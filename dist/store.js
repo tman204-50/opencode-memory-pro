@@ -628,6 +628,28 @@ export class MemoryStore {
         this.notifyGraphRemoved(id);
         return true;
     }
+    // DELETE_BY_FORCE (1.3.8): like deleteById but sees rows the status-
+    // filtered reads hide (disabled/merged/digested). Fixes memory_forget
+    // force=true: the soft-delete path marks rows disabled, and the force
+    // path previously used deleteById, whose readByScopes filter excludes
+    // status='disabled' — so "Use force=true for permanent deletion" silently
+    // failed and left the hidden row on disk forever. Tries the exact-id raw
+    // delete first (fast path), then falls back to an unfiltered scan so
+    // prefix ids and hidden rows both work.
+    async deleteByIdForce(id) {
+        if (await this.deleteByIdRaw(id)) {
+            return true;
+        }
+        const table = this.requireTable();
+        const rows = await table.query().limit(100000).toArray();
+        const match = rows.find((row) => this.matchesId(row.id, id));
+        if (!match)
+            return false;
+        await table.delete(`id = '${escapeSql(match.id)}'`);
+        this.invalidateScope(match.scope);
+        this.notifyGraphRemoved(match.id);
+        return true;
+    }
     async softDeleteMemory(id, scopes) {
         const rows = await this.readByScopes(scopes);
         const match = rows.find((row) => this.matchesId(row.id, id));

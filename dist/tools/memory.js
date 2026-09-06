@@ -447,7 +447,11 @@ export function createMemoryTools(state) {
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 if (args.force) {
-                    const deleted = await state.store.deleteById(args.id, scopes);
+                    // FORCE_DELETE_HIDDEN (1.3.8): was deleteById, whose
+                    // readByScopes filter excludes disabled/merged rows — so
+                    // force=true could never permanently delete a memory that
+                    // was soft-deleted first.
+                    const deleted = await state.store.deleteByIdForce(args.id);
                     if (!deleted) {
                         return `Memory ${args.id} not found in current scope.`;
                     }

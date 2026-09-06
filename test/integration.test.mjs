@@ -126,6 +126,28 @@ test("integration: MemoryStore full lifecycle on real LanceDB", async () => {
     }
 });
 
+test("integration: deleteByIdForce removes rows hidden by the status filter", async () => {
+    const store = await newStore("mem-forget-force-");
+    try {
+        const id = "force-id-1";
+        await store.put(makeRecord(id, "the force delete test row for hidden status memories"));
+
+        assert.equal(await store.softDeleteMemory(id, ["global"]), true);
+        assert.equal(await store.hasMemory(id, ["global"]), false, "soft-deleted row is hidden from active reads");
+        assert.equal(await store.deleteById(id, ["global"]), false, "old hard-delete path cannot see disabled rows");
+        assert.equal(await store.deleteByIdForce(id), true, "force path removes the hidden row");
+        assert.equal(await store.deleteByIdForce(id), false, "row is gone on second attempt");
+        assert.equal(await store.hasMemory(id, ["global"]), false, "no active or hidden row remains");
+
+        await store.put(makeRecord(id, "the force delete prefix row"));
+        assert.equal(await store.softDeleteMemory(id, ["global"]), true);
+        assert.equal(await store.deleteByIdForce(id.slice(0, 10)), true, "force path also matches by id prefix");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: events table round-trip and TTL status", async () => {
     const store = await newStore("mem-events-");
     try {
