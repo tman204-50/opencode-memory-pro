@@ -2,7 +2,7 @@ import { mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { validateEpisodicRecord, validateEpisodicRecordArray } from "./types.js";
 import { tokenize } from "./utils.js";
-import { log } from "./logger.js";
+import { log, logFileOnly } from "./logger.js";
 const TABLE_NAME = "memories";
 const EVENTS_TABLE_NAME = "effectiveness_events";
 const EVENTS_SOURCE_COLUMN = "source";
@@ -129,7 +129,18 @@ export class MemoryStore {
                     log("info", `[store] optimized ${table.name}: ${count} versions before, pruned=${stats.prune.oldVersionsRemoved}, bytesRemoved=${stats.prune.bytesRemoved}`);
                 }
                 catch (error) {
-                    log("warn", `[store] optimize failed for ${table.name}: ${error instanceof Error ? error.message : String(error)}`);
+                    const message = error instanceof Error ? error.message : String(error);
+                    // Known-benign LanceDB compaction races: a concurrent write
+                    // (or a second optimize pass) commits a newer version between
+                    // our read and our commit. Lance leaves the rewritten
+                    // fragments for GC and the next optimize retry succeeds (and
+                    // the success line below is logged). Keep these out of the
+                    // TUI; they still land in the plugin log file for debugging.
+                    if (/Retryable commit conflict|Compaction commit failed/.test(message)) {
+                        logFileOnly("warn", `[store] optimize conflict for ${table.name} (self-heals on retry): ${message}`);
+                        continue;
+                    }
+                    log("warn", `[store] optimize failed for ${table.name}: ${message}`);
                 }
             }
         }

@@ -124,3 +124,14 @@ function consoleFallback(level, message) {
             break;
     }
 }
+
+// File-sink-only logging: writes to the configured log file but never to the
+// opencode /log bus or the console. Used for known-benign noise (e.g. LanceDB
+// optimize commit-conflict warnings) that should stay out of the TUI while
+// remaining debuggable in the plugin log.
+export function logFileOnly(level, message, extra) {
+    const lvl = LOG_LEVELS[level] ?? LOG_LEVELS.info;
+    if (lvl < _minLevel)
+        return;
+    writeFileLog(level, message, extra);
+}

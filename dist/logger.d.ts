@@ -6,4 +6,5 @@ export declare function configureLogger(opts: {
     logFile?: string;
 }): void;
 export declare function log(level: LogLevel, message: string, extra?: Record<string, unknown>): void;
+export declare function logFileOnly(level: LogLevel, message: string, extra?: Record<string, unknown>): void;
 export {};
