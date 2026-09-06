@@ -46,6 +46,30 @@ const OWN_SESSION_IDS = new Set();
 export function isOwnSession(sessionID) {
     return typeof sessionID === "string" && OWN_SESSION_IDS.has(sessionID);
 }
+// LLM_HEALTH (1.3.9): module-level runtime health for the capture/summary LLM,
+// mirroring the embedder pattern so memory_stats can report both sides.
+const globalLlmHealth = {
+    status: "never-called", // never-called | healthy | error
+    lastError: null,
+    lastSuccess: null,
+    errorCount: 0,
+    lastConfig: null,
+};
+export function getLlmHealth() {
+    return { ...globalLlmHealth };
+}
+export function setLlmHealth(patch) {
+    Object.assign(globalLlmHealth, patch);
+}
+export function resetLlmHealth() {
+    Object.assign(globalLlmHealth, {
+        status: "never-called",
+        lastError: null,
+        lastSuccess: null,
+        errorCount: 0,
+        lastConfig: null,
+    });
+}
 /**
  * Tolerant JSON parse of the extraction model's reply. Accepts a bare array
  * or an object wrapping an array under "memories"/"items"; strips markdown
@@ -169,6 +193,7 @@ export async function requestLLMDigest(client, llmConfig, texts, targetChars, gr
 async function runEphemeralPrompt(client, llmConfig, system, userText, title) {
     let sessionId = null;
     try {
+        globalLlmHealth.lastConfig = { provider: llmConfig?.provider ?? null, model: llmConfig?.model ?? null };
         const created = await client.session.create({
             body: { title: `opencode-memory-pro ${title}` },
         });
@@ -176,6 +201,7 @@ async function runEphemeralPrompt(client, llmConfig, system, userText, title) {
         sessionId = createdPayload?.id;
         if (!sessionId) {
             log("warn", `[llm] ${title}: session.create did not return an id (got ${JSON.stringify(createdPayload)?.slice(0, 200)})`);
+            setLlmHealth({ status: "error", lastError: "session.create returned no id", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
             return null;
         }
         OWN_SESSION_IDS.add(sessionId);
@@ -191,12 +217,15 @@ async function runEphemeralPrompt(client, llmConfig, system, userText, title) {
         const text = extractAssistantText(response);
         if (!text) {
             log("warn", `[llm] ${title}: session.prompt succeeded but returned no text parts (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+            setLlmHealth({ status: "error", lastError: "session.prompt returned no text parts", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
             return null;
         }
+        setLlmHealth({ status: "healthy", lastError: null, lastSuccess: Date.now(), errorCount: 0 });
         return text;
     }
     catch (error) {
         log("warn", `[llm] ${title}: ${error instanceof Error ? error.message : String(error)} (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+        setLlmHealth({ status: "error", lastError: error instanceof Error ? error.message : String(error), lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
         return null;
     }
     finally {

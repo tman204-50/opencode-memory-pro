@@ -11,7 +11,7 @@ import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
 import { sweepExpiredMemories } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
-const PLUGIN_VERSION = "1.3.8";
+const PLUGIN_VERSION = "1.3.9";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
@@ -138,6 +138,23 @@ const plugin = async (input) => {
             if (!state.startupLogged) {
                 state.startupLogged = true;
                 log("info", `Plugin v${PLUGIN_VERSION} initialized`);
+                // STARTUP_DEGRADED (1.3.9): one proactive warning when the
+                // install can't reach full features, so fresh users know what
+                // to configure instead of discovering degraded mode later.
+                const missing = [];
+                const emb = state.config.embedding ?? {};
+                if (state.config.capture?.mode === "llm" && (!state.config.capture?.llm?.provider || !state.config.capture?.llm?.model)) {
+                    missing.push("capture.llm.{provider,model} (LLM capture will fall back to heuristics)");
+                }
+                if (emb.provider === "openai" && !emb.apiKey) {
+                    missing.push("embedding.apiKey (recall will fall back to BM25-only)");
+                }
+                if (emb.provider !== "openai" && !(emb.baseUrl ?? "")) {
+                    missing.push("embedding.baseUrl (defaults to http://127.0.0.1:11434)");
+                }
+                if (missing.length > 0) {
+                    log("warn", `Memory plugin running degraded: missing ${missing.join(", ")}. See README "Quick start" for full-feature setup.`);
+                }
             }
         },
         event: async ({ event }) => {

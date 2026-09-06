@@ -4,9 +4,35 @@ import { generateId } from "../utils.js";
 import { getEmbedderHealth } from "../embedder.js";
 import { extractiveDigest, retentionCandidates } from "../store.js";
 import { requestLLMDigest } from "../llm.js";
+import { getLlmHealth } from "../llm.js";
 import { log } from "../logger.js";
 function unavailableMessage(provider) {
     return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
+}
+// DEGRADED_FLAGS (1.3.9): report what the user is missing for full features.
+// Returns a list of human-readable strings, empty when running at full strength.
+function computeDegradedFlags(state, embedderHealth, graphStats) {
+    const flags = [];
+    const emb = state.config?.embedding ?? {};
+    if (state.config?.capture?.mode === "llm") {
+        const cap = state.config.capture;
+        if (!cap?.llm?.provider || !cap?.llm?.model) {
+            flags.push("llm-capture-unconfigured: capture.mode=llm but capture.llm.provider/model is missing — capture will fall back to heuristics");
+        }
+    }
+    if (emb.provider === "openai" && !emb.apiKey) {
+        flags.push("embedding-api-key-missing: embedding.provider=openai but no apiKey (or OPENCODE_MEMORY_PRO_OPENAI_API_KEY) is set — recall will fall back to BM25-only");
+    }
+    if (emb.provider !== "openai" && !(emb.baseUrl ?? "")) {
+        flags.push("embedding-baseurl-missing: embedding.provider=ollama but no baseUrl (defaults to http://127.0.0.1:11434) — recall will fall back to BM25-only");
+    }
+    if (graphStats && graphStats.enabled === false && state.config?.graph?.enabled) {
+        flags.push("graph-disabled: graph.enabled=true but the graph store did not initialize (check graph.dbPath)");
+    }
+    if (state.config?.capture?.llm?.provider && state.config?.capture?.llm?.model && getLlmHealth().status === "error") {
+        flags.push("llm-unhealthy: last LLM capture/digest call failed — falling back to heuristics/extractive digests");
+    }
+    return flags;
 }
 // LLM_CAPTURE (1.1): mode-aware digest builder shared by memory_summarize
 // and the retention sweep. capture.mode === "llm" → abstractive LLM digest
@@ -246,6 +272,7 @@ export function createMemoryTools(state) {
                 const incompatibleVectors = await state.store.countIncompatibleVectors(buildScopeFilter(scope, state.config.includeGlobalScope), await state.embedder.dim());
                 const health = state.store.getIndexHealth();
                 const embedderHealth = getEmbedderHealth();
+                const llmHealth = getLlmHealth();
                 const searchMode = embedderHealth.fallbackActive ? "bm25-only" : state.config.retrieval.mode;
                 const eventTtl = state.config.retention
                     ? await state.store.getEventTtlStatus()
@@ -276,9 +303,19 @@ export function createMemoryTools(state) {
                     embeddingModel: state.config.embedding.model,
                     searchMode,
                     embedderHealth,
+                    capture: {
+                        mode: state.config.capture?.mode ?? "heuristics",
+                        llm: {
+                            provider: state.config.capture?.llm?.provider ?? null,
+                            model: state.config.capture?.llm?.model ?? null,
+                            configured: Boolean(state.config.capture?.llm?.provider && state.config.capture?.llm?.model),
+                        },
+                        llmHealth,
+                    },
                     eventTtl,
                     graph: graphStats,
                     memoryRetention,
+                    degradedFlags: computeDegradedFlags(state, embedderHealth, graphStats),
                 }, null, 2);
             },
         }),
