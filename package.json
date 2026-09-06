@@ -35,6 +35,9 @@
   },
   "scripts": {
     "test": "node --test",
+    "test:unit": "node --test test/unit.test.mjs",
+    "test:integration": "node --test test/integration.test.mjs",
+    "test:e2e": "node test/scenario-e2e.mjs",
     "verify": "npm test && npm pack --dry-run"
   },
   "dependencies": {
