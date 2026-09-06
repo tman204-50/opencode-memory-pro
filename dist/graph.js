@@ -552,6 +552,7 @@ export class GraphStore {
         }
         const memCache = new Map();
         const best = new Map();
+        const now = Date.now();
         let frontier = Array.from(seeds);
         let hop = 1;
         while (hop <= maxHops && frontier.length > 0 && visitedEntities.size <= MAX_VISITED_ENTITIES) {
@@ -561,7 +562,11 @@ export class GraphStore {
                     break;
                 let edgeRows = [];
                 try {
-                    edgeRows = this.db.prepare("SELECT src, dst, relation, weight FROM edges WHERE src = ? OR dst = ? LIMIT ?").all(entity, entity, MAX_EDGES_PER_ENTITY);
+                    // EDGE_ORDER (1.3.0): was LIMIT-without-ORDER-BY, i.e. an
+                    // arbitrary fanout subset; now the strongest/most-recent
+                    // edges win the per-entity budget so weak stale links no
+                    // longer crowd out good ones.
+                    edgeRows = this.db.prepare("SELECT src, dst, relation, weight, last_seen FROM edges WHERE src = ? OR dst = ? ORDER BY weight DESC, last_seen DESC LIMIT ?").all(entity, entity, MAX_EDGES_PER_ENTITY);
                 }
                 catch {
                     edgeRows = [];
@@ -574,7 +579,14 @@ export class GraphStore {
                     const typed = edge.relation !== "co_occurs";
                     const edgeStrength = Math.min(1, (typeof edge.weight === "number" && edge.weight > 0 ? edge.weight : 1) / 3);
                     const relationStrength = typed ? TYPED_RELATION_STRENGTH : 1.0;
-                    const scoreFactor = (1 + expansionLambda) * Math.pow(hopDecay, hop - 1) * relationStrength * edgeStrength;
+                    // EDGE_DECAY (1.3.0): stored weights are bounded by
+                    // maxEdgeProvenance but never age — add a ranking-only
+                    // recency factor so long-dormant pairs (>=1yr) fade to a
+                    // 0.35 floor instead of holding their old strength forever.
+                    const edgeAgeMs = now - (typeof edge.last_seen === "number" ? edge.last_seen : now);
+                    const edgeAgeDays = Math.max(0, edgeAgeMs) / 86400000;
+                    const recencyFactor = Math.max(0.35, 1 - edgeAgeDays / 365);
+                    const scoreFactor = (1 + expansionLambda) * Math.pow(hopDecay, hop - 1) * relationStrength * edgeStrength * recencyFactor;
                     // Every edge is scored (a typed edge reaching the SAME
                     // neighbor as an earlier co_occurs edge upgrades the
                     // candidate); the discovered set only prevents duplicate

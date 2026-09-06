@@ -11,6 +11,17 @@ const DEFAULT_CACHE_CONFIG = {
     maxRecordsPerScope: 1000,
     enabled: true,
 };
+// ANN_TUNABLES (1.3.0): nprobes controls IVF recall-vs-latency on filtered
+// vector searches; the consolidation query batch controls how many ANN
+// queries each batched vectorSearch call carries. Both were build-time
+// guesses (nprobes=40, batch=16) — now env-overridable with the same
+// conservative defaults, so tuning no longer requires a rebuild.
+function envInt(name, fallback, min, max) {
+    const raw = Number(process.env[name]);
+    return Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.floor(raw))) : fallback;
+}
+const NPROBES = envInt("OPENCODE_MEMORY_PRO_NPROBES", 40, 1, 500);
+const ANN_QUERY_BATCH = envInt("OPENCODE_MEMORY_PRO_QUERY_BATCH", 16, 1, 256);
 // Exported for use by consolidateDuplicates
 export function storeFastCosine(a, b, normA, normB) {
     if (a.length === 0 || b.length === 0 || a.length !== b.length)
@@ -533,7 +544,7 @@ export class MemoryStore {
         }
         const BATCH_SIZE = 100;
         const FALLBACK_THRESHOLD = 500;
-        const QUERY_BATCH = 16;
+        const QUERY_BATCH = ANN_QUERY_BATCH;
         let mergedPairs = 0;
         let updatedRecords = 0;
         let skippedRecords = 0;
@@ -759,7 +770,7 @@ export class MemoryStore {
             if (this.indexState.vector) {
                 const results = await table.vectorSearch(queryVector)
                     .where(`scope = '${escapeSql(scope)}'`)
-                    .nprobes(40)
+                    .nprobes(NPROBES)
                     .limit(Math.max(safeLimit, 100))
                     .toArray();
                 const scored = results.map((r) => {
@@ -807,7 +818,7 @@ export class MemoryStore {
         if (this.indexState.vector) {
             const results = await table.vectorSearch(queryVectors)
                 .where(`scope = '${escapeSql(scope)}'`)
-                .nprobes(40)
+                .nprobes(NPROBES)
                 .limit(Math.max(safeLimit, 100))
                 .toArray();
             const byQuery = new Map();

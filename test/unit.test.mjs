@@ -344,3 +344,40 @@ test("graph: DisabledGraphStore is a safe no-op", async () => {
     assert.equal(g.expandRecall("query").length, 0);
     assert.deepEqual(g.stats().relations, {});
 });
+
+test("graph: expandRecall ranks fresh edges above stale ones (recency decay)", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { GraphStore } = await import("../dist/graph.js");
+    const dir = mkdtempSync(join(tmpdir(), "graph-decay-"));
+    const store = new GraphStore({
+        dbPath: join(dir, "graph.db"),
+        maxEntitiesPerMemory: 20,
+        maxEdgeProvenance: 20,
+        typedEdges: true,
+    }, { ctor: DatabaseSync, name: "node:sqlite" });
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
+    // Two disjoint 1-hop clusters: m1's postgres edge is 1 day old, m2's
+    // mysql edge is ~400 days old. Both are weight-1 co-occurrence hops from
+    // the query seed, so identical shape — only recency differs.
+    store.indexMemory("m1", "the plugin uses docker and postgres", now - DAY);
+    store.indexMemory("m2", "the helm chart uses mysql and redis", now - 400 * DAY);
+    const expanded = store.expandRecall("postgres mysql", { maxHops: 2, expansionLimit: 10, expansionLambda: 0.3 });
+    assert.ok(Array.isArray(expanded) && expanded.length >= 2, `expected both clusters, got ${JSON.stringify(expanded)}`);
+    const byId = new Map(expanded.map((c) => [c.memoryId, c]));
+    assert.ok(byId.has("m1") && byId.has("m2"), "both memories reachable in one hop");
+    assert.ok(byId.get("m1").scoreFactor > byId.get("m2").scoreFactor,
+        `fresh edge must outrank stale edge: m1=${byId.get("m1").scoreFactor} m2=${byId.get("m2").scoreFactor}`);
+    store.db.close();
+});
+
+test("utils: classifyFailure buckets error messages", async () => {
+    const { classifyFailure } = await import("../dist/utils.js");
+    assert.equal(classifyFailure("SyntaxError: Unexpected token '}'"), "syntax");
+    assert.equal(classifyFailure("TypeError: cannot read properties of undefined"), "runtime");
+    assert.equal(classifyFailure("ECONNREFUSED to 127.0.0.1:8080"), "resource");
+    assert.equal(classifyFailure("some totally unique message"), "unknown");
+});

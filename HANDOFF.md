@@ -30,15 +30,12 @@ Give this file to the agent on restart (also stored in memory as
 - Unreviewed remainder: `.d.ts` files only (types; llm.d.ts verified in sync with parseExtractionJSON).
 
 ## Known remaining issues / next steps (not done)
-- `nprobes(40)` still a guess for recall-vs-latency; tune via `findSimilarVectorsBatch` if consolidation misses duplicates.
-- `updateTaskState`/episodic `values` include failureType/errorMessage (nullable now) — callers only pass `state`, so they stay null.
-- Graph store (`~/.opencode/memory/graph.db`) — healthy; revisit only if RSS grows again. Handoff databases staged in graph.js: co-occurrence weight only grows (no decay); expandRecall `LIMIT 100` per entity is unordered — both acceptable approximations.
-- `memory_forget` logs `feedbackType:"useful"` + `helpful:false` — intentionally maps to "unhelpful" at consumers; considered correct, no change.
-- ⚠️ Recurring benign optimize warns: (a) retryable commit conflict (two compactions raced); (b) phantom manifest `_versions/18446744073709549627.manifest` on effectiveness_events — warn-only, self-heals; do not hand-edit the lance dir while running.
-- `QUERY_BATCH=16` starting point; raise if consolidated latency high.
+- Deferred items from <=1.2.2 were ADDRESSED in 1.3.0: nprobes + QUERY_BATCH are env-tunable (`OPENCODE_MEMORY_PRO_NPROBES`=40, `OPENCODE_MEMORY_PRO_QUERY_BATCH`=16); session.error now carries `data.message` → classified via `classifyFailure` and persisted as failureType/errorMessage (still null when the bus yields no message); expandRecall edges now `ORDER BY weight DESC, last_seen DESC` (was unordered LIMIT) and scoreFactor gets ranking-only recency decay (>=1yr fades to 0.35 floor); stored co-occurrence weight was already bounded by maxEdgeProvenance. `memory_forget` useful/helpful:false mapping + benign optimize warns: REVERIFIED intentional/benign, no change.
+- Graph store (`~/.opencode/memory/graph.db`) — healthy; revisit only if RSS grows again.
+- Verify 1.3.0 live after restart (1.2.2 was the last verified-live version).
 
 ## Versioning rule (user-mandated)
-Every build = new tarball with INCREMENTAL version: bump `"version"` in package.json AND `PLUGIN_VERSION` in dist/index.js, `npm pack`, repin opencode.json. Never overwrite an existing version tarball. Next is 1.2.2 (or 1.3.0 for new features).
+Every build = new tarball with INCREMENTAL version: bump `"version"` in package.json AND `PLUGIN_VERSION` in dist/index.js, `npm pack`, repin opencode.json. Never overwrite an existing version tarball. Next is 1.3.1 (or 1.4.0 for new features).
 
 ## Deploy flow (from memory)
-edit code → `node --check` → `npm test` (22 tests) → optional smoke → bump versions → `npm pack` → sed-repin opencode.json → user restarts opencode.
+edit code → `node --check` → `npm test` (24 tests) → optional smoke → bump versions → `npm pack` → sed-repin opencode.json → user restarts opencode.

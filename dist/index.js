@@ -4,14 +4,14 @@ import { extractCaptureCandidate } from "./extract.js";
 import { extractPreferenceSignals, aggregatePreferences, resolveConflicts, buildPreferenceInjection } from "./preference.js";
 import { buildScopeFilter, deriveProjectScope } from "./scope.js";
 import { MemoryStore } from "./store.js";
-import { generateId } from "./utils.js";
+import { generateId, classifyFailure } from "./utils.js";
 import { initLogger, configureLogger, log } from "./logger.js";
 import { calculateInjectionLimit, createSummarizationConfig, summarizeContent, truncateText } from "./summarize.js";
 import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
 import { sweepExpiredMemories } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
-const PLUGIN_VERSION = "1.2.2";
+const PLUGIN_VERSION = "1.3.0";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
@@ -156,9 +156,19 @@ const plugin = async (input) => {
             if (evt.type === "session.error") {
                 // Track failures so handleSessionEnd (fired on session.deleted) can
                 // report an accurate outcome instead of a hardcoded "unknown".
+                // EPISODIC_FAILURE (1.3.0): SDK events carry the error object
+                // (ProviderAuthError/UnknownError/MessageAbortedError/ApiError —
+                // all expose data.message), so we also keep the raw message and
+                // classify it at session end to fill failureType/errorMessage.
                 const sid = evt.properties?.sessionID;
                 if (sid) {
-                    state.sessionErrors.set(sid, true);
+                    const err = evt.properties?.error;
+                    const message = typeof err?.data?.message === "string"
+                        ? err.data.message
+                        : (typeof err?.message === "string" ? err.message : undefined);
+                    state.sessionErrors.set(sid, message
+                        ? { failed: true, message }
+                        : { failed: true });
                     // Bound growth in case session.deleted never fires for a
                     // given session (e.g. crash) — simple FIFO eviction since
                     // Map iteration order is insertion order in JS.
@@ -173,9 +183,10 @@ const plugin = async (input) => {
             if (evt.type === "session.deleted") {
                 const sid = evt.properties?.info?.id;
                 if (sid && !isOwnSession(sid)) {
-                    const hadError = state.sessionErrors.get(sid) === true;
+                    const entry = state.sessionErrors.get(sid);
                     state.sessionErrors.delete(sid);
-                    await handleSessionEnd(sid, state, hadError ? "failed" : "success");
+                    const hadError = entry?.failed === true;
+                    await handleSessionEnd(sid, state, hadError ? "failed" : "success", entry?.message);
                 }
                 // Session is closing — final dedup pass for its scope. Uses the
                 // session's own directory (Session.info.directory) rather than
@@ -885,7 +896,7 @@ async function handleSessionStart(sessionID, state, input) {
     await state.store.createTaskEpisode(episode);
     state.activeEpisodes.set(sessionID, { taskId, scope: activeScope });
 }
-async function handleSessionEnd(sessionID, state, outcome) {
+async function handleSessionEnd(sessionID, state, outcome, errorMessage) {
     await state.ensureInitialized();
     if (!state.initialized)
         return;
@@ -893,7 +904,16 @@ async function handleSessionEnd(sessionID, state, outcome) {
     if (!entry)
         return;
     const finalState = outcome === "success" ? "success" : "failed";
-    await state.store.updateTaskState(entry.taskId, finalState, entry.scope);
+    // EPISODIC_FAILURE (1.3.0): when the bus gave us an error message,
+    // classify it (syntax/runtime/logic/resource/unknown) and persist it with
+    // the raw message. Truncated to match putEvent's 4000-char safety cap.
+    let failureType;
+    let failureMessage = errorMessage;
+    if (finalState === "failed" && typeof failureMessage === "string" && failureMessage.length > 0) {
+        failureType = classifyFailure(failureMessage);
+        failureMessage = failureMessage.slice(0, 4000);
+    }
+    await state.store.updateTaskState(entry.taskId, finalState, entry.scope, failureType, failureMessage);
     if (finalState === "success") {
         // Previously this scope-wide pattern extraction ran on every
         // session.idle (i.e. every turn) and its result was discarded via a

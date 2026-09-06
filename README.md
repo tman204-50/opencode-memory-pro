@@ -130,6 +130,18 @@ Env overrides: `OPENCODE_MEMORY_PRO_LOG_LEVEL`,
 `OPENCODE_MEMORY_PRO_LOG_FILE`. The env overrides are applied at plugin
 initialization, so they work even before sidecar config is resolved.
 
+### ANN tunables
+
+Advanced knobs for the vector-search layer. The defaults are conservative;
+tune only if you observe recall misses (raise `nprobes`) or slow
+consolidation (raise `QUERY_BATCH`). Both are read from the environment at
+plugin load.
+
+- `OPENCODE_MEMORY_PRO_NPROBES` — IVF probe count for filtered vector
+  searches (recall vs. latency). Default `40`.
+- `OPENCODE_MEMORY_PRO_QUERY_BATCH` — how many ANN queries each batched
+  vector-search call carries during duplicate consolidation. Default `16`.
+
 > Migrating from `lancedb-opencode-pro`: this is a clean-break rename —
 > sidecar is `opencode-memory-pro.json`, env prefix is `OPENCODE_MEMORY_PRO_*`.
 > Data is **not** affected: the default storage path is unchanged
