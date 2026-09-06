@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin";
-import { deriveProjectScope, buildScopeFilter } from "../scope.js";
+import { deriveProjectScope, buildScopeFilter, resolveScope } from "../scope.js";
 import { generateId } from "../utils.js";
 function unavailableMessage(provider) {
     return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
@@ -17,7 +17,7 @@ export function createFeedbackTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 await state.store.putEvent({
                     id: generateId(),
                     type: "feedback",
@@ -43,7 +43,7 @@ export function createFeedbackTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(scope, state.config.includeGlobalScope);
                 const exists = await state.store.hasMemory(args.id, scopes);
                 if (!exists) {
@@ -74,7 +74,7 @@ export function createFeedbackTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(scope, state.config.includeGlobalScope);
                 const exists = await state.store.hasMemory(args.id, scopes);
                 if (!exists) {
@@ -103,7 +103,7 @@ export function createFeedbackTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const summary = await state.store.summarizeEvents(scope, state.config.includeGlobalScope);
                 return JSON.stringify(summary, null, 2);
             },

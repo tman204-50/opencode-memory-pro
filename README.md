@@ -40,7 +40,7 @@ Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥
 opencode plugin opencode-memory-pro
 ```
 
-The latest release is **v1.3.6** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
+The latest release is **v1.3.7** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
@@ -407,6 +407,27 @@ are unchanged (`~/.opencode/memory/lancedb` + `~/.opencode/memory/graph.db`),
 so your memories and graph carry over untouched.
 
 ## Changelog
+
+### v1.3.7 (2026-09-06)
+
+Scope normalization — fixes lost memories when a `scope` argument is
+explicitly passed to a tool while `scoping` is `"global"`:
+
+- **Explicit scopes now collapse to `global` in global mode**: previously
+  `memory_remember(scope="project")` (and every other tool accepting a `scope`
+  arg) stored the row under the literal string `"project"` — but scope-filtered
+  reads derive the scope via `deriveProjectScope()`, which returns `"global"`
+  in global mode, so the memory was effectively lost (invisible to search,
+  promote, why, `memory_global_list`, ...; reachable only by passing
+  `scope="project"` explicitly).
+- **New `resolveScope(scope, worktree)` helper** in `dist/scope.js` — collapses
+  any explicit scope to `"global"` in global mode and honors it in project
+  mode (falling back to the derived project scope when omitted). Applied to all
+  30 scope-arg sites across `dist/tools/memory.js`, `dist/tools/episodic.js`,
+  and `dist/tools/feedback.js`, including `memory_clear`, which previously
+  called `clearScope(args.scope)` without any normalization.
+- **Tests**: two new unit tests cover the collapse-to-global and
+  honor-in-project-mode behavior.
 
 ### v1.3.6 (2026-09-06)
 

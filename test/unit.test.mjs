@@ -5,6 +5,7 @@ import { extractiveDigest, retentionCandidates, storeFastCosine } from "../dist/
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
+import { resolveScope } from "../dist/scope.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
 
@@ -431,5 +432,32 @@ test("optimize lock: reclaims a genuinely stale lock after the grace window", as
         assert.ok(content.startsWith(`${process.pid}\n`), "reclaimed lock now owned by this pid");
     } finally {
         await fsRm(dir, { recursive: true, force: true });
+    }
+});
+
+test("scope: resolveScope collapses explicit scopes to global in global mode", () => {
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    try {
+        assert.equal(resolveScope(undefined, "/tmp"), "global");
+        assert.equal(resolveScope("project", "/tmp"), "global");
+        assert.equal(resolveScope("global", "/tmp"), "global");
+        assert.equal(resolveScope("anything", "/tmp"), "global");
+    } finally {
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+    }
+});
+
+test("scope: resolveScope honors explicit scopes in project mode", () => {
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    process.env.OPENCODE_MEMORY_PRO_SCOPING = "project";
+    try {
+        assert.equal(resolveScope("global", "/tmp"), "global");
+        assert.equal(resolveScope("project", "/tmp"), "project");
+        const derived = resolveScope(undefined, "/tmp");
+        assert.ok(derived.startsWith("project:"), `expected derived project scope, got ${derived}`);
+    } finally {
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
     }
 });

@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin";
-import { deriveProjectScope } from "../scope.js";
+import { deriveProjectScope, resolveScope } from "../scope.js";
 import { generateId, parseJsonObject } from "../utils.js";
 function unavailableMessage(provider) {
     return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
@@ -17,7 +17,7 @@ export function createEpisodicTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const episode = {
                     id: generateId(),
                     sessionId: context.sessionID,
@@ -48,7 +48,7 @@ export function createEpisodicTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const stateFilter = args.state;
                 const episodes = await state.store.queryTaskEpisodes(activeScope, stateFilter);
                 if (episodes.length === 0) {
@@ -73,7 +73,7 @@ export function createEpisodicTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 let queryVector = [];
                 try {
                     queryVector = await state.embedder.embed(args.query);
@@ -107,7 +107,7 @@ export function createEpisodicTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const result = await state.store.suggestRetryBudget(activeScope, args.minSamples ?? 3);
                 if (!result) {
                     return `Insufficient data for retry budget suggestion (need at least ${args.minSamples} failed tasks)`;
@@ -131,7 +131,7 @@ export function createEpisodicTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const strategies = await state.store.suggestRecoveryStrategies(activeScope, args.taskId);
                 if (strategies.length === 0) {
                     return `No recovery strategies found for task ${args.taskId}`;

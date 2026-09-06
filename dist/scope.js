@@ -26,6 +26,18 @@ export function buildScopeFilter(activeScope, includeGlobal) {
     const scopes = includeGlobal ? [activeScope, "global"] : [activeScope];
     return [...new Set(scopes)];
 }
+// SCOPE_NORMALIZE (1.3.7): resolves a caller-supplied scope argument against
+// the active scoping mode. In "global" mode every explicit scope (e.g. a
+// memory_remember(scope="project")) collapses to "global" — otherwise such
+// rows would be stored under a literal scope that scope-filtered tools never
+// query (the rows are effectively lost). In "project" mode the argument is
+// honored, falling back to the derived project scope.
+export function resolveScope(scope, worktree) {
+    if (resolveScoping(worktree) !== "project") {
+        return "global";
+    }
+    return scope ?? deriveProjectScope(worktree);
+}
 function resolveScoping(worktree) {
     try {
         return resolveMemoryConfig({}, worktree).scoping === "project" ? "project" : "global";

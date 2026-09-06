@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin";
-import { deriveProjectScope, buildScopeFilter } from "../scope.js";
+import { deriveProjectScope, buildScopeFilter, resolveScope } from "../scope.js";
 import { generateId } from "../utils.js";
 import { getEmbedderHealth } from "../embedder.js";
 import { extractiveDigest, retentionCandidates } from "../store.js";
@@ -43,7 +43,7 @@ export function createMemoryTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 let queryVector = [];
                 let embedderFailed = false;
@@ -208,7 +208,7 @@ export function createMemoryTools(state) {
                 if (!args.confirm) {
                     return "Rejected: memory_delete requires confirm=true.";
                 }
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const deleted = await state.store.deleteById(args.id, scopes);
                 return deleted ? `Deleted memory ${args.id}.` : `Memory ${args.id} not found in current scope.`;
@@ -220,15 +220,16 @@ export function createMemoryTools(state) {
                 scope: tool.schema.string(),
                 confirm: tool.schema.boolean().default(false),
             },
-            execute: async (args) => {
+            execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
                 if (!args.confirm) {
                     return "Rejected: destructive clear requires confirm=true.";
                 }
-                const count = await state.store.clearScope(args.scope);
-                return `Cleared ${count} memories from scope ${args.scope}.`;
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
+                const count = await state.store.clearScope(activeScope);
+                return `Cleared ${count} memories from scope ${activeScope}.`;
             },
         }),
         memory_stats: tool({
@@ -240,7 +241,7 @@ export function createMemoryTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const entries = await state.store.list(scope, 20);
                 const incompatibleVectors = await state.store.countIncompatibleVectors(buildScopeFilter(scope, state.config.includeGlobalScope), await state.embedder.dim());
                 const health = state.store.getIndexHealth();
@@ -303,7 +304,7 @@ export function createMemoryTools(state) {
                 // passed `args.scope` to cleanupExpiredEvents where `undefined`
                 // meant ALL scopes (and the store's `scope LIKE 'project:%'`
                 // matched every project scope).
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const cutoffTimestamp = Date.now() - status.retentionDays * 24 * 60 * 60 * 1000;
                 if (args.dryRun) {
@@ -370,7 +371,7 @@ export function createMemoryTools(state) {
                 if (args.text.length < state.config.minCaptureChars) {
                     return `Content too short (minimum ${state.config.minCaptureChars} characters).`;
                 }
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 let vector = [];
                 try {
                     vector = await state.embedder.embed(args.text);
@@ -443,7 +444,7 @@ export function createMemoryTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 if (args.force) {
                     const deleted = await state.store.deleteById(args.id, scopes);
@@ -499,7 +500,7 @@ export function createMemoryTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const citation = await state.store.getCitation(args.id, scopes);
                 if (!citation) {
@@ -535,7 +536,7 @@ export function createMemoryTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const result = await state.store.validateCitation(args.id, scopes);
                 return JSON.stringify({
@@ -556,7 +557,7 @@ export function createMemoryTools(state) {
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const sinceTimestamp = Date.now() - (args.days ?? 7) * 24 * 60 * 60 * 1000;
                 const memories = await state.store.listSince(activeScope, sinceTimestamp, 1000);
                 if (memories.length === 0) {
@@ -598,7 +599,7 @@ ${recentSamples}
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const explanation = await state.store.explainMemory(args.id, scopes, activeScope, state.config.retrieval.recencyHalfLifeHours, state.config.globalDiscountFactor);
                 if (!explanation) {
@@ -637,7 +638,7 @@ Explanation:
                 if (!lastRecall) {
                     return "No recent recall to explain. Use memory_search or wait for auto-recall first.";
                 }
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const explanations = [];
                 for (const result of lastRecall.results) {
@@ -697,7 +698,7 @@ ${explanations.join("\n")}`;
                 if (!args.confirm) {
                     return "Rejected: memory_scope_demote requires confirm=true.";
                 }
-                const projectScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const projectScope = resolveScope(args.scope, context.directory || context.worktree);
                 const globalExists = await state.store.hasMemory(args.id, ["global"]);
                 if (!globalExists) {
                     return `Memory ${args.id} not found in global scope or is not a global memory.`;
@@ -774,7 +775,7 @@ ${explanations.join("\n")}`;
                 if (!args.confirm) {
                     return "Rejected: memory_consolidate requires confirm=true.";
                 }
-                const targetScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const targetScope = resolveScope(args.scope, context.directory || context.worktree);
                 if (state.consolidationInProgress.get(targetScope)) {
                     return JSON.stringify({ scope: targetScope, status: "already_in_progress", message: "Consolidation already in progress for this scope" });
                 }
@@ -980,7 +981,7 @@ ${explanations.join("\n")}`;
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const dashboard = await state.store.getWeeklyEffectivenessSummary(scope, state.config.includeGlobalScope, args.days ?? 7);
                 return JSON.stringify(dashboard, null, 2);
             },
@@ -995,7 +996,7 @@ ${explanations.join("\n")}`;
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const scope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const kpi = await state.store.getKpiSummary(scope, args.days ?? 30);
                 return JSON.stringify(kpi, null, 2);
             },
@@ -1012,7 +1013,7 @@ ${explanations.join("\n")}`;
                 await state.ensureInitialized();
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const records = await state.store.exportAllRecords(scopes);
                 if (args.dryRun) {
@@ -1073,7 +1074,7 @@ ${explanations.join("\n")}`;
                 if (!Array.isArray(payload?.memories)) {
                     return JSON.stringify({ error: "Not a memory_export backup (missing memories array)" }, null, 2);
                 }
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const source = payload?.memories ?? [];
                 let imported = 0;
@@ -1203,7 +1204,7 @@ ${explanations.join("\n")}`;
                 if (summarizeCfg.enabled === false) {
                     return JSON.stringify({ error: "Summarization disabled via config summarize.enabled=false" }, null, 2);
                 }
-                const activeScope = args.scope ?? deriveProjectScope(context.directory || context.worktree);
+                const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 const minAgeDays = args.minAgeDays ?? summarizeCfg.minAgeDays;
                 const minGroupSize = args.minGroupSize ?? summarizeCfg.minGroupSize;
@@ -1347,7 +1348,7 @@ ${explanations.join("\n")}`;
                     return JSON.stringify({ error: "Memory retention disabled via config retention.memory.enabled=false" }, null, 2);
                 }
                 const result = await sweepExpiredMemories(state, {
-                    scope: args.scope ?? deriveProjectScope(context.directory || context.worktree),
+                    scope: resolveScope(args.scope, context.directory || context.worktree),
                     dryRun: args.dryRun === true,
                     unusedDays: args.unusedDays,
                     minAgeDays: args.minAgeDays,
