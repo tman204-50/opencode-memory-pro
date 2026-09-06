@@ -340,6 +340,71 @@ test("integration: forced compaction is safe on a fresh store", async () => {
     }
 });
 
+test("integration: dimension-mismatch is detected on init, and repair rebuilds the table at the new dimension", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mem-dimmismatch-"));
+    const dbPath = join(dir, "lancedb");
+
+    // Phase 1: create the store at DIM and write some real memories.
+    const store1 = new MemoryStore(dbPath);
+    await store1.init(DIM);
+    try {
+        await store1.put(makeRecord("dim-1", "first memory before the embedding model switch"));
+        await store1.put(makeRecord("dim-2", "second memory before the embedding model switch"));
+        await store1.put(makeRecord("dim-3", "third memory in a different scope", { scope: "proj-x" }));
+        await store1.updateMemoryScope("dim-3", "proj-x", ["global"]).catch(() => { });
+
+        const health1 = store1.getIndexHealth();
+        assert.equal(health1.dimensionMismatch, false, "freshly created table matches its own dimension");
+        assert.equal(health1.expectedDim, DIM);
+        assert.equal(health1.actualDim, DIM);
+    }
+    finally {
+        store1.close();
+    }
+
+    // Phase 2: reopen the SAME store, simulating a switch to a smaller-dim
+    // embedder (init()'s vectorDim argument is what a live embedder.dim()
+    // probe would have returned under the new model).
+    const NEW_DIM = 8;
+    const store2 = new MemoryStore(dbPath);
+    await store2.init(NEW_DIM);
+    try {
+        const health2 = store2.getIndexHealth();
+        assert.equal(health2.dimensionMismatch, true, "opening an existing table with a different embedder dim must be flagged");
+        assert.equal(health2.expectedDim, DIM, "expectedDim reports the table's real physical width");
+        assert.equal(health2.actualDim, NEW_DIM, "actualDim reports what the current embedder just probed");
+        assert.equal(await store2.getPhysicalVectorDim(), DIM);
+
+        // Repair, mirroring exactly what the memory_reembed tool does.
+        const scopes = await store2.listDistinctScopes();
+        assert.ok(scopes.includes("global") && scopes.includes("proj-x"), "must discover every scope, not just one");
+        const records = await store2.exportAllRecords(scopes);
+        assert.equal(records.length, 3, "must export every row across every scope before rebuilding");
+        const idsBefore = records.map((r) => r.id).sort();
+
+        await store2.connection.dropTable("memories");
+        store2.table = null;
+        await store2.init(NEW_DIM);
+
+        for (const record of records) {
+            const vector = deterministicEmbed(record.text).slice(0, NEW_DIM);
+            await store2.put({ ...record, vector, vectorDim: vector.length, embeddingModel: "test-embed-new" });
+        }
+
+        assert.equal(await store2.getPhysicalVectorDim(), NEW_DIM, "table must be physically rebuilt at the new dimension");
+        assert.equal(store2.getIndexHealth().dimensionMismatch, false, "post-repair health must report no mismatch");
+
+        const afterScopes = await store2.listDistinctScopes();
+        const afterRecords = await store2.exportAllRecords(afterScopes);
+        assert.deepEqual(afterRecords.map((r) => r.id).sort(), idsBefore, "every original id must survive the rebuild");
+        assert.ok(afterRecords.every((r) => r.vector.length === NEW_DIM), "every row must carry a vector at the new dimension");
+        assert.ok(afterRecords.find((r) => r.id === "dim-1").text.includes("first memory"), "original text must be preserved");
+    }
+    finally {
+        store2.close();
+    }
+});
+
 test("integration: plugin E2E scenario (subprocess)", async () => {
     const result = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["test/scenario-e2e.mjs"], {

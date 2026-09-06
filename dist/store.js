@@ -56,6 +56,13 @@ export class MemoryStore {
         ftsError: "",
         vectorRetries: 0,
         ftsRetries: 0,
+        // DIMENSION_MISMATCH_DETECT: set by init() by comparing the live
+        // embedder's probed dimension against the "vector" column's actual
+        // physical FixedSizeList width (fixed forever once the table's first
+        // row is written). See getPhysicalVectorDim() / repairEmbeddingDimension().
+        dimensionMismatch: false,
+        expectedDim: null,
+        actualDim: null,
     };
     scopeCache = new Map();
     // SCOPE_CACHE_LAZY (1.1.7): per-scope write counter. invalidateScope()
@@ -362,6 +369,35 @@ export class MemoryStore {
         await this.ensureMemoriesTableCompatibility();
         await this.ensureEventTableCompatibility();
         await this.ensureIndexes();
+        // DIMENSION_MISMATCH_DETECT: compare the embedder dimension this
+        // process just probed (vectorDim, the init() argument) against the
+        // table's actual physical column width. They only diverge when
+        // embedding.provider/embedding.model was changed to a different-
+        // output-size model without resetting the store — and when that
+        // happens, LanceDB does NOT reject the mismatched write; it silently
+        // coerces it into the old fixed-width column (corrupting the vector),
+        // and every vectorSearch() call at the new dimension throws (silently
+        // swallowed by findSimilarVectors's catch), so dedup/consolidation
+        // silently stop finding neighbors for anything written after the
+        // switch. See repairEmbeddingDimension() for the fix.
+        try {
+            const physicalDim = await this.getPhysicalVectorDim();
+            this.indexState.expectedDim = physicalDim;
+            this.indexState.actualDim = vectorDim;
+            this.indexState.dimensionMismatch = physicalDim !== null && physicalDim !== vectorDim;
+            if (this.indexState.dimensionMismatch) {
+                log("warn", `[store] Embedding dimension mismatch: the embedder currently produces ` +
+                    `${vectorDim}-dim vectors, but this store's "vector" column is physically fixed ` +
+                    `at ${physicalDim}-dim (set when the table was first created). New memories will ` +
+                    `be written with corrupted vectors and dedup/consolidation will silently stop ` +
+                    `finding neighbors for anything written from now on. Fix: call the memory_reembed ` +
+                    `tool (dryRun:false, confirm:true) to back up and re-embed every memory under the ` +
+                    `current model.`);
+            }
+        }
+        catch (error) {
+            log("debug", `[store] dimension-mismatch check failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         const retentionDays = this.retentionConfig?.effectivenessEventsDays;
         if (retentionDays !== undefined && retentionDays > 0) {
             await this.cleanupExpiredEvents(undefined, retentionDays);
@@ -1673,7 +1709,32 @@ export class MemoryStore {
             ftsError: this.indexState.ftsError || undefined,
             vectorRetries: this.indexState.vectorRetries,
             ftsRetries: this.indexState.ftsRetries,
+            dimensionMismatch: this.indexState.dimensionMismatch,
+            expectedDim: this.indexState.expectedDim,
+            actualDim: this.indexState.actualDim,
         };
+    }
+    // DIMENSION_MISMATCH_DETECT: the "vector" column is an Arrow
+    // FixedSizeList whose width is fixed forever by the first row ever
+    // written to the table (LanceDB/Arrow enforce a uniform width per
+    // column) — NOT by whatever `vectorDim` a later write claims in its
+    // bookkeeping column. Reading it back via table.schema() is the only
+    // reliable way to know the table's true, physical embedding dimension.
+    async getPhysicalVectorDim() {
+        const table = this.requireTable();
+        const schema = await table.schema();
+        const vectorField = schema.fields.find((field) => field.name === "vector");
+        const listSize = vectorField?.type?.listSize;
+        return typeof listSize === "number" ? listSize : null;
+    }
+    // DIMENSION_MISMATCH_REPAIR: a dimension mismatch is a whole-table
+    // structural problem (the physical column width is table-wide, not
+    // scope-scoped), so the repair must span every scope present, not just
+    // the caller's current scope.
+    async listDistinctScopes() {
+        const table = this.requireTable();
+        const rows = await table.query().select(["scope"]).limit(200000).toArray();
+        return [...new Set(rows.map((row) => String(row.scope ?? "")).filter((scope) => scope.length > 0))];
     }
     invalidateScope(scope) {
         this.scopeVersions.set(scope, (this.scopeVersions.get(scope) ?? 0) + 1);

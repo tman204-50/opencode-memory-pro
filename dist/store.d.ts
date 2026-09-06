@@ -98,7 +98,12 @@ export declare class MemoryStore {
         ftsError?: string;
         vectorRetries?: number;
         ftsRetries?: number;
+        dimensionMismatch: boolean;
+        expectedDim: number | null;
+        actualDim: number | null;
     };
+    getPhysicalVectorDim(): Promise<number | null>;
+    listDistinctScopes(): Promise<string[]>;
     private invalidateScope;
     private getCachedScopes;
     private enforceMaxScopes;

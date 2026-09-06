@@ -92,6 +92,17 @@ export declare function createMemoryTools(state: ToolRuntimeState): {
             scope?: string | undefined;
         }, context: import("@opencode-ai/plugin").ToolContext): Promise<string>;
     };
+    memory_reembed: {
+        description: string;
+        args: {
+            dryRun: import("zod").ZodDefault<import("zod").ZodOptional<import("zod").ZodBoolean>>;
+            confirm: import("zod").ZodDefault<import("zod").ZodOptional<import("zod").ZodBoolean>>;
+        };
+        execute(args: {
+            dryRun: boolean;
+            confirm: boolean;
+        }): Promise<string>;
+    };
     memory_event_cleanup: {
         description: string;
         args: {

@@ -426,6 +426,7 @@ All tools are auto-registered when the plugin loads. Hybrid recall surfaces
 | `memory_event_cleanup` | Clean up expired effectiveness events (optional archive). |
 | `memory_consolidate` | Merge near-duplicate memories in a scope. |
 | `memory_consolidate_all` | Global duplicate cleanup (daily cron friendly). |
+| `memory_reembed` | Detect/repair an embedding-dimension mismatch (backs up, rebuilds the table, re-embeds every memory). |
 
 **Scoping**
 
@@ -475,6 +476,45 @@ npm run verify      # tests + pack dry-run
 CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
+
+### v1.4.1 (2026-09-06)
+
+New `memory_reembed` tool — detects and repairs embedding-dimension
+mismatches, which previously corrupted the store silently:
+
+- **Root cause**: the `memories` table's `vector` column is an Arrow
+  `FixedSizeList` whose width is fixed forever by the first row ever
+  written. `init()` re-probes the embedder's dimension on every startup but
+  silently discarded that value once a table already existed — nothing ever
+  compared "what the embedder produces now" against "what the table is
+  physically built for." Switching `embedding.provider`/`embedding.model` to
+  a different-dimension model did not error: LanceDB silently coerced
+  mismatched writes into the old fixed-width column (corrupting the vector,
+  not rejecting the write), and every `vectorSearch()` call at the new
+  dimension threw inside `findSimilarVectors`'s catch block, which silently
+  swallowed it — so write-time dedup and `memory_consolidate` silently
+  stopped finding neighbors for anything written after the switch, with zero
+  visible symptom beyond a passive `memory_stats.incompatibleVectors` count.
+- **Detection**: `init()` now reads back the table's actual physical vector
+  width (`getPhysicalVectorDim()`) and compares it to the freshly-probed
+  embedder dimension on every startup, logging a `warn` on mismatch.
+  `getIndexHealth()` (and therefore `memory_stats.index`) now reports
+  `dimensionMismatch`/`expectedDim`/`actualDim`, and `computeDegradedFlags`
+  surfaces an `embedding-dimension-mismatch` flag pointing at the fix.
+- **Repair**: `memory_reembed` (`dryRun` default `true`, `confirm` gate for
+  the actual repair — same pattern as `memory_clear`/`memory_forget`)
+  discovers every scope in the store (a dimension mismatch is table-wide,
+  not scope-scoped), backs up every memory to
+  `<dbPath's parent>/backups/reembed-repair-<ts>.json` (same shape as
+  `memory_export`, written *before* any mutation, always), then drops and
+  recreates the `memories` table at the current embedder's dimension and
+  re-embeds every memory from its stored text under its original id (so
+  entity-graph edges and citation chains keyed by id stay valid).
+- **Tests**: new integration test covers detection on a freshly-created
+  table (no false positive), detection after reopening with a different
+  dimension, and a full repair pass — asserting the physical column width
+  actually changes, every original id/text survives, and post-repair health
+  reports no mismatch.
 
 ### v1.4.0 (2026-09-06)
 
