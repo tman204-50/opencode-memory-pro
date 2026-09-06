@@ -1,4 +1,4 @@
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { validateEpisodicRecord, validateEpisodicRecordArray } from "./types.js";
 import { tokenize } from "./utils.js";
@@ -68,6 +68,16 @@ export class MemoryStore {
     // logged but never fatal.
     static OPTIMIZE_INTERVAL_MS = 6 * 60 * 60 * 1000;
     static OPTIMIZE_MIN_VERSIONS = 500;
+    // OPTIMIZE_LOCK (1.3.4): two opencode processes sharing one store both run
+    // maybeOptimizeAll on first writes after a restart (lastOptimizeAt=0), so
+    // their optimize() calls race. The loser's native Rust env_logger prints
+    // "Compaction commit failed; leaving N rewritten fragment(s) in place for
+    // GC" DIRECTLY to stderr — the plugin has no JS hook to intercept it (no
+    // RUST_LOG in the binary), so it lands on the TUI no matter what log()
+    // does. A lock file serializes compaction across processes; the loser just
+    // skips this cycle (the 6h interval retries later). Stale locks (owner
+    // process dead or older than the TTL) are reclaimed.
+    static OPTIMIZE_LOCK_TTL_MS = 30 * 60 * 1000;
     optimizing = false;
     lastOptimizeAt = 0;
     constructor(dbPath, cacheConfig) {
@@ -75,12 +85,72 @@ export class MemoryStore {
         this.cacheConfig = { ...DEFAULT_CACHE_CONFIG, ...cacheConfig };
     }
     /**
+     * Cross-process compaction lock. Returns true when this process owns the
+     * lock; false when another live process holds it (or the lock could not be
+     * taken). Stale locks are reclaimed: owner pid no longer alive, or the lock
+     * file is older than OPTIMIZE_LOCK_TTL_MS (crash fallback; the pid check
+     * covers the normal case).
+     */
+    async acquireOptimizeLock() {
+        await mkdir(this.dbPath, { recursive: true }).catch(() => { });
+        const lockFile = join(this.dbPath, ".optimize.lock");
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                const handle = await open(lockFile, "wx");
+                try {
+                    await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8");
+                }
+                catch { }
+                await handle.close();
+                return true;
+            }
+            catch (error) {
+                if (error?.code !== "EEXIST")
+                    return false;
+                let stale = false;
+                try {
+                    const content = await readFile(lockFile, "utf8");
+                    const [pidStr, tsStr] = content.split("\n");
+                    const ownerPid = Number(pidStr);
+                    const ownerTs = Number(tsStr);
+                    if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
+                        stale = true;
+                    }
+                    else if (Number.isFinite(ownerTs) && Date.now() - ownerTs > MemoryStore.OPTIMIZE_LOCK_TTL_MS) {
+                        stale = true;
+                    }
+                    else if (ownerPid !== process.pid) {
+                        try {
+                            process.kill(ownerPid, 0);
+                        }
+                        catch {
+                            stale = true;
+                        }
+                    }
+                }
+                catch {
+                    stale = true;
+                }
+                if (!stale)
+                    return false;
+                await rm(lockFile, { force: true }).catch(() => { });
+            }
+        }
+        return false;
+    }
+    async releaseOptimizeLock() {
+        await rm(join(this.dbPath, ".optimize.lock"), { force: true }).catch(() => { });
+    }
+    /**
      * Version-count-gated Lance compaction. Non-blocking: reads the _versions
      * directory for each open table and optimizes the ones that crossed the
      * threshold (or all when force=true), throttled by an interval so chatty
      * sessions can't trigger it every turn. cleanupOlderThan=1h keeps
      * in-flight recent versions; deleteUnverified removes orphaned fragment
-     * files (safe under Lance's exclusive table write lock).
+     * files (safe under Lance's exclusive table write lock). The cross-process
+     * lock keeps two opencode instances from racing optimize() on a shared
+     * store — the race is what makes lance print "Compaction commit failed" to
+     * stderr (uninterceptable), so the lock is what keeps it out of the TUI.
      */
     async maybeOptimizeAll(force = false) {
         if (this.optimizing)
@@ -121,27 +191,37 @@ export class MemoryStore {
             return;
         this.optimizing = true;
         try {
-            const olderThan = new Date(Date.now() - 60 * 60 * 1000);
-            log("debug", `[store] optimize candidates: ${candidates.map((c) => `${c.table.name}(${c.count})`).join(", ")}`);
-            for (const { table, count } of candidates) {
-                try {
-                    const stats = await table.optimize({ cleanupOlderThan: olderThan, deleteUnverified: true });
-                    log("info", `[store] optimized ${table.name}: ${count} versions before, pruned=${stats.prune.oldVersionsRemoved}, bytesRemoved=${stats.prune.bytesRemoved}`);
-                }
-                catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
-                    // Known-benign LanceDB compaction races: a concurrent write
-                    // (or a second optimize pass) commits a newer version between
-                    // our read and our commit. Lance leaves the rewritten
-                    // fragments for GC and the next optimize retry succeeds (and
-                    // the success line below is logged). Keep these out of the
-                    // TUI; they still land in the plugin log file for debugging.
-                    if (/Retryable commit conflict|Compaction commit failed/.test(message)) {
-                        logFileOnly("warn", `[store] optimize conflict for ${table.name} (self-heals on retry): ${message}`);
-                        continue;
+            const lockHeld = await this.acquireOptimizeLock();
+            if (!lockHeld) {
+                logFileOnly("warn", "[store] optimize skipped: another process holds the compaction lock (retries next interval)");
+                return;
+            }
+            try {
+                const olderThan = new Date(Date.now() - 60 * 60 * 1000);
+                log("debug", `[store] optimize candidates: ${candidates.map((c) => `${c.table.name}(${c.count})`).join(", ")}`);
+                for (const { table, count } of candidates) {
+                    try {
+                        const stats = await table.optimize({ cleanupOlderThan: olderThan, deleteUnverified: true });
+                        log("info", `[store] optimized ${table.name}: ${count} versions before, pruned=${stats.prune.oldVersionsRemoved}, bytesRemoved=${stats.prune.bytesRemoved}`);
                     }
-                    log("warn", `[store] optimize failed for ${table.name}: ${message}`);
+                    catch (error) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        // Known-benign LanceDB compaction races: a concurrent write
+                        // (or a second optimize pass) commits a newer version between
+                        // our read and our commit. Lance leaves the rewritten
+                        // fragments for GC and the next optimize retry succeeds (and
+                        // the success line below is logged). Keep these out of the
+                        // TUI; they still land in the plugin log file for debugging.
+                        if (/Retryable commit conflict|Compaction commit failed/.test(message)) {
+                            logFileOnly("warn", `[store] optimize conflict for ${table.name} (self-heals on retry): ${message}`);
+                            continue;
+                        }
+                        log("warn", `[store] optimize failed for ${table.name}: ${message}`);
+                    }
                 }
+            }
+            finally {
+                await this.releaseOptimizeLock();
             }
         }
         finally {
@@ -224,9 +304,13 @@ export class MemoryStore {
         // LANCE_COMPACTION_FIX (1.1.6): fire-and-forget so a first-run
         // compaction of a backlogged store (13k+ versions) doesn't block init —
         // it compacts in the background once the version gate passes.
-        void this.maybeOptimizeAll(false).catch((error) => {
-            log("warn", `[store] startup optimize failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+        // OPTIMIZE_JITTER (1.3.4): staggered 5–30s so two instances that boot
+        // together don't race for the compaction lock in the same instant.
+        setTimeout(() => {
+            void this.maybeOptimizeAll(false).catch((error) => {
+                log("warn", `[store] startup optimize failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
+        }, 5_000 + Math.floor(Math.random() * 25_000));
     }
     // GRACEFUL_SHUTDOWN: lance's commit path spawns a background
     // auto_cleanup_hook task; if the process exits without closing the
