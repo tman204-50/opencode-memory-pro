@@ -381,3 +381,55 @@ test("utils: classifyFailure buckets error messages", async () => {
     assert.equal(classifyFailure("ECONNREFUSED to 127.0.0.1:8080"), "resource");
     assert.equal(classifyFailure("some totally unique message"), "unknown");
 });
+// OPTIMIZE_LOCK_TOCTOU (1.3.6): the 1.3.4 lock treated an EMPTY lock file as
+// stale and deleted it, but the owner creates the file with open("wx") and
+// only THEN writes its pid. A contender reading in between could steal the
+// lock, making two instances both "own" it and race optimize() — which puts
+// "Compaction commit failed" on the TUI. The fix waits through the
+// open->write window instead of reclaiming immediately.
+import { open as fsOpen, mkdtemp, rm as fsRm, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MemoryStore } from "../dist/store.js";
+
+test("optimize lock: does not steal a lock during the owner's open->write window", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "omp-lock-"));
+    try {
+        const store = new MemoryStore(dir, {});
+        const lockFile = join(dir, ".optimize.lock");
+        // Simulate the owner having created the lock via open("wx") but not
+        // yet written its pid (the exact race window from the 1.3.4 bug).
+        const handle = await fsOpen(lockFile, "wx");
+        const acquirePromise = store.acquireOptimizeLock();
+        // Owner finishes initializing ~100ms later (well inside the grace).
+        await new Promise((r) => setTimeout(r, 100));
+        await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8");
+        await handle.close();
+        const acquired = await acquirePromise;
+        // The lock was still being initialized and is now owned by a live
+        // process (us): the contender must NOT steal it. The 1.3.4 code read
+        // the empty file as "stale", deleted it, recreated it and returned
+        // true — the bug that let two instances both own the lock.
+        assert.equal(acquired, false);
+        const content = await readFile(lockFile, "utf8");
+        assert.ok(content.startsWith(`${process.pid}\n`), "lock file still owned by the original owner");
+    } finally {
+        await fsRm(dir, { recursive: true, force: true });
+    }
+});
+
+test("optimize lock: reclaims a genuinely stale lock after the grace window", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "omp-lock-stale-"));
+    try {
+        const store = new MemoryStore(dir, {});
+        const lockFile = join(dir, ".optimize.lock");
+        // Dead owner pid (not alive), lock content well inside TTL.
+        await writeFile(lockFile, "999999\n1234567890\n", "utf8");
+        const acquired = await store.acquireOptimizeLock();
+        assert.equal(acquired, true);
+        const content = await readFile(lockFile, "utf8");
+        assert.ok(content.startsWith(`${process.pid}\n`), "reclaimed lock now owned by this pid");
+    } finally {
+        await fsRm(dir, { recursive: true, force: true });
+    }
+});

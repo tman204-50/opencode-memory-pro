@@ -78,6 +78,17 @@ export class MemoryStore {
     // skips this cycle (the 6h interval retries later). Stale locks (owner
     // process dead or older than the TTL) are reclaimed.
     static OPTIMIZE_LOCK_TTL_MS = 30 * 60 * 1000;
+    // OPTIMIZE_LOCK_WAIT (1.3.6): the 1.3.4 lock gave up instantly when a live
+    // process held it, and worse, it treated an EMPTY lock file as stale and
+    // deleted it. But the owner creates the file with open("wx") and only THEN
+    // writes its pid — a reader landing in that window read 0 bytes, declared
+    // the lock stale, deleted it, and both processes "owned" the lock and raced
+    // optimize(), which is what puts "Compaction commit failed; leaving N
+    // rewritten fragments in place for GC" back on the TUI. Now a contender
+    // WAITS a bounded amount of time for a live owner to finish (serializing
+    // the compaction), and only reclaims after the pid should have been
+    // written or the 30min TTL passes.
+    static OPTIMIZE_LOCK_WAIT_MS = 10 * 1000;
     optimizing = false;
     lastOptimizeAt = 0;
     constructor(dbPath, cacheConfig) {
@@ -94,7 +105,9 @@ export class MemoryStore {
     async acquireOptimizeLock() {
         await mkdir(this.dbPath, { recursive: true }).catch(() => { });
         const lockFile = join(this.dbPath, ".optimize.lock");
-        for (let attempt = 0; attempt < 2; attempt += 1) {
+        const deadline = Date.now() + MemoryStore.OPTIMIZE_LOCK_WAIT_MS;
+        let waitedMs = 0;
+        for (;;) {
             try {
                 const handle = await open(lockFile, "wx");
                 try {
@@ -102,6 +115,9 @@ export class MemoryStore {
                 }
                 catch { }
                 await handle.close();
+                if (waitedMs > 0) {
+                    log("debug", `[store] acquired compaction lock after ${waitedMs}ms wait`);
+                }
                 return true;
             }
             catch (error) {
@@ -114,6 +130,16 @@ export class MemoryStore {
                     const ownerPid = Number(pidStr);
                     const ownerTs = Number(tsStr);
                     if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
+                        // The owner creates the file with open("wx") and only
+                        // THEN writes the pid; reading in between yields empty
+                        // content. Treat that as "being initialized", not stale
+                        // — this was the 1.3.4 bug that let two instances both
+                        // own the lock and race optimize().
+                        if (waitedMs < 250) {
+                            await new Promise((resolve) => setTimeout(resolve, 50));
+                            waitedMs += 50;
+                            continue;
+                        }
                         stale = true;
                     }
                     else if (Number.isFinite(ownerTs) && Date.now() - ownerTs > MemoryStore.OPTIMIZE_LOCK_TTL_MS) {
@@ -127,16 +153,37 @@ export class MemoryStore {
                             stale = true;
                         }
                     }
+                    else {
+                        // Same process already owns it (shouldn't happen with
+                        // the optimizing guard; never deadlock on ourselves).
+                        return false;
+                    }
                 }
                 catch {
+                    // Lock vanished between the EEXIST and the read (owner
+                    // released); give it a short grace before reclaiming.
+                    if (waitedMs < 150) {
+                        await new Promise((resolve) => setTimeout(resolve, 50));
+                        waitedMs += 50;
+                        continue;
+                    }
                     stale = true;
                 }
-                if (!stale)
-                    return false;
+                if (!stale) {
+                    // Live owner: wait for it to finish instead of racing it,
+                    // until the bounded deadline (then skip this cycle).
+                    if (Date.now() >= deadline) {
+                        logFileOnly("debug", "[store] compaction lock still held after waiting; skipping this cycle");
+                        return false;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                    waitedMs += 100;
+                    continue;
+                }
+                // Stale: reclaim and loop back to try creating the lock.
                 await rm(lockFile, { force: true }).catch(() => { });
             }
         }
-        return false;
     }
     async releaseOptimizeLock() {
         await rm(join(this.dbPath, ".optimize.lock"), { force: true }).catch(() => { });
@@ -155,42 +202,51 @@ export class MemoryStore {
     async maybeOptimizeAll(force = false) {
         if (this.optimizing)
             return;
-        const elapsed = Date.now() - this.lastOptimizeAt;
-        if (!force && elapsed < MemoryStore.OPTIMIZE_INTERVAL_MS)
-            return;
-        const tables = [this.table, this.eventTable, this.episodicTaskTable].filter(Boolean);
-        const candidates = [];
-        for (const table of tables) {
-            let count = 0;
-            // LANCE_COMPACTION_FIX (1.1.6): LanceDB stores each table on disk as
-            // "<name>.lance", but Table.name only carries the bare name — so the
-            // old readdir(.../table.name/_versions) always hit ENOENT, the catch
-            // swallowed it, and optimize() NEVER ran. Result: 13k+ _versions and
-            // 11k+ fragment files accumulated (disk + native handle/cache growth
-            // per write, EMFILE/OOM risk). Try the real on-disk dir first.
-            for (const dirName of [`${table.name}.lance`, table.name]) {
-                try {
-                    const entries = await readdir(join(this.dbPath, dirName, "_versions"), { withFileTypes: true });
-                    count = entries.filter((e) => e.isFile()).length;
-                    if (count > 0)
-                        break;
-                }
-                catch { }
-            }
-            if (force || count >= MemoryStore.OPTIMIZE_MIN_VERSIONS) {
-                candidates.push({ table, count });
-            }
-            else {
-                log("debug", `[store] optimize skipped for ${table.name}: ${count} versions (min ${MemoryStore.OPTIMIZE_MIN_VERSIONS})`);
-            }
-        }
-        if (force) {
-            this.lastOptimizeAt = Date.now();
-        }
-        if (candidates.length === 0)
-            return;
+        // OPTIMIZE_GUARD (1.3.6): set the in-process guard synchronously,
+        // BEFORE any await. The 1.3.4 code set it only after the async
+        // candidate enumeration, so two overlapping calls in one process (the
+        // fire-and-forget write trigger plus an awaited explicit call on the
+        // first turn) could both pass the guard and run optimize()
+        // concurrently — another way into the "Compaction commit failed" race.
         this.optimizing = true;
+        let attempted = false;
         try {
+            const elapsed = Date.now() - this.lastOptimizeAt;
+            if (!force && elapsed < MemoryStore.OPTIMIZE_INTERVAL_MS)
+                return;
+            const tables = [this.table, this.eventTable, this.episodicTaskTable].filter(Boolean);
+            const candidates = [];
+            for (const table of tables) {
+                let count = 0;
+                // LANCE_COMPACTION_FIX (1.1.6): LanceDB stores each table on disk as
+                // "<name>.lance", but Table.name only carries the bare name — so the
+                // old readdir(.../table.name/_versions) always hit ENOENT, the catch
+                // swallowed it, and optimize() NEVER ran. Result: 13k+ _versions and
+                // 11k+ fragment files accumulated (disk + native handle/cache growth
+                // per write, EMFILE/OOM risk). Try the real on-disk dir first.
+                for (const dirName of [`${table.name}.lance`, table.name]) {
+                    try {
+                        const entries = await readdir(join(this.dbPath, dirName, "_versions"), { withFileTypes: true });
+                        count = entries.filter((e) => e.isFile()).length;
+                        if (count > 0)
+                            break;
+                    }
+                    catch { }
+                }
+                if (force || count >= MemoryStore.OPTIMIZE_MIN_VERSIONS) {
+                    candidates.push({ table, count });
+                }
+                else {
+                    log("debug", `[store] optimize skipped for ${table.name}: ${count} versions (min ${MemoryStore.OPTIMIZE_MIN_VERSIONS})`);
+                }
+            }
+            if (force) {
+                this.lastOptimizeAt = Date.now();
+                attempted = true;
+            }
+            if (candidates.length === 0)
+                return;
+            attempted = true;
             const lockHeld = await this.acquireOptimizeLock();
             if (!lockHeld) {
                 logFileOnly("warn", "[store] optimize skipped: another process holds the compaction lock (retries next interval)");
@@ -226,7 +282,9 @@ export class MemoryStore {
         }
         finally {
             this.optimizing = false;
-            this.lastOptimizeAt = Date.now();
+            if (attempted) {
+                this.lastOptimizeAt = Date.now();
+            }
         }
     }
     async init(vectorDim) {
