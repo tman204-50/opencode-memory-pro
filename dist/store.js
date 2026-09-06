@@ -10,6 +10,13 @@ const DEFAULT_CACHE_CONFIG = {
     maxScopes: 10,
     maxRecordsPerScope: 1000,
     enabled: true,
+    // SCOPE_CACHE_STALENESS (1.4.0): the version counter only sees THIS
+    // process's writes, so when two opencode processes share one dbPath the
+    // scope cache could serve stale records forever. A modest age-based
+    // staleness bound forces a reload after staleAfterMs even when the local
+    // version is unchanged, bounding cross-process staleness without a schema
+    // change. 0 disables the age check (pure version gating, pre-1.4.0).
+    staleAfterMs: 60 * 1000,
 };
 // ANN_TUNABLES (1.3.0): nprobes controls IVF recall-vs-latency on filtered
 // vector searches; the consolidation query batch controls how many ANN
@@ -642,6 +649,9 @@ export class MemoryStore {
         }
         const table = this.requireTable();
         const rows = await table.query().limit(100000).toArray();
+        if (rows.length === 100000) {
+            log("warn", "[store] deleteByIdForce fallback scan hit the 100000-row cap; the target may not be found if it lives beyond the cap");
+        }
         const match = rows.find((row) => this.matchesId(row.id, id));
         if (!match)
             return false;
@@ -711,6 +721,9 @@ export class MemoryStore {
     }
     async pruneScope(scope, maxEntries) {
         const rows = await this.list(scope, 100000);
+        if (rows.length === 100000) {
+            log("warn", `[store] pruneScope scanned up to the 100000-row cap for scope=${scope}; entries older than the newest 100k are not candidates for pruning`);
+        }
         if (rows.length <= maxEntries)
             return 0;
         const flagged = rows.filter((r) => {
@@ -748,7 +761,7 @@ export class MemoryStore {
         let rows = await this.readByScopesIncludingMerged([scope]);
         rows = rows.filter((r) => r.status === undefined || r.status === null || r.status === "" || r.status === "active");
         if (rows.length === 0) {
-            return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0 };
+            return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0, clearedFlags: 0 };
         }
         const BATCH_SIZE = 100;
         const FALLBACK_THRESHOLD = 500;
@@ -763,12 +776,23 @@ export class MemoryStore {
             row,
             norm: this.scopeCache.get(scope)?.norms.get(row.id) ?? vecNorm(row.vector),
         }));
+        // DEDUP_FLAG_REVALIDATION (1.4.0): the write-time dedup check used to
+        // flag nearly every capture (RRF score >= 1.0 vs writeThreshold in
+        // [0,1]), and the flag was a one-way ratchet — nothing ever cleared it,
+        // so flaggedCount only grew. Consolidation is where a real cosine
+        // comparison happens, so flagged rows whose closest found neighbor
+        // stays below the consolidate threshold get the flag cleared; rows
+        // that DO have a near-duplicate keep it.
+        const metaById = new Map(rowsWithNorms.map(({ row }) => [row.id, parseMetadata(row.metadataJson)]));
+        const flaggedIds = new Set([...metaById].filter(([, meta]) => meta.isPotentialDuplicate === true).map(([id]) => id));
+        const bestSimByFlagged = new Map();
+        const mergedIds = new Set();
+        let clearedFlags = 0;
         log("debug", `[consolidate] scope=${scope} rows=${rows.length} threshold=${threshold} candidateLimit=${candidateLimit} batchSize=${BATCH_SIZE} fallbackThreshold=${FALLBACK_THRESHOLD}`);
         const processWithANN = async () => {
             let localMerged = 0;
             let localUpdated = 0;
             let localSkipped = 0;
-            const mergedIds = new Set();
             const totalChunks = Math.ceil(rowsWithNorms.length / BATCH_SIZE);
             for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
                 const chunkStart = chunkIdx * BATCH_SIZE;
@@ -805,6 +829,12 @@ export class MemoryStore {
                             if (mergedIds.has(b.row.id))
                                 continue;
                             const sim = storeFastCosine(a.row.vector, b.row.vector, a.norm, b.norm);
+                            if (flaggedIds.has(a.row.id)) {
+                                bestSimByFlagged.set(a.row.id, Math.max(bestSimByFlagged.get(a.row.id) ?? -1, sim));
+                            }
+                            if (flaggedIds.has(b.row.id)) {
+                                bestSimByFlagged.set(b.row.id, Math.max(bestSimByFlagged.get(b.row.id) ?? -1, sim));
+                            }
                             if (sim < threshold)
                                 continue;
                             const aMeta = parseMetadata(a.row.metadataJson);
@@ -879,7 +909,6 @@ export class MemoryStore {
             let localMerged = 0;
             let localUpdated = 0;
             let localSkipped = 0;
-            const mergedIds = new Set();
             for (let i = 0; i < rowsWithNorms.length; i += 1) {
                 const a = rowsWithNorms[i];
                 if (mergedIds.has(a.row.id))
@@ -889,6 +918,12 @@ export class MemoryStore {
                     if (mergedIds.has(b.row.id))
                         continue;
                     const sim = storeFastCosine(a.row.vector, b.row.vector, a.norm, b.norm);
+                    if (flaggedIds.has(a.row.id)) {
+                        bestSimByFlagged.set(a.row.id, Math.max(bestSimByFlagged.get(a.row.id) ?? -1, sim));
+                    }
+                    if (flaggedIds.has(b.row.id)) {
+                        bestSimByFlagged.set(b.row.id, Math.max(bestSimByFlagged.get(b.row.id) ?? -1, sim));
+                    }
                     if (sim < threshold)
                         continue;
                     const aMeta = parseMetadata(a.row.metadataJson);
@@ -955,14 +990,33 @@ export class MemoryStore {
             }
             else {
                 log("warn", `[consolidate] Skipping fallback for large scope (${rows.length} >= ${FALLBACK_THRESHOLD})`);
-                return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0 };
+                return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0, clearedFlags: 0 };
             }
         }
-        if (mergedPairs > 0) {
+        // DEDUP_FLAG_REVALIDATION (1.4.0): clear false duplicate flags. Rows
+        // whose best found neighbor never reached the merge threshold were
+        // flagged by the pre-1.4.0 RRF write-check (or carry a flag made stale
+        // by later edits); unsetting isPotentialDuplicate lets flaggedCount
+        // self-correct instead of ratcheting up forever.
+        for (const [id, bestSim] of bestSimByFlagged) {
+            if (mergedIds.has(id) || bestSim >= threshold)
+                continue;
+            const meta = metaById.get(id);
+            if (!meta || meta.isPotentialDuplicate !== true)
+                continue;
+            delete meta.isPotentialDuplicate;
+            delete meta.duplicateOf;
+            await this.requireTable().update({
+                where: `id = '${escapeSql(id)}'`,
+                values: { metadataJson: JSON.stringify(meta) },
+            });
+            clearedFlags += 1;
+        }
+        if (mergedPairs > 0 || clearedFlags > 0) {
             this.invalidateScope(scope);
         }
         await this.maybeOptimizeAll(false);
-        return { mergedPairs, updatedRecords, skippedRecords };
+        return { mergedPairs, updatedRecords, skippedRecords, clearedFlags };
     }
     // ANN_CONSOLIDATION (1.1.7): previously this did
 // query().where(scope).limit(limit).toArray() — which returns the FIRST N
@@ -1647,7 +1701,9 @@ export class MemoryStore {
         for (const scope of scopes) {
             const currentVersion = this.scopeVersions.get(scope) ?? 0;
             let entry = this.scopeCache.get(scope);
-            if (!entry || entry.version !== currentVersion) {
+            const maxAgeMs = Number.isFinite(this.cacheConfig.staleAfterMs) ? this.cacheConfig.staleAfterMs : 0;
+            const staleByAge = maxAgeMs > 0 && (entry ? Date.now() - (entry.loadedAt ?? entry.lastAccessTimestamp) > maxAgeMs : false);
+            if (!entry || entry.version !== currentVersion || staleByAge) {
                 if (entry) {
                     this.cacheStats.evictions++;
                 }
@@ -1667,7 +1723,7 @@ export class MemoryStore {
                 for (const record of sortedRecords) {
                     norms.set(record.id, vecNorm(record.vector));
                 }
-                entry = { records: sortedRecords, tokenized, idf, norms, lastAccessTimestamp: Date.now(), version: currentVersion };
+                entry = { records: sortedRecords, tokenized, idf, norms, loadedAt: Date.now(), lastAccessTimestamp: Date.now(), version: currentVersion };
                 this.scopeCache.set(scope, entry);
                 this.cacheStats.misses++;
                 this.enforceMaxScopes();

@@ -11,7 +11,7 @@ import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
 import { sweepExpiredMemories } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
-const PLUGIN_VERSION = "1.3.9";
+const PLUGIN_VERSION = "1.4.0";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
@@ -597,12 +597,16 @@ async function createRuntimeState(input) {
         activeEpisodes: new Map(),
         sessionErrors: new Map(),
         lastRecall: null,
+        // PER_SCOPE_COOLDOWN (1.4.0): cooldowns are per-scope (Map keyed by scope)
+        // instead of a single shared timestamp — one shared value meant the
+        // first scope to consolidate/sweep blocked every other scope for the
+        // whole 30-minute cooldown, even scopes that had never run.
         consolidationInProgress: new Map(),
-        lastConsolidateAt: 0,
+        lastConsolidateAt: new Map(),
         // MEMORY_RETENTION (1.0): digest-then-hide expiry sweep state — same
         // throttle pattern as consolidation (cooldown-gated, one per scope).
         sweepInProgress: new Map(),
-        lastSweepAt: 0,
+        lastSweepAt: new Map(),
         ensureInitialized: async () => {
             if (state.initialized)
                 return;
@@ -800,22 +804,19 @@ async function storeCapturedMemory(state, opts) {
     }
     let isPotentialDuplicate = false;
     let duplicateOf = null;
+    // DEDUP_COSINE_CHECK (1.4.0): the write-time dedup check used to go
+    // through the hybrid search() API, whose RRF score is algebraically >= 1.0
+    // for limit:1 (rrfScore = 1/(rrfK+1) * (rrfK+1) == 1.0, then multiplied by
+    // an importance factor in [1, 1.4]) — so every capture with any same-dim
+    // record in the scope compared >= 1.0 against writeThreshold (clamped
+    // [0,1]) and got falsely flagged as a duplicate. Now it uses
+    // findSimilarVectors, which returns a raw cosine similarity in [0,1], the
+    // same primitive consolidateDuplicates measures against.
     if (state.config.dedup.enabled) {
-        const similar = await state.store.search({
-            query: opts.text,
-            queryVector: vector,
-            scopes: [opts.scope],
-            limit: 1,
-            vectorWeight: 1.0,
-            bm25Weight: 0.0,
-            minScore: 0.0,
-            rrfK: 60,
-            recencyBoost: false,
-            globalDiscountFactor: 1.0,
-        });
+        const similar = await state.store.findSimilarVectors(vector, opts.scope, 1);
         if (similar.length > 0 && similar[0].score >= state.config.dedup.writeThreshold) {
             isPotentialDuplicate = true;
-            duplicateOf = similar[0].record.id;
+            duplicateOf = similar[0].id;
         }
     }
     const memoryId = generateId();
@@ -866,11 +867,12 @@ async function maybeConsolidateDuplicates(state, scope, force = false) {
     if (state.consolidationInProgress.get(scope))
         return;
     if (!force) {
-        const elapsed = Date.now() - state.lastConsolidateAt;
+        const last = state.lastConsolidateAt.get(scope) ?? 0;
+        const elapsed = Date.now() - last;
         if (elapsed < CONSOLIDATE_COOLDOWN_MS)
             return;
     }
-    state.lastConsolidateAt = Date.now();
+    state.lastConsolidateAt.set(scope, Date.now());
     state.consolidationInProgress.set(scope, true);
     state.store
         .consolidateDuplicates(scope, state.config.dedup.consolidateThreshold, state.config.dedup.candidateLimit)
@@ -888,11 +890,12 @@ async function maybeSweepExpiredMemories(state, scope, force = false) {
     if (state.sweepInProgress.get(scope))
         return;
     if (!force) {
-        const elapsed = Date.now() - state.lastSweepAt;
+        const last = state.lastSweepAt.get(scope) ?? 0;
+        const elapsed = Date.now() - last;
         if (elapsed < CONSOLIDATE_COOLDOWN_MS)
             return;
     }
-    state.lastSweepAt = Date.now();
+    state.lastSweepAt.set(scope, Date.now());
     state.sweepInProgress.set(scope, true);
     sweepExpiredMemories(state, { scope })
         .then((result) => {

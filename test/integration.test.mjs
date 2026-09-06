@@ -246,6 +246,87 @@ test("integration: consolidation merges near-duplicate memories", async () => {
     }
 });
 
+test("integration: dedup write-check primitive returns cosine in [0,1] (not RRF)", async () => {
+    const store = await newStore("mem-dedupcos-");
+    const text = "the team decided to use go for backend services and postgres for storage";
+    try {
+        await store.put(makeRecord("dup-a", text, { timestamp: Date.now() - 60_000 }));
+        await store.put(makeRecord("dup-b", text, { timestamp: Date.now() }));
+
+        // findSimilarVectors is what storeCapturedMemory now calls for the
+        // write-time dedup check: raw cosine, bounded to [0,1].
+        const similar = await store.findSimilarVectors(deterministicEmbed(text), "global", 1);
+        assert.ok(similar.length === 1, "top-1 similar should be returned");
+        assert.ok(similar[0].score <= 1.0001, `cosine must not exceed 1, got ${similar[0].score}`);
+        assert.ok(similar[0].score > 0.99, `identical texts should score near 1, got ${similar[0].score}`);
+
+        // Regression guard: the old write-check went through search() with
+        // vectorWeight=1/bm25=0/limit=1, whose RRF score is algebraically
+        // >= 1.0 regardless of similarity — the exact bug this fixed.
+        const rrf = await store.search({
+            query: text,
+            queryVector: deterministicEmbed(text),
+            scopes: ["global"],
+            limit: 1,
+            vectorWeight: 1.0,
+            bm25Weight: 0.0,
+            minScore: 0.0,
+            rrfK: 60,
+            recencyBoost: false,
+            globalDiscountFactor: 1.0,
+        });
+        assert.ok(rrf.length === 1 && rrf[0].score >= 1.0, "RRF score >= 1.0 (bug signature)");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: consolidation clears false isPotentialDuplicate flags", async () => {
+    const store = await newStore("mem-flagclear-");
+    try {
+        await store.put(makeRecord("flagged-1", "quantum entanglement photosynthesis ziggurat", {
+            metadataJson: JSON.stringify({ isPotentialDuplicate: true, duplicateOf: "whatever" }),
+        }));
+        await store.put(makeRecord("unrelated-1", "the team decided to use go for backend services and postgres for storage"));
+
+        const result = await store.consolidateDuplicates("global", 0.99, 10);
+        assert.equal(result.mergedPairs, 0, "dissimilar rows must not merge");
+        assert.ok(result.clearedFlags >= 1, `expected >=1 cleared flag, got ${JSON.stringify(result)}`);
+
+        const exported = await store.exportAllRecords(["global"]);
+        const flagged = exported.find((r) => r.id === "flagged-1");
+        assert.ok(flagged, "flagged row must still exist");
+        assert.ok(!flagged.metadataJson.includes("isPotentialDuplicate"), "flag must be cleared");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: scope cache reloads after age bound (cross-process staleness)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mem-cachettl-"));
+    const store = new MemoryStore(join(dir, "lancedb"), { staleAfterMs: 10 });
+    try {
+        await store.init(DIM);
+        await store.put(makeRecord("ttl-1", "cached memory about caching and staleness"));
+        const before = await store.search(searchParams("cached memory staleness", deterministicEmbed("cached memory staleness")));
+        assert.ok(before.some((r) => r.record.id === "ttl-1"), "record visible through the cache");
+
+        // Simulate another process writing to the shared store: delete the row
+        // through the table directly, bypassing invalidateScope (this process's
+        // version counter is not bumped, which is exactly the cross-process gap).
+        await store.requireTable().delete("id = 'ttl-1'");
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        const after = await store.search(searchParams("cached memory staleness", deterministicEmbed("cached memory staleness")));
+        assert.ok(!after.some((r) => r.record.id === "ttl-1"), "stale cache entry must be reloaded after the age bound");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: forced compaction is safe on a fresh store", async () => {
     const store = await newStore("mem-compact-");
     try {

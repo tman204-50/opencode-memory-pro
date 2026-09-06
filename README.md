@@ -40,7 +40,7 @@ Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥
 opencode plugin opencode-memory-pro
 ```
 
-The latest release is **v1.3.9** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
+The latest release is **v1.4.0** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
@@ -488,6 +488,44 @@ are unchanged (`~/.opencode/memory/lancedb` + `~/.opencode/memory/graph.db`),
 so your memories and graph carry over untouched.
 
 ## Changelog
+
+### v1.4.0 (2026-09-06)
+
+Dedup correctness overhaul — the write-time duplicate check compared against
+the wrong score type, and the resulting flags were a one-way ratchet:
+
+- **Write-time dedup now compares a raw cosine similarity**: the capture path
+  went through the hybrid `search()` API, whose RRF score is algebraically
+  `>= 1.0` for `limit: 1` (and up to `1.4` with importance) — so every capture
+  in a non-empty scope compared `>= 1.0` against `dedup.writeThreshold`
+  (clamped to `[0,1]`) and got falsely flagged as a potential duplicate.
+  `storeCapturedMemory` now calls `findSimilarVectors` (the same raw cosine
+  primitive consolidation measures) and compares that to the threshold.
+  Consequence: recall scores can no longer exceed 100%, and
+  `dedup.enabled`'s write-time detection actually detects.
+- **False duplicate flags now self-correct**: `isPotentialDuplicate` was a
+  one-way ratchet — consolidation never cleared it, so `memory_stats`
+  `flaggedCount` only grew (153 flagged / 0 merged observed on a live store).
+  `consolidateDuplicates` now revalidates flags against the real cosine
+  threshold and clears (`isPotentialDuplicate`/`duplicateOf` removed) any
+  flagged row whose closest found neighbor never reaches the merge bar.
+  Returns `clearedFlags` so tools can report the correction.
+- **Auto-consolidation cooldown is per-scope**: the shared
+  `lastConsolidateAt` timestamp meant the first scope to consolidate blocked
+  all other scopes for 30 minutes. Cooldowns are now tracked per scope
+  (same for the retention sweep, which had the identical flaw).
+- **Scope cache staleness bound**: the per-process version counter can't see
+  writes from another opencode process sharing the same `dbPath`, so process A
+  could serve stale records indefinitely. Cache entries now reload after a
+  60s age bound even when the local version is unchanged (configurable via
+  `cache.staleAfterMs`; 0 restores pure version gating).
+- **Consistent truncation warnings**: `deleteByIdForce`'s 100k-row fallback
+  scan and `pruneScope`'s 100k-row read now log a warning when the cap is hit,
+  matching `getCachedScopes`.
+- **Tests**: three new integration tests — the dedup write-check primitive
+  returns cosine in `[0,1]` (plus a guard that the old RRF path still scores
+  `>= 1.0`), consolidation clears false flags, and the scope cache reloads
+  after the age bound when a second process writes behind its back.
 
 ### v1.3.8 (2026-09-06)
 
