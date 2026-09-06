@@ -40,7 +40,7 @@ Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥
 opencode plugin opencode-memory-pro
 ```
 
-The latest release is **v1.3.5** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
+The latest release is **v1.3.6** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
@@ -407,6 +407,31 @@ are unchanged (`~/.opencode/memory/lancedb` + `~/.opencode/memory/graph.db`),
 so your memories and graph carry over untouched.
 
 ## Changelog
+
+### v1.3.6 (2026-09-06)
+
+Compaction lock hardening — fixes the "Compaction commit failed; leaving N
+rewritten fragment(s) in place for GC" warning reappearing on the TUI at
+startup / first turn when two opencode instances share one store:
+
+- **No more lock stealing during the owner's init window**: the owner creates
+  `.optimize.lock` with `open("wx")` and *then* writes its pid; a contender
+  reading in between saw an empty file, declared it stale, deleted it, and
+  created its own — so both processes "owned" the lock and raced `optimize()`
+  (the native LanceDB stderr line is uninterceptable by the plugin). The lock
+  now treats an empty file as "being initialized" for a short grace instead of
+  reclaiming it.
+- **Contenders wait instead of giving up instantly**: when a live process holds
+  the lock, the second instance now polls up to 10s for it to finish (serializing
+  compaction across processes) before skipping this cycle and retrying next
+  interval, instead of racing it.
+- **In-process guard set synchronously**: `maybeOptimizeAll` now sets
+  `optimizing = true` before any `await`, so overlapping calls in one process
+  (fire-and-forget write trigger + awaited explicit call on the first turn)
+  can no longer both run `optimize()` concurrently.
+- **Tests**: two new unit tests cover the open→write TOCTOU (old lock returns
+  `true` and steals; new lock returns `false` and preserves ownership) and
+  stale-lock reclamation.
 
 ### v1.3.5 (2026-09-06)
 
