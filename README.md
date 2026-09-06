@@ -40,7 +40,7 @@ Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥
 opencode plugin opencode-memory-pro
 ```
 
-The latest release is **v1.3.7** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
+The latest release is **v1.3.8** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
@@ -407,6 +407,22 @@ are unchanged (`~/.opencode/memory/lancedb` + `~/.opencode/memory/graph.db`),
 so your memories and graph carry over untouched.
 
 ## Changelog
+
+### v1.3.8 (2026-09-06)
+
+Fixes `memory_forget(force=true)` being unable to permanently delete a memory
+that was soft-deleted first:
+
+- **Force delete now sees hidden rows**: `softDeleteMemory` marks a row
+  `status='disabled'`, and the force path previously used `deleteById`, whose
+  `readByScopes` query filters out `status='disabled'` (and `merged`/`digested`)
+  rows — so "Use force=true for permanent deletion" silently failed and left
+  the hidden row on disk forever. The force path now uses the new
+  `deleteByIdForce` in `dist/store.js`, which tries the exact-id raw delete
+  first and otherwise scans unfiltered rows (so id prefixes still match).
+- **Tests**: integration test covers the exact scenario — soft-delete, confirm
+  the old path returns `false`, then `deleteByIdForce` removes the row and
+  reports `false` on a second attempt.
 
 ### v1.3.7 (2026-09-06)
 
