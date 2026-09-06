@@ -409,7 +409,10 @@ export class MemoryStore {
         }
         const cutoffTimestamp = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
         const table = this.requireEventTable();
-        const allExpired = await table.query().where(`timestamp < ${cutoffTimestamp}`).toArray();
+        // TTL_STATUS_BOUND (1.3.5): was an unbounded toArray() over every
+        // expired event (this store has seen 636MB event tables). Bound it
+        // like every other read path; the status is an estimate anyway.
+        const allExpired = await table.query().where(`timestamp < ${cutoffTimestamp}`).limit(100000).toArray();
         const expiredCount = allExpired.length;
         const scopeBreakdown = {};
         for (const row of allExpired) {
@@ -429,6 +432,14 @@ export class MemoryStore {
             tags: record.tags ?? undefined,
             status: record.status ?? "active",
             parentId: record.parentId ?? undefined,
+            // CITATION_CHAIN_SERIALIZE (1.3.5): citationChain is a STRING
+            // column (normalizeRow JSON.parses it on read; updateCitation
+            // stringifies it). The import path passed a raw array, which
+            // stored "src" via Array.prototype.toString and broke chains on
+            // round trip. Normalize at the chokepoint so every writer agrees.
+            citationChain: Array.isArray(record.citationChain)
+                ? JSON.stringify(record.citationChain)
+                : record.citationChain,
         };
         await table.add([recordWithDefaults]);
         this.invalidateScope(record.scope);
@@ -545,6 +556,20 @@ export class MemoryStore {
         this.notifyGraphRemoved(match.id);
         return true;
     }
+    // DELETE_BY_RAW_ID (1.3.5): exact-id hard delete that sees rows the
+    // filtered reads hide (digested/merged/disabled). Used by memory_import
+    // replace-mode so a pre-existing hidden row is actually replaced instead
+    // of leaving two physical rows with the same id.
+    async deleteByIdRaw(id) {
+        const table = this.requireTable();
+        const rows = await table.query().where(`id = '${escapeSql(id)}'`).limit(1).toArray();
+        if (rows.length === 0)
+            return false;
+        await table.delete(`id = '${escapeSql(id)}'`);
+        this.invalidateScope(rows[0].scope);
+        this.notifyGraphRemoved(id);
+        return true;
+    }
     async softDeleteMemory(id, scopes) {
         const rows = await this.readByScopes(scopes);
         const match = rows.find((row) => this.matchesId(row.id, id));
@@ -633,7 +658,15 @@ export class MemoryStore {
         return toDelete.length;
     }
     async consolidateDuplicates(scope, threshold, candidateLimit = 50) {
-        const rows = await this.readByScopesIncludingMerged([scope]);
+        // MERGE_STATUS_FILTER (1.3.5): consolidation used to run over
+        // readByScopesIncludingMerged and only consulted METADATA
+        // status:merged/mergedFrom — so digested (retention-hidden) and
+        // disabled (soft-deleted) rows could be picked as merge endpoints and
+        // have their column status overwritten to "merged", resurrecting
+        // disabled rows and corrupting digest provenance. Only active/unset
+        // rows may participate.
+        let rows = await this.readByScopesIncludingMerged([scope]);
+        rows = rows.filter((r) => r.status === undefined || r.status === null || r.status === "" || r.status === "active");
         if (rows.length === 0) {
             return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0 };
         }
@@ -999,14 +1032,23 @@ export class MemoryStore {
             const projects = extractRecalledProjects(metadataJson);
             if (!projects.has(projectScope)) {
                 projects.add(projectScope);
+                // METADATA_MERGE_FIX (1.3.5): this previously REPLACED
+                // metadataJson with `{ recalledProjects: [...] }`, silently
+                // dropping source / isPotentialDuplicate / graphEntities /
+                // pinned on the first recall of every global memory. In the
+                // default scoping:"global" mode that hit every memory, which
+                // broke pruneScope (duplicate-flag based) and retention
+                // (pinned protections). Merge into the existing blob instead.
+                const baseMeta = parseMetadata(metadataJson);
                 if (projects.size > 100) {
                     const arr = Array.from(projects);
                     arr.splice(0, arr.length - 100);
-                    metadataJson = JSON.stringify({ recalledProjects: arr });
+                    baseMeta.recalledProjects = arr;
                 }
                 else {
-                    metadataJson = JSON.stringify({ recalledProjects: Array.from(projects) });
+                    baseMeta.recalledProjects = Array.from(projects);
                 }
+                metadataJson = JSON.stringify(baseMeta);
                 newProjectCount = projects.size;
             }
         }
@@ -1532,6 +1574,11 @@ export class MemoryStore {
                 const records = await this.readByScopes([scope]);
                 let sortedRecords = records;
                 if (records.length > this.cacheConfig.maxRecordsPerScope) {
+                    // SCOPE_CACHE_TRUNCATE (1.3.5): truncation used to be
+                    // silent, which made older memories permanently invisible
+                    // to search. Log it once per cache rebuild so the operator
+                    // knows to raise cacheConfig.maxRecordsPerScope.
+                    log("warn", `[store] scope cache truncated: ${scope} has ${records.length} records but maxRecordsPerScope=${this.cacheConfig.maxRecordsPerScope}; older memories are not searchable until the limit is raised`);
                     sortedRecords = [...records].sort((a, b) => b.timestamp - a.timestamp).slice(0, this.cacheConfig.maxRecordsPerScope);
                 }
                 const tokenized = sortedRecords.map((record) => tokenize(record.text));
@@ -1812,7 +1859,54 @@ export class MemoryStore {
         return patterns.sort((a, b) => b.count - a.count);
     }
     async addRetryAttempt(taskId, scope, attempt) {
-        return this.appendToEpisodeField(taskId, scope, "retryAttemptsJson", (raw) => JSON.parse(raw || "[]"), (items) => JSON.stringify(items), attempt, (item) => ({ ...item, timestamp: Date.now() }));
+        // RETRY_ATTEMPT_COUNT (1.3.5): was a blind push via
+        // appendToEpisodeField — attemptNumber was never provided by any
+        // caller, so retry_budget_suggest always saw attempts.length === 0.
+        // Compute the 1-based attempt number from the existing array so the
+        // retry-budget median is over real values. Also the only live writer
+        // (tool.execute.after validation failures) now wired in index.js.
+        await this.ensureEpisodicTaskTable(384);
+        const table = this.requireEpisodicTaskTable();
+        const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
+        if (rows.length === 0)
+            return false;
+        const existing = rows[0];
+        const items = JSON.parse(existing.retryAttemptsJson || "[]");
+        items.push({
+            ...attempt,
+            attemptNumber: items.length + 1,
+            timestamp: Date.now(),
+        });
+        await table.update({
+            where: `id = '${escapeSql(existing.id)}'`,
+            values: { retryAttemptsJson: JSON.stringify(items) },
+        });
+        return true;
+    }
+    // EPISODE_RECALL_USED (1.3.5): stamps metadata.recallUsed on the session's
+    // task episode so calculateMemoryLift can separate tasks that used recall
+    // from tasks that didn't (the field existed but nothing ever set it, so
+    // memory_kpi always reported "no-recall-data").
+    async markEpisodeRecallUsed(taskId, scope) {
+        await this.ensureEpisodicTaskTable(384);
+        const table = this.requireEpisodicTaskTable();
+        const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
+        if (rows.length === 0)
+            return false;
+        const existing = rows[0];
+        let metadata = {};
+        try {
+            metadata = JSON.parse(existing.metadataJson || "{}");
+        }
+        catch {
+            metadata = {};
+        }
+        metadata.recallUsed = true;
+        await table.update({
+            where: `id = '${escapeSql(existing.id)}'`,
+            values: { metadataJson: JSON.stringify(metadata) },
+        });
+        return true;
     }
     async addRecoveryStrategy(taskId, scope, strategy) {
         return this.appendToEpisodeField(taskId, scope, "recoveryStrategiesJson", (raw) => JSON.parse(raw || "[]"), (items) => JSON.stringify(items), strategy, (item) => ({ ...item, attemptedAt: Date.now() }));
@@ -2271,6 +2365,48 @@ export class MemoryStore {
         const rows = await table
             .query()
             .where(`(${whereExpr}) AND (status != 'disabled' OR status IS NULL OR status = '') AND NOT (status = 'merged') AND NOT (status = 'digested') AND NOT (metadataJson LIKE '%"status":"merged"%')`)
+            .select([
+            "id",
+            "text",
+            "vector",
+            "category",
+            "scope",
+            "importance",
+            "timestamp",
+            "lastRecalled",
+            "recallCount",
+            "projectCount",
+            "schemaVersion",
+            "embeddingModel",
+            "vectorDim",
+            "metadataJson",
+            "userId",
+            "teamId",
+            "sourceSessionId",
+            "confidence",
+            "tags",
+            "status",
+            "parentId",
+            "citationSource",
+            "citationTimestamp",
+            "citationStatus",
+            "citationChain",
+        ])
+            .limit(100000)
+            .toArray();
+        return rows
+            .map((row) => normalizeRow(row))
+            .filter((row) => row !== null);
+    }
+    // GRAPH_BACKFILL_ALL (1.3.5): the one-time graph backfill previously
+    // read only ["global"], so project-scoped memories (scoping:"project")
+    // never entered the entity graph. Reads every active row across ALL
+    // scopes with the same status filter as readByScopes.
+    async readAllActive() {
+        const table = this.requireTable();
+        const rows = await table
+            .query()
+            .where(`(status != 'disabled' OR status IS NULL OR status = '') AND NOT (status = 'merged') AND NOT (status = 'digested') AND NOT (metadataJson LIKE '%"status":"merged"%')`)
             .select([
             "id",
             "text",

@@ -453,12 +453,17 @@ export function createMemoryTools(state) {
                     await state.store.putEvent({
                         id: generateId(),
                         type: "feedback",
-                        feedbackType: "useful",
+                        // FORGET_FEEDBACK (1.3.5): was feedbackType "useful" with
+                        // helpful:false, polluting the unhelpful-recall stats.
+                        // "wrong" is the semantically-correct signal (memory
+                        // should not be stored) and feeds the false-positive
+                        // rate / wrong penalty.
+                        feedbackType: "wrong",
                         scope: activeScope,
                         sessionID: context.sessionID,
                         timestamp: Date.now(),
                         memoryId: args.id,
-                        helpful: false,
+                        reason: "explicit-forget (hard delete)",
                         metadataJson: JSON.stringify({ source: "explicit-forget", hardDelete: true }),
                     });
                     return `Permanently deleted memory ${args.id}.`;
@@ -470,12 +475,14 @@ export function createMemoryTools(state) {
                 await state.store.putEvent({
                     id: generateId(),
                     type: "feedback",
-                    feedbackType: "useful",
+                    // FORGET_FEEDBACK (1.3.5): was feedbackType "useful" with
+                    // helpful:false, polluting the unhelpful-recall stats.
+                    feedbackType: "wrong",
                     scope: activeScope,
                     sessionID: context.sessionID,
                     timestamp: Date.now(),
                     memoryId: args.id,
-                    helpful: false,
+                    reason: "explicit-forget (soft delete)",
                     metadataJson: JSON.stringify({ source: "explicit-forget", hardDelete: false }),
                 });
                 return `Soft-deleted (disabled) memory ${args.id}. Use force=true for permanent deletion.`;
@@ -1081,7 +1088,14 @@ ${explanations.join("\n")}`;
                         continue;
                     }
                     try {
-                        const exists = await state.store.hasMemory(m.id, scopes);
+                        // IMPORT_EXISTS_RAW (1.3.5): hasMemory only sees ACTIVE
+                        // rows, so replace-mode imported a second active row
+                        // with the same id when a digested/merged/disabled row
+                        // already existed (Lance has no primary key → two
+                        // physical rows per id → ambiguous lookups). Check the
+                        // raw id and delete the raw row on replace.
+                        const existingRows = await state.store.findRawRecordsByIds([m.id], scopes);
+                        const exists = existingRows.length > 0;
                         if (exists && args.mode !== "replace") {
                             skipped += 1;
                             continue;
@@ -1096,7 +1110,7 @@ ${explanations.join("\n")}`;
                             continue;
                         }
                         if (exists) {
-                            await state.store.deleteById(m.id, scopes);
+                            await state.store.deleteByIdRaw(m.id);
                         }
                         let vector = Array.isArray(m.vector) ? m.vector.map(Number) : [];
                         if (vector.length !== embedderDim) {

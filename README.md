@@ -40,7 +40,7 @@ Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥
 opencode plugin opencode-memory-pro
 ```
 
-The latest release is **v1.3.3** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
+The latest release is **v1.3.5** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
@@ -405,6 +405,47 @@ Clean-break rename: sidecar is `opencode-memory-pro.json`, env prefix is
 `OPENCODE_MEMORY_PRO_*`. Data is **not** affected — the default storage paths
 are unchanged (`~/.opencode/memory/lancedb` + `~/.opencode/memory/graph.db`),
 so your memories and graph carry over untouched.
+
+## Changelog
+
+### v1.3.5 (2026-09-06)
+
+Code-review hardening pass — bug fixes, no breaking changes:
+
+- **Metadata is no longer destroyed on recall** (`updateMemoryUsage`): the
+  first recall of a global memory used to *replace* `metadataJson` with
+  `{ recalledProjects: [...] }`, silently dropping `pinned`, duplicate flags,
+  source, and graph entities — breaking `memory_export` provenance, duplicate-
+  aware pruning, and the pin protection in retention. It now merges into the
+  existing metadata blob.
+- **LLM capture respects an explicit "nothing to store" verdict**: when the LLM
+  extraction succeeds but returns `[]`, the transcript no longer falls through
+  to the keyword heuristics and gets stored against the model's judgment — the
+  heuristic fallback now only runs when extraction actually fails.
+- **Ephemeral LLM sessions no longer trigger consolidate/sweep**: the
+  `session.deleted` cleanup ran unconditionally with `force=true`, so in
+  `capture.mode="llm"` every ephemeral extraction/digest session paid a full
+  dedup + retention scan on teardown (and could spawn further LLM digests).
+  Own sessions are skipped entirely; pending transcript fragments are flushed
+  before user sessions close.
+- **Consolidation only merges active memories**: digested (retention-hidden)
+  and disabled (soft-deleted) rows can no longer be picked as merge endpoints,
+  which previously flipped their status to `merged` and could resurrect
+  disabled memories / corrupt digest provenance.
+- **`memory_import` replace-mode can't duplicate ids**: existence is now
+  checked against raw rows (digested/merged/disabled included) and replace
+  deletes the exact id before re-adding, so a hidden row is truly replaced
+  instead of leaving two physical rows per id. Citation chains are also
+  stringified consistently on write.
+- **Episodic data is actually recorded**: failed validations now write numbered
+  retry attempts (so `retry_budget_suggest` has real data), and sessions that
+  receive injected memories are stamped `recallUsed` (so `memory_kpi`'s memory
+  lift is meaningful).
+- **Smaller fixes**: `session.error` session-id fallback (`info.id`), bounded
+  `getEventTtlStatus` read, graph backfill covers all scopes, embedder
+  `fallbackActive` resets on recovery, scope-cache truncation is logged,
+  `memory_forget` records `wrong` feedback instead of polluting unhelpful
+  stats.
 
 ## License
 

@@ -11,7 +11,7 @@ import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
 import { sweepExpiredMemories } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
-const PLUGIN_VERSION = "1.3.4";
+const PLUGIN_VERSION = "1.3.5";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
@@ -160,7 +160,11 @@ const plugin = async (input) => {
                 // (ProviderAuthError/UnknownError/MessageAbortedError/ApiError —
                 // all expose data.message), so we also keep the raw message and
                 // classify it at session end to fill failureType/errorMessage.
-                const sid = evt.properties?.sessionID;
+                // ERROR_SESSION_ID_FALLBACK (1.3.5): session.error carried the
+                // sessionID at properties.sessionID while created/deleted use
+                // properties.info.id — if the SDK ever omits one, don't lose
+                // the failure classification.
+                const sid = evt.properties?.sessionID ?? evt.properties?.info?.id;
                 if (sid) {
                     const err = evt.properties?.error;
                     const message = typeof err?.data?.message === "string"
@@ -183,19 +187,37 @@ const plugin = async (input) => {
             if (evt.type === "session.deleted") {
                 const sid = evt.properties?.info?.id;
                 if (sid && !isOwnSession(sid)) {
+                    // SESSION_DELETED_FLUSH (1.3.5): capture fragments were
+                    // only ever flushed on session.idle, so quick sessions
+                    // lost their transcript AND leaked their captureBuffer
+                    // entry. Flush before the session disappears.
+                    try {
+                        await flushAutoCapture(sid, state, input.client);
+                    }
+                    catch (error) {
+                        log("warn", `failed to flush capture on session end: ${toErrorMessage(error)}`);
+                    }
                     const entry = state.sessionErrors.get(sid);
                     state.sessionErrors.delete(sid);
                     const hadError = entry?.failed === true;
                     await handleSessionEnd(sid, state, hadError ? "failed" : "success", entry?.message);
+                    // Session is closing — final dedup pass for its scope. Uses the
+                    // session's own directory (Session.info.directory) rather than
+                    // client.session.get, which may 404 after deletion. force=true
+                    // bypasses the idle cooldown since this is a one-time cleanup.
+                    const deletedInfo = evt.properties?.info;
+                    const finalScope = deletedInfo?.directory ? deriveProjectScope(deletedInfo.directory) : state.defaultScope;
+                    maybeConsolidateDuplicates(state, finalScope, true);
+                    maybeSweepExpiredMemories(state, finalScope, true);
                 }
-                // Session is closing — final dedup pass for its scope. Uses the
-                // session's own directory (Session.info.directory) rather than
-                // client.session.get, which may 404 after deletion. force=true
-                // bypasses the idle cooldown since this is a one-time cleanup.
-                const deletedInfo = evt.properties?.info;
-                const finalScope = deletedInfo?.directory ? deriveProjectScope(deletedInfo.directory) : state.defaultScope;
-                maybeConsolidateDuplicates(state, finalScope, true);
-                maybeSweepExpiredMemories(state, finalScope, true);
+                // OWN_SESSION_CLEANUP (1.3.5): the consolidate/sweep calls
+                // above used to run UNCONDITIONALLY — including for the
+                // plugin's own ephemeral LLM-capture/digest sessions, with
+                // force=true bypassing the cooldown. In capture.mode="llm"
+                // every LLM round trip paid a full consolidate+retention scan
+                // on teardown and could trigger further LLM digests. Own
+                // sessions are now skipped entirely (handleSessionEnd guard
+                // covers the rest).
                 return;
             }
             const sessionID = evt.properties?.sessionID;
@@ -256,6 +278,18 @@ const plugin = async (input) => {
             if (validation) {
                 try {
                     await state.store.addValidationOutcome(taskId, activeScope, validation);
+                    // RETRY_ATTEMPT_WIRE (1.3.5): failed validations are the
+                    // only real "attempt" signal the plugin sees (same command
+                    // family retried in the sessions). Record them so
+                    // retry_budget_suggest has data instead of always
+                    // answering "1 retry". addRetryAttempt assigns the
+                    // 1-based attemptNumber/timestamp.
+                    if (validation.status === "fail") {
+                        await state.store.addRetryAttempt(taskId, activeScope, {
+                            outcome: "failed",
+                            errorMessage: (validation.output ?? "").slice(0, 500),
+                        });
+                    }
                 }
                 catch (error) {
                     log("warn", `failed to record validation outcome: ${toErrorMessage(error)}`);
@@ -448,6 +482,14 @@ const plugin = async (input) => {
             for (const result of limitedResults) {
                 state.store.updateMemoryUsage(result.record.id, activeScope, scopes).catch(() => { });
             }
+            // EPISODE_RECALL_USED (1.3.5): stamp the session's task episode so
+            // memory_kpi's memory-lift metric can actually separate tasks that
+            // used recall from tasks that didn't (nothing ever set it before).
+            const recallEpisode = state.activeEpisodes.get(eventInput.sessionID);
+            if (recallEpisode) {
+                state.store.markEpisodeRecallUsed(recallEpisode.taskId, recallEpisode.scope)
+                    .catch((error) => log("warn", `failed to mark episode recall used: ${toErrorMessage(error)}`));
+            }
             // Apply summarization if configured
             const summarizationConfig = createSummarizationConfig(state.config.injection);
             const processedResults = limitedResults.map((item) => {
@@ -554,8 +596,10 @@ async function createRuntimeState(input) {
                 if (state.graph?.enabled) {
                     // One-time backfill: index existing memories into the graph
                     // so recall boosts work immediately, not only for new captures.
+                    // GRAPH_BACKFILL_ALL (1.3.5): was readByScopes(["global"]),
+                    // which skipped every project-scoped memory.
                     try {
-                        const records = await state.store.readByScopes(["global"]);
+                        const records = await state.store.readAllActive();
                         state.graph.reindexMemories(records);
                     }
                     catch (error) {
@@ -671,6 +715,14 @@ async function flushAutoCapture(sessionID, state, client) {
             skipReason: candidates === null ? "llm-unavailable" : "llm-empty-result",
             text: combined,
         });
+        // LLM_EMPTY_VERDICT (1.3.5): when the LLM ran fine but deliberately
+        // returned [] ("nothing here is memory-worthy"), that is a real
+        // verdict, not a failure — falling through to the keyword heuristics
+        // stored transcript content the LLM explicitly rejected. Only fall
+        // back when extraction FAILED (candidates === null).
+        if (candidates !== null) {
+            return;
+        }
     }
     const result = extractCaptureCandidate(combined, state.config.minCaptureChars);
     if (!result.candidate) {

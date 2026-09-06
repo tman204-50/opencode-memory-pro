@@ -42,6 +42,10 @@ async function embedWithRetry(embedder, config, text) {
             const result = await embedder.embed(text);
             globalEmbedderHealth.lastSuccess = Date.now();
             globalEmbedderHealth.lastError = null;
+            // EMBEDDER_HEALTH_RESET (1.3.5): fallbackActive used to stay true
+            // forever after one outage, so memory_stats reported "bm25-only"
+            // even after the provider recovered. Reset it on any success.
+            globalEmbedderHealth.fallbackActive = false;
             if (globalEmbedderHealth.status === "degraded") {
                 globalEmbedderHealth.status = "healthy";
                 log("info", "Embedder recovered, resuming normal mode");
@@ -83,6 +87,7 @@ async function dimWithRetry(embedder, config) {
             const result = await embedder.dim();
             globalEmbedderHealth.lastSuccess = Date.now();
             globalEmbedderHealth.lastError = null;
+            globalEmbedderHealth.fallbackActive = false;
             return result;
         }
         catch (error) {
