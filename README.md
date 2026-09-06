@@ -1,7 +1,11 @@
 # opencode-memory-pro
 
+[![npm version](https://img.shields.io/npm/v/opencode-memory-pro.svg)](https://www.npmjs.com/package/opencode-memory-pro)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/tman204-50/opencode-memory-pro/actions/workflows/ci.yml/badge.svg)](https://github.com/tman204-50/opencode-memory-pro/actions/workflows/ci.yml)
+
 Long-term memory subsystem for [OpenCode](https://opencode.ai) — a maintained,
-standalone fork of `lancedb-opencode-pro`. It stores memories in LanceDB,
+standalone fork of `lancedb-opencode-pro` (source: [GitHub](https://github.com/tman204-50/opencode-memory-pro)). It stores memories in LanceDB,
 embeds them locally or via OpenAI, builds an offline entity graph to boost and
 expand recall, tracks its own effectiveness, and ships a full lifecycle toolkit
 (backup, digests, retention, scoping, episodic learning). No source patching
@@ -30,18 +34,13 @@ required: install the package directly.
 
 ## Install
 
-From a local tarball (or point at the repo):
-
-```bash
-npm pack                                  # -> opencode-memory-pro-<version>.tgz
-opencode plugin ./opencode-memory-pro-<version>.tgz -g
-```
-
-Or from npm once published:
+Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥ 22):
 
 ```bash
 opencode plugin opencode-memory-pro
 ```
+
+The latest release is **v1.3.0** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
@@ -393,9 +392,12 @@ their task episode, so `similar_task_recall` / `retry_budget_suggest` /
 
 ```bash
 npm install
-npm test        # node --test (unit suite)
-npm run verify  # test + pack dry-run
+npm test            # node --test (unit + integration suites)
+npm run test:e2e    # full plugin E2E scenario (mock embedder, real LanceDB)
+npm run verify      # tests + pack dry-run
 ```
+
+CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Migrating from `lancedb-opencode-pro`
 
