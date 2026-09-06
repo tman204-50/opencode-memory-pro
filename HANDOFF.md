@@ -4,7 +4,7 @@ Give this file to the agent on restart (also stored in memory as
 `969ec905` [versioning rule] and `0193fb44` [1.1.6 history]).
 
 ## State
-- Working tree: `/home/toddv/projects/opencode-memory-pro` (patched `dist/*.js` directly; no TS source).
+- Working tree: `<repo-root>` (patched `dist/*.js` directly; no TS source).
 - **1.2.1 tarball built**: `opencode-memory-pro-1.2.1.tgz` (38 files; 2 stale duplicates removed).
 - `~/.config/opencode/opencode.json` repinned to `opencode-memory-pro-1.2.1.tgz`.
 - `~/.config/opencode/opencode-memory-pro.json`: logging.level=debug, file=~/.opencode/memory/opencode-memory-pro.log.
