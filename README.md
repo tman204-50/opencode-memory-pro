@@ -42,12 +42,6 @@ opencode plugin opencode-memory-pro
 
 The latest release is **v1.4.0** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
-Remove the old plugin pin at the same time:
-
-```bash
-opencode plugin lancedb-opencode-pro -g   # removes pin (if installed)
-```
-
 ### Getting started
 
 **1. Install and restart OpenCode** — done above. That's it for a baseline
@@ -479,13 +473,6 @@ npm run verify      # tests + pack dry-run
 ```
 
 CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
-
-## Migrating from `lancedb-opencode-pro`
-
-Clean-break rename: sidecar is `opencode-memory-pro.json`, env prefix is
-`OPENCODE_MEMORY_PRO_*`. Data is **not** affected — the default storage paths
-are unchanged (`~/.opencode/memory/lancedb` + `~/.opencode/memory/graph.db`),
-so your memories and graph carry over untouched.
 
 ## Changelog
 
