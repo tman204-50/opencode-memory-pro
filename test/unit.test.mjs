@@ -461,3 +461,20 @@ test("scope: resolveScope honors explicit scopes in project mode", () => {
         else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
     }
 });
+
+test("config: shipped example file is valid, resolves cleanly, and leaks no secrets", async () => {
+    const fs = await import("node:fs");
+    const raw = JSON.parse(fs.readFileSync(new URL("../opencode-memory-pro.example.json", import.meta.url), "utf8"));
+    const cfg = resolveMemoryConfig(raw, "/tmp");
+    assert.equal(cfg.provider, "opencode-memory-pro");
+    assert.equal(cfg.embedding.provider, "ollama");
+    assert.equal(cfg.embedding.model, "nomic-embed-text");
+    assert.equal(cfg.capture.mode, "heuristics");
+    assert.equal(cfg.retrieval.recencyHalfLifeHours, 72);
+    assert.equal(cfg.injection.maxCharsPerMemory, 1200);
+    assert.equal(cfg.dedup.writeThreshold, 0.92);
+    assert.equal(cfg.graph.typedEdges, true);
+    const dumped = JSON.stringify(raw);
+    assert.ok(!/sk-or-v1|sk-[A-Za-z0-9]{16,}|api[_-]?key"\s*:\s*"[^"<]/.test(dumped), "example must not embed real secret material");
+    assert.ok((raw._comment ?? "").length > 0, "example should carry inline guidance");
+});

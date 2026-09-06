@@ -40,13 +40,94 @@ Published on npm — install directly (requires OpenCode ≥ 1.x and Node.js ≥
 opencode plugin opencode-memory-pro
 ```
 
-The latest release is **v1.3.8** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
+The latest release is **v1.3.9** on [npm](https://www.npmjs.com/package/opencode-memory-pro); source and releases are on [GitHub](https://github.com/tman204-50/opencode-memory-pro).
 
 Remove the old plugin pin at the same time:
 
 ```bash
 opencode plugin lancedb-opencode-pro -g   # removes pin (if installed)
 ```
+
+### Getting started
+
+**1. Install and restart OpenCode** — done above. That's it for a baseline
+setup: the plugin works with **zero configuration**.
+
+**2. What you get out of the box, and what needs config:**
+
+| Capability | Out of the box | Needs config to enhance |
+|---|---|---|
+| Recall | Works — falls back to pure BM25 if no embedder is reachable | **Embedding model** → semantic/hybrid vector search |
+| Capture (session → memories) | Works — offline heuristic keyword capture | **LLM summary model** → LLM-quality extraction + abstractive digests |
+| Digests (`memory_summarize` / `memory_expire`) | Extractive offline digests | Same LLM summary model → abstractive digests |
+
+> **Nothing below is required** — every enhancement has an offline fallback.
+> But configuring an embedding model makes recall dramatically better
+> (semantic similarity instead of keyword-only), and configuring an LLM
+> summary model makes captured memories higher quality and digests far more
+> useful.
+
+**3. (Optional) configure an embedding model.**
+
+The plugin stores memories in a vector store; the embedding model decides how
+well recall can find semantically related memories. Two options:
+
+- **Local (no API key, no cost):** default — `ollama` +
+  `nomic-embed-text` at `http://127.0.0.1:11434`. Requires Ollama running.
+- **OpenAI-compatible (hosted):** e.g. OpenAI, OpenRouter, or any endpoint
+  that serves the `/embeddings` API. Set `embedding.provider` to `"openai"`,
+  the model, the base URL, and an API key:
+
+```json
+{
+  "embedding": {
+    "provider": "openai",
+    "model": "openai/text-embedding-3-small",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "apiKey": "sk-..."
+  }
+}
+```
+
+If the embedder is unreachable, recall falls back to pure BM25 over the FTS
+index and capture still works — the plugin is offline-tolerant by design.
+
+**4. (Optional) configure an LLM summary model** (for LLM-quality
+capture/digests).
+
+With `capture.mode: "llm"`, on session idle the plugin sends the session
+buffer to an LLM (via an ephemeral OpenCode SDK session) which returns
+structured memories, and digests become LLM-written abstractive summaries.
+The LLM is addressed by **OpenCode provider + model IDs** — OpenCode owns
+routing, auth, and base URLs, so no API key or baseUrl lives in the plugin
+config. The provider must be resolvable in your `opencode.json`:
+
+```json
+{
+  "capture": {
+    "mode": "llm",
+    "llm": { "provider": "openrouter", "model": "z-ai/glm-5.3-flash" }
+  }
+}
+```
+
+On any LLM failure, capture **falls back to heuristics** and records an
+`llm-fallback` capture event — the plugin never breaks because the LLM is
+unavailable.
+
+**5. (Optional) start from the full annotated example** — the package includes
+`opencode-memory-pro.example.json` with every option documented in-file. Copy
+it to `~/.config/opencode/opencode-memory-pro.json` and edit:
+
+```bash
+cp node_modules/opencode-memory-pro/opencode-memory-pro.example.json ~/.config/opencode/opencode-memory-pro.json
+```
+
+**Healthy installs are never silent:** at startup the plugin logs a warning
+if it detects missing pieces (e.g. `capture.mode: "llm"` without a resolvable
+provider, or an OpenAI embedder without a key), and `memory_stats` reports the
+same as `degradedFlags`, plus `llmHealth` — so you can always tell what's
+running at full strength vs. degraded.
 
 ## Configuration
 
