@@ -801,7 +801,12 @@ export class MemoryStore {
         return rows.filter((row) => row.lastRecalled > 0 && row.lastRecalled < cutoffTime).slice(0, limit);
     }
     async clearScope(scope) {
-        const rows = await this.readByScopes([scope]);
+        // CLEAR_SCOPE_COUNT_ALL (1.4.6): readByScopes filters merged/digested/
+        // disabled rows, but the delete below removes ALL rows in the scope —
+        // the returned count undercounted (wrong tool response) and hidden
+        // rows' graph nodes were never notified. Read exactly the set the
+        // delete will remove (IncludingMerged applies no status filter).
+        const rows = await this.readByScopesIncludingMerged([scope]);
         if (rows.length === 0)
             return 0;
         await this.requireTable().delete(`scope = '${escapeSql(scope)}'`);

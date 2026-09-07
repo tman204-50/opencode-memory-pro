@@ -512,6 +512,29 @@ test("integration: consolidation merges near-duplicate memories", async () => {
     }
 });
 
+// CLEAR_SCOPE_COUNT_ALL (1.4.6): clearScope read visible rows only but deleted
+// ALL rows in the scope — the returned count undercounted whenever
+// merged/digested rows were present, and their graph nodes were never notified.
+test("integration: clearScope counts and removes all rows including merged (CLEAR_SCOPE_COUNT_ALL)", async () => {
+    const store = await newStore("mem-clearscope-");
+    const text = "the team decided to use go for backend services and postgres for storage";
+    try {
+        await store.put(makeRecord("cs-a", text, { timestamp: Date.now() - 60_000 }));
+        await store.put(makeRecord("cs-b", text, { timestamp: Date.now() }));
+        const result = await store.consolidateDuplicates("global", 0.9, 10);
+        assert.ok(result.mergedPairs >= 1, `expected ≥1 merged pair, got ${JSON.stringify(result)}`);
+        assert.equal((await store.readByScopes(["global"])).length, 1, "sanity: merged row is hidden from visible reads");
+        assert.equal((await store.readByScopesIncludingMerged(["global"])).length, 2, "sanity: both rows still on disk");
+
+        const cleared = await store.clearScope("global");
+        assert.equal(cleared, 2, "count must include merged rows the delete actually removes");
+        assert.equal((await store.readByScopesIncludingMerged(["global"])).length, 0, "no rows survive clearScope");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: dedup write-check primitive returns cosine in [0,1] (not RRF)", async () => {
     const store = await newStore("mem-dedupcos-");
     const text = "the team decided to use go for backend services and postgres for storage";
