@@ -664,6 +664,38 @@ test("integration: scope cache hits within the default staleness bound", async (
     }
 });
 
+// CACHE_PATCH_USAGE (1.4.9): updateMemoryUsage called invalidateScope on
+// every recall result, so in active sessions (auto-recall fires per LLM
+// request) the scope cache never survived one round — every getCachedScopes
+// paid a full rebuild (observed 20+/20+ cacheMiss live, recall.pipeline
+// 1279-1570ms vs the 630-880ms clean baseline). Usage fields are not used by
+// _search scoring, so the write now patches the cached record in place and
+// the cache stays hot. Mutant: restoring `this.invalidateScope(match.scope)`
+// makes the second search a miss and this test fails.
+test("integration: updateMemoryUsage patches the scope cache without invalidating (CACHE_PATCH_USAGE)", async () => {
+    const store = await newStore("mem-cachepatch-");
+    try {
+        await store.put(makeRecord("usage-1", "usage updates must keep the scope cache hot"));
+        await store.search(searchParams("usage updates keep hot", deterministicEmbed("usage updates keep hot")));
+        const entry = store.scopeCache.get("global");
+        assert.ok(entry, "scope cache entry must exist after the first search");
+        const hitsBefore = store.cacheStats.hits;
+        await store.updateMemoryUsage("usage-1", "project:probe", ["global"]);
+        const results = await store.search(searchParams("usage updates keep hot", deterministicEmbed("usage updates keep hot")));
+        assert.equal(store.cacheStats.hits, hitsBefore + 1, "second search must be a cache HIT (no invalidation)");
+        assert.ok(results.some((r) => r.record.id === "usage-1"), "memory must still be searchable after the usage update");
+        const cachedRecord = entry.records.find((r) => r.id === "usage-1");
+        assert.ok(cachedRecord, "cached record must exist in the entry");
+        assert.equal(cachedRecord.recallCount, 1, "cached record must reflect the bumped usage in place");
+        assert.ok(cachedRecord.lastRecalled > 0, "cached record must have lastRecalled stamped");
+        const dbRow = (await store.readByScopes(["global"])).find((r) => r.id === "usage-1");
+        assert.equal(dbRow.recallCount, 1, "DB row must still be updated (table.update preserved)");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: forced compaction is safe on a fresh store", async () => {
     const store = await newStore("mem-compact-");
     try {

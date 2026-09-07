@@ -1417,7 +1417,32 @@ export class MemoryStore {
                     metadataJson: metadataJson ?? null,
                 },
             });
-            this.invalidateScope(match.scope);
+            // CACHE_PATCH_USAGE (1.4.9): this used to call invalidateScope
+            // here. updateMemoryUsage fires on EVERY recall result
+            // (index.js:654 auto-recall, tools/memory.js:296 manual search —
+            // every LLM request in active sessions), and invalidation bumped
+            // scopeVersions, so the scope cache never survived one round:
+            // every getCachedScopes paid a full readByScopes + tokenize + IDF
+            // + vecNorm rebuild (~150-215ms @ ~1500 rows) and recall.pipeline
+            // stayed 1279-1570ms vs the 630-880ms clean baseline despite the
+            // 1.4.8 TTL fix. The usage fields (lastRecalled/recallCount/
+            // projectCount/metadataJson) are NOT used by _search scoring —
+            // only by cleanup/prune/retention — so invalidating the search
+            // cache is pure downside. Patch the cached record in place
+            // instead: the cache stays hot AND consumers see fresh usage
+            // counters. Real content changes still invalidate via store.put.
+            const cachedEntry = this.scopeCache.get(match.scope);
+            if (cachedEntry) {
+                const cachedRecord = cachedEntry.records.find((record) => this.matchesId(record.id, match.id));
+                if (cachedRecord) {
+                    cachedRecord.lastRecalled = now;
+                    cachedRecord.recallCount = newRecallCount;
+                    cachedRecord.projectCount = newProjectCount ?? null;
+                    if (metadataJson !== match.metadataJson) {
+                        cachedRecord.metadataJson = metadataJson;
+                    }
+                }
+            }
         });
     }
     async getCitation(id, scopes) {

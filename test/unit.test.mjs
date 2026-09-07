@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCandidates } from "../dist/store.js";
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
-import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession } from "../dist/llm.js";
+import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput } from "../dist/llm.js";
 import { summarizeContent } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
 import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore } from "../dist/index.js";
@@ -183,6 +183,39 @@ test("llm: requestLLMCapture returns [] (not null) when model emits an empty JSO
     };
     const result = await requestLLMCapture(fakeClient, { provider: "openrouter", model: "z-ai/glm-5.3-flash" }, "some text", "sess-empty");
     assert.deepEqual(result, [], "empty extraction is a valid result, not a failure");
+});
+
+// CAPTURE_TAIL_KEEP (1.4.9): over-cap transcripts must keep the TAIL (freshest
+// context), not the head. Mutant: reverting to .slice(0, MAX) fails this.
+test("llm: truncateCaptureInput keeps the tail when the transcript exceeds the cap", () => {
+    const over = "x".repeat(60000) + "FRESH-DECISION";
+    const cut = truncateCaptureInput(over);
+    assert.equal(cut.length, 60000);
+    assert.equal(cut, over.slice(-60000), "exact tail must be kept (mutant: .slice(0, MAX) keeps the head)");
+    assert.ok(cut.endsWith("FRESH-DECISION"), "the newest content must survive truncation");
+    const short = "short transcript";
+    assert.equal(truncateCaptureInput(short), short, "under-cap input passes through unchanged");
+});
+
+// CAPTURE_NO_REASONING (1.4.9): live flushes burned reasoning=638-1173 tokens
+// (llm.prompt p50=20s); the SDK prompt body has no reasoning knob, so the
+// capture system prompt must explicitly forbid step-by-step thinking. Mutant:
+// removing the directive fails this.
+test("llm: capture system prompt forbids step-by-step reasoning", async () => {
+    let receivedSystem = null;
+    const fakeClient = {
+        session: {
+            create: async () => ({ data: { id: "ephemeral-noreason" } }),
+            prompt: async (opts) => {
+                receivedSystem = opts.body.system;
+                return { data: { info: {}, parts: [{ type: "text", text: "[]" }] } };
+            },
+            delete: async () => { },
+        },
+    };
+    await requestLLMCapture(fakeClient, { provider: "openrouter", model: "z-ai/glm-5.3-flash" }, "some text", "sess-noreason");
+    assert.ok(/reason step-by-step|any thinking/i.test(receivedSystem), "system prompt must suppress chain-of-thought");
+    assert.ok(receivedSystem.includes("only the JSON array"), "system prompt must demand direct output");
 });
 
 test("llm: requestLLMDigest strips fences/commentary and returns text + sourceCount", async () => {

@@ -12,6 +12,12 @@ import { startSpan } from "./timing.js";
 //     callers can fall back to the offline heuristics pipeline.
 //   - Tools are disabled on the ephemeral prompt so extraction/summarization
 //     is a pure text-in/text-out call.
+// CAPTURE_NO_REASONING (1.4.9): live usage samples (1.4.8) showed every
+// capture call burning reasoning=638-1173 tokens before a tiny out=168-671
+// JSON reply, with llm.prompt p50=20.4s/p90=52.9s. The SDK prompt body exposes
+// no maxTokens/temperature/reasoning knobs, so the only request-side lever is
+// the prompt itself: an explicit no-step-by-step directive. Measurable via the
+// reasoning= field in the PROMPT_USAGE_LOG line after restart.
 const EXTRACTION_SYSTEM_PROMPT = `You are a memory extraction system for an AI coding assistant.
 
 Read the conversation transcript below and extract DURABLE, memory-worthy content: decisions made, preferences expressed, durable facts about the user's projects/systems, and context that will matter weeks from now.
@@ -22,6 +28,7 @@ Return ONLY valid JSON — an array of objects, with no markdown fences and no c
 [{"content": "...", "type": "fact|decision|preference|other", "importance": 0.0-1.0}]
 
 Rules:
+- Do NOT reason step-by-step or show any thinking. Read the transcript once and output only the JSON array immediately.
 - content: 1-3 self-contained sentences (no bare pronouns). One memory per item.
 - type: "decision" (a choice was made), "fact" (durable fact), "preference" (user's stated preference), "other".
 - importance: 0.0 (trivial) to 1.0 (critical). Be selective: most transcripts yield 1-4 memories.
@@ -36,6 +43,14 @@ Return ONLY the summary text. No markdown headers, no commentary.`;
 const VALID_CAPTURE_TYPES = ["decision", "fact", "preference", "other"];
 const MAX_EXTRACTIONS = 8;
 const MAX_CAPTURE_INPUT_CHARS = 60000;
+// CAPTURE_TAIL_KEEP (1.4.9): transcripts regularly hit the 60k-char cap
+// (observed in=16-18k tokens on every live flush). The old .slice(0, MAX)
+// kept the HEAD — for a long session that discarded exactly the recent
+// decisions a memory system should keep. Truncate from the front so the tail
+// (freshest context) survives.
+export function truncateCaptureInput(text) {
+    return text.length > MAX_CAPTURE_INPUT_CHARS ? text.slice(-MAX_CAPTURE_INPUT_CHARS) : text;
+}
 const MAX_DIGEST_INPUT_CHARS = 80000;
 /**
  * Session IDs of ephemeral sessions this plugin created itself. Their own
@@ -157,7 +172,7 @@ export async function requestLLMCapture(client, llmConfig, sessionText, sessionI
     const text = typeof sessionText === "string" ? sessionText.trim() : "";
     if (!text)
         return null;
-    const input = text.length > MAX_CAPTURE_INPUT_CHARS ? text.slice(0, MAX_CAPTURE_INPUT_CHARS) : text;
+    const input = truncateCaptureInput(text);
     const userPart = `Conversation transcript (${sessionID ? `session ${sessionID}` : "session"}):\n\n${input}\n\nExtract memories now.`;
     const reply = await runEphemeralPrompt(client, llmConfig, EXTRACTION_SYSTEM_PROMPT, userPart, "memory-capture");
     if (reply === null) {
