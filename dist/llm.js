@@ -46,6 +46,20 @@ const OWN_SESSION_IDS = new Set();
 export function isOwnSession(sessionID) {
     return typeof sessionID === "string" && OWN_SESSION_IDS.has(sessionID);
 }
+// OWN_SESSIONS_CAP (1.4.6): OWN_SESSION_IDS grew unbounded — one entry per
+// ephemeral LLM session for the lifetime of the server process. FIFO-capped
+// like sessionErrors in index.js; Set iteration order is insertion order, so
+// the oldest id is evicted. (Ids are evicted only from tracking, the sessions
+// themselves are already deleted server-side in runEphemeralPrompt's finally.)
+const MAX_OWN_SESSION_IDS = 500;
+export function trackOwnSession(sessionId) {
+    OWN_SESSION_IDS.add(sessionId);
+    if (OWN_SESSION_IDS.size > MAX_OWN_SESSION_IDS) {
+        const oldest = OWN_SESSION_IDS.values().next().value;
+        if (oldest !== undefined)
+            OWN_SESSION_IDS.delete(oldest);
+    }
+}
 // LLM_HEALTH (1.3.9): module-level runtime health for the capture/summary LLM,
 // mirroring the embedder pattern so memory_stats can report both sides.
 const globalLlmHealth = {
@@ -204,7 +218,7 @@ async function runEphemeralPrompt(client, llmConfig, system, userText, title) {
             setLlmHealth({ status: "error", lastError: "session.create returned no id", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
             return null;
         }
-        OWN_SESSION_IDS.add(sessionId);
+        trackOwnSession(sessionId);
         const response = await client.session.prompt({
             path: { id: sessionId },
             body: {

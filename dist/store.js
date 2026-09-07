@@ -850,8 +850,14 @@ export class MemoryStore {
             ...sortedFlagged.slice(0, deleteFromFlagged),
             ...sortedUnflagged.slice(0, toDeleteCount - deleteFromFlagged),
         ];
+        // PRUNE_SCOPE_BATCH_DELETE (1.4.6): the per-row delete loop issued one
+        // round trip per row; batch into a single id IN (...) delete. Same
+        // selection semantics (flagged oldest first), one round trip.
+        if (toDelete.length > 0) {
+            const idList = toDelete.map((row) => `'${escapeSql(row.id)}'`).join(", ");
+            await this.requireTable().delete(`id IN (${idList})`);
+        }
         for (const row of toDelete) {
-            await this.requireTable().delete(`id = '${escapeSql(row.id)}'`);
             this.notifyGraphRemoved(row.id);
         }
         this.invalidateScope(scope);

@@ -535,6 +535,31 @@ test("integration: clearScope counts and removes all rows including merged (CLEA
     }
 });
 
+// PRUNE_SCOPE_BATCH_DELETE (1.4.6): pruneScope used one delete round trip per
+// row; the batched id IN (...) delete must preserve the same selection
+// semantics (flagged oldest first) and remove exactly the over-cap rows.
+test("integration: pruneScope removes over-cap entries flagged-first via batched delete (PRUNE_SCOPE_BATCH_DELETE)", async () => {
+    const store = await newStore("mem-prunebatch-");
+    try {
+        for (let i = 0; i < 5; i++) {
+            const flagged = i < 2; // the two oldest rows are flagged duplicates
+            await store.put(makeRecord(`prune-${i}`, `prune batch row number ${i} with some text`, {
+                timestamp: Date.now() - (100 - i) * 1000,
+                metadataJson: JSON.stringify(flagged ? { isPotentialDuplicate: true } : {}),
+            }));
+        }
+        const pruned = await store.pruneScope("global", 3);
+        assert.equal(pruned, 2, "over-cap rows (the two flagged oldest) must be pruned");
+        const survivors = await store.readByScopesIncludingMerged(["global"]);
+        assert.equal(survivors.length, 3, "exactly maxEntries rows remain");
+        const ids = survivors.map((r) => r.id).sort();
+        assert.deepEqual(ids, ["prune-2", "prune-3", "prune-4"], "flagged oldest rows removed, unflagged survive");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: dedup write-check primitive returns cosine in [0,1] (not RRF)", async () => {
     const store = await newStore("mem-dedupcos-");
     const text = "the team decided to use go for backend services and postgres for storage";

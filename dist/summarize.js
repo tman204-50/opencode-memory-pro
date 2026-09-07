@@ -193,9 +193,14 @@ export function summarizeContent(text, config) {
             : "text";
     // No summarization
     if (config.mode === "none") {
+        // NONE_MODE_NO_TRUNCATE (1.4.6): "none" promises to keep content
+        // as-is, but this branch still truncated at textThreshold * 4 chars
+        // (1200 with the default threshold). The live recall path already
+        // bypasses summarizeContent for mode "none" (index.js), so this was
+        // a latent trap for future callers — honor the contract instead.
         return {
             type: "kept",
-            content: truncateText(text, config.textThreshold * 4), // Max chars limit
+            content: text,
             originalLength,
             estimatedTokens: estimateTokens(text, contentType),
         };

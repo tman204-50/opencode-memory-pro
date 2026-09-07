@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCandidates } from "../dist/store.js";
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
-import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
+import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession } from "../dist/llm.js";
+import { summarizeContent } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
 import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore } from "../dist/index.js";
 import { buildPreferenceInjection } from "../dist/preference.js";
@@ -807,6 +808,31 @@ test("preference: buildPreferenceInjection budget mode consumes tokenBudget and 
     const fallback = buildPreferenceInjection(prefs, { mode: "budget", maxMemories: 10 });
     const fallbackItems = fallback.split("\n").length - 1;
     assert.equal(fallbackItems, 3, "missing tokenBudget falls back to 500 (all items fit)");
+});
+
+// OWN_SESSIONS_CAP (1.4.6): OWN_SESSION_IDS grew unbounded — one entry per
+// ephemeral LLM session for the lifetime of the server process.
+test("llm: trackOwnSession FIFO-caps the own-session set at 500 (OWN_SESSIONS_CAP)", () => {
+    for (let i = 1; i <= 501; i++) {
+        trackOwnSession(`own-sess-${i}`);
+    }
+    assert.equal(isOwnSession("own-sess-1"), false, "oldest id evicted once the cap is exceeded");
+    assert.equal(isOwnSession("own-sess-501"), true, "newest id still tracked");
+    assert.equal(isOwnSession("own-sess-2"), true, "second-oldest survives at the cap boundary");
+    trackOwnSession("own-sess-1");
+    assert.equal(isOwnSession("own-sess-1"), true, "re-added id is tracked again");
+    assert.equal(isOwnSession("own-sess-2"), false, "re-add evicts the new oldest entry");
+    assert.equal(isOwnSession("own-sess-3"), true, "remaining entries unaffected");
+});
+
+// NONE_MODE_NO_TRUNCATE (1.4.6): mode "none" must keep content as-is — the
+// branch used to truncate at textThreshold * 4 chars (1200 by default).
+test("summarize: mode none keeps full text without truncation (NONE_MODE_NO_TRUNCATE)", () => {
+    const long = "lorem ipsum dolor sit amet ".repeat(60); // 1620 chars > 1200
+    const result = summarizeContent(long, { mode: "none", textThreshold: 300, summaryTargetChars: 200 });
+    assert.equal(result.type, "kept");
+    assert.equal(result.content, long, "none-mode must return the text untruncated");
+    assert.equal(result.originalLength, long.length);
 });
 
 // EMBEDDING_CONFIG_REEMBED (1.4.5): a config-change embedder swap (new
