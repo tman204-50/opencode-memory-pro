@@ -11,7 +11,7 @@ import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
-const PLUGIN_VERSION = "1.4.5";
+const PLUGIN_VERSION = "1.4.6";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
