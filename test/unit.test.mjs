@@ -6,7 +6,7 @@ import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle } from "../dist/index.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
 
@@ -584,4 +584,39 @@ test("capture: flushAutoCapture retry after init recovery consumes and stores re
     const storedEvent = events.find((e) => e.outcome === "stored");
     assert.ok(storedEvent, "stored capture event must be recorded");
     assert.equal(storedEvent.memoryId, storedRecords[0].id);
+});
+
+// SESSION_IDLE_FLUSH_GUARD (1.4.5): the session.idle/compacted path used to
+// await flushAutoCapture with no try/catch — a transient store failure (e.g.
+// putEvent rejecting on a LanceDB hiccup) propagated out of the event hook,
+// aborting capture AND skipping the consolidate/sweep pass for that event.
+test("capture: handleSessionIdle swallows flush failure and still consolidates (SESSION_IDLE_FLUSH_GUARD)", async () => {
+    const { state } = makeFlushState({ initialized: true, minCaptureChars: 0 });
+    state.captureBuffer.set("sess-4", ["decided to use SQLite for the cache"]);
+    // The "considered" recordCaptureEvent is the first store call in flush —
+    // make it reject exactly like a transient LanceDB write failure.
+    state.store.putEvent = async () => { throw new Error("lancedb transient failure"); };
+    // Enable the consolidate/sweep pass with observable stubs.
+    state.config.dedup.enabled = true;
+    state.consolidationInProgress = new Map();
+    state.lastConsolidateAt = new Map();
+    state.sweepInProgress = new Map();
+    state.lastSweepAt = new Map();
+    let consolidateCalls = 0;
+    state.store.consolidateDuplicates = async () => { consolidateCalls += 1; };
+    state.store.readByScopes = async () => [];
+    const warnMessages = [];
+    const originalWarn = console.warn;
+    console.warn = (msg) => { warnMessages.push(String(msg)); };
+    try {
+        await assert.doesNotReject(handleSessionIdle("sess-4", "session.idle", state, { client: offlineClient }));
+    }
+    finally {
+        console.warn = originalWarn;
+    }
+    assert.equal(consolidateCalls, 1, "consolidate must still run after a failed flush");
+    assert.ok(
+        warnMessages.some((m) => m.includes("failed to flush capture on session idle")),
+        "flush failure must be logged as a warn, not propagated",
+    );
 });

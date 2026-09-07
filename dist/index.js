@@ -243,17 +243,9 @@ const plugin = async (input) => {
             if (isOwnSession(sessionID))
                 return;
             if (evt.type === "session.idle" || evt.type === "session.compacted") {
-                await flushAutoCapture(sessionID, state, input.client);
-                if (state.config.dedup.enabled) {
-                    // Use the session's actual directory (not the static plugin-init
-                    // worktree) since a single opencode server process can host
-                    // sessions across multiple project directories.
-                    const activeScope = await resolveSessionScope(sessionID, input.client, state.defaultScope);
-                    // idle = throttled background pass (cooldown-gated);
-                    // compacted = explicit compaction, consolidate right away.
-                    maybeConsolidateDuplicates(state, activeScope, evt.type === "session.compacted");
-                    maybeSweepExpiredMemories(state, activeScope, evt.type === "session.compacted");
-                }
+                // SESSION_IDLE_FLUSH_GUARD (1.4.5): extracted into a named
+                // function so the flush-failure path is unit-testable.
+                await handleSessionIdle(sessionID, evt.type, state, input);
             }
         },
         "experimental.text.complete": async (eventInput, eventOutput) => {
@@ -825,6 +817,31 @@ async function flushAutoCapture(sessionID, state, client) {
     });
     await state.store.pruneScope(activeScope, state.config.maxEntriesPerScope);
 }
+// SESSION_IDLE_FLUSH_GUARD (1.4.5): session.idle/session.compacted handling,
+// extracted from the event hook so the flush-failure path is unit-testable.
+// Mirrors the session.deleted pattern (:211-216): a transient store failure
+// inside flushAutoCapture (e.g. putEvent rejecting on a LanceDB hiccup) must
+// not propagate out of the plugin's event hook — that aborted the capture AND
+// skipped the consolidate/sweep pass for this event. Fragments survive in the
+// buffer (CAPTURE_RETRY_ON_DEFERRED) and retry on the next flush.
+async function handleSessionIdle(sessionID, eventType, state, input) {
+    try {
+        await flushAutoCapture(sessionID, state, input.client);
+    }
+    catch (error) {
+        log("warn", `failed to flush capture on session idle: ${toErrorMessage(error)}`);
+    }
+    if (state.config.dedup.enabled) {
+        // Use the session's actual directory (not the static plugin-init
+        // worktree) since a single opencode server process can host
+        // sessions across multiple project directories.
+        const activeScope = await resolveSessionScope(sessionID, input.client, state.defaultScope);
+        // idle = throttled background pass (cooldown-gated);
+        // compacted = explicit compaction, consolidate right away.
+        maybeConsolidateDuplicates(state, activeScope, eventType === "session.compacted");
+        maybeSweepExpiredMemories(state, activeScope, eventType === "session.compacted");
+    }
+}
 /**
  * Shared capture-store path (used by both heuristics and LLM modes): embed,
  * advisory dedup check, store, graph-index. Returns { id, skipReason } —
@@ -1067,4 +1084,4 @@ function hasEmbeddingConfigChanged(current, next) {
 export default plugin;
 // CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
 // opencode plugin loading consumes the default export and ignores these.
-export { flushAutoCapture };
+export { flushAutoCapture, handleSessionIdle };
