@@ -58,6 +58,13 @@ const ANN_QUERY_BATCH = envInt("OPENCODE_MEMORY_PRO_QUERY_BATCH", 16, 1, 256);
 const MAX_SCAN_ROWS = envInt("OPENCODE_MEMORY_PRO_MAX_SCAN_ROWS", 5_000_000, 0, 100_000_000);
 const SCAN_LIMIT = MAX_SCAN_ROWS === 0 ? Number.MAX_SAFE_INTEGER : MAX_SCAN_ROWS;
 const SCAN_ORDER = Object.freeze([Object.freeze({ columnName: "timestamp", ascending: false })]);
+// EPISODE_SCAN_ORDER (1.5.0): the episodic_tasks table uses startTime (not
+// timestamp) as its temporal column — the READ_CAP_FIX pattern from 1.4.3,
+// applied to queryTaskEpisodes/suggestRetryBudget so a client-side top-N slice
+// means "most recent N" instead of an arbitrary scan-order prefix (a scope
+// with more episodes than the caller's limit hid every newer episode forever).
+const EPISODE_SCAN_ORDER = Object.freeze([Object.freeze({ columnName: "startTime", ascending: false })]);
+const EPISODE_SCAN_LIMIT = MAX_SCAN_ROWS === 0 ? Number.MAX_SAFE_INTEGER : Math.max(MAX_SCAN_ROWS, 10_000);
 // Exported for use by consolidateDuplicates
 export function storeFastCosine(a, b, normA, normB) {
     if (a.length === 0 || b.length === 0 || a.length !== b.length)
@@ -2184,7 +2191,12 @@ export class MemoryStore {
         if (sinceTimestamp) {
             whereClause += ` AND startTime >= ${sinceTimestamp}`;
         }
-        const rows = await table.query().where(whereClause).toArray();
+        // EPISODE_SCAN_ORDER (1.5.0): order by startTime DESC so client-side
+        // slices mean "most recent N". Older episodes remain reachable by
+        // passing a larger limit (bounded here by EPISODE_SCAN_LIMIT, the
+        // READ_CAP_FIX cap from 1.4.3 — memory_kpi aggregates must still see
+        // every row, not just a capped prefix).
+        const rows = await table.query().where(whereClause).orderBy(EPISODE_SCAN_ORDER).limit(EPISODE_SCAN_LIMIT).toArray();
         return validateEpisodicRecordArray(rows);
     }
     /**
@@ -2393,7 +2405,10 @@ export class MemoryStore {
     async suggestRetryBudget(scope, minSamples = 3) {
         await this.ensureEpisodicTaskTable(384);
         const table = this.requireEpisodicTaskTable();
-        const rows = await table.query().where(`scope = '${escapeSql(scope)}' AND state = 'failed'`).toArray();
+        // EPISODE_SCAN_ORDER (1.5.0): same recency ordering as
+        // queryTaskEpisodes — failedEpisodes[0] must be the MOST RECENT
+        // failure (the reference error), not an arbitrary scan-order row.
+        const rows = await table.query().where(`scope = '${escapeSql(scope)}' AND state = 'failed'`).orderBy(EPISODE_SCAN_ORDER).limit(EPISODE_SCAN_LIMIT).toArray();
         const failedEpisodes = validateEpisodicRecordArray(rows);
         if (failedEpisodes.length < minSamples) {
             return null;

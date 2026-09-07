@@ -490,6 +490,29 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.0 (2026-09-07)
+
+Episodic-task query ordering fix (bug report: `task_episode_query` silently
+hid new episodes once a scope's count exceeded the query limit):
+
+- **EPISODE_SCAN_ORDER — `episodic_tasks` reads are now recency-ordered**:
+  `queryTaskEpisodes` and `suggestRetryBudget` queried with **no `.orderBy()`
+  and no `.limit()`** — `task_episode_query`'s client-side `.slice(0, limit)`
+  then returned an arbitrary oldest-first scan prefix, so once a scope held
+  more episodes than the limit (max 100) every newer episode was truncated
+  away permanently, with no error or log. Both now order by `startTime DESC`
+  (the `startTime` equivalent of the 1.4.3 `SCAN_ORDER`/`SCAN_LIMIT` pattern
+  used for the `memories`/event tables). `task_episode_query`'s slice now
+  means "most recent N"; `suggestRetryBudget`'s `failedEpisodes[0]` is now the
+  **most recent** failure (the reference error), not an arbitrary row.
+  Verified live vs the reported failure: with 1110 episodes, the newest
+  session's episodes and all pending rows are now returned first; previously
+  0 of 147 same-day episodes were visible at any limit ≤ 100. Memory-KPI
+  aggregations are unaffected (they read the full ordered set).
+- KPI (`calculateRetryToSuccessRate`/`calculateMemoryLift`) and
+  `suggestRecoveryStrategies` reads also flow through the ordered/limited
+  query where applicable (aggregates see every row; none truncate).
+
 ### v1.4.9 (2026-09-07)
 
 Scope-cache persistence + capture-LLM prompt hardening:

@@ -849,6 +849,96 @@ test("integration: initializeStore auto-repairs dimension mismatch (EMBEDDING_CO
     }
 });
 
+// EPISODE_SCAN_ORDER (1.5.0): queryTaskEpisodes previously returned an
+// UNORDERED scan — task_episode_query's client-side .slice(0, limit) silently
+// truncated newer episodes once a scope exceeded the limit. With recency
+// ordering (startTime DESC) the slice means "most recent N" — the newest
+// episode MUST always be present. Mutant: reverting to a no-orderBy query
+// makes this fail (empirical check: in the pre-fix store the newest of 1109
+// rows sat at scan position 1101 and was truncated at any limit <= 100).
+test("integration: task episode query orders by startTime desc so newest episodes are never hidden by limit (EPISODE_SCAN_ORDER)", async () => {
+    const store = await newStore("mem-episode-order-");
+    const mk = (id, taskId, startTime, state = "running") => ({
+        id,
+        sessionId: `sess-${id}`,
+        scope: "global",
+        taskId,
+        state,
+        startTime,
+        commandsJson: "[]",
+        validationOutcomesJson: "[]",
+        successPatternsJson: "[]",
+        retryAttemptsJson: "[]",
+        recoveryStrategiesJson: "[]",
+        metadataJson: "{}",
+    });
+    try {
+        const base = Date.now() - 10_000;
+        for (let i = 0; i < 12; i += 1) {
+            await store.createTaskEpisode(mk(`ep-${i}`, `task-${i}`, base + i));
+        }
+        const episodes = await store.queryTaskEpisodes("global");
+        assert.equal(episodes.length, 12, "all episodes must be returned");
+        assert.equal(episodes[0].taskId, "task-11", "newest episode must be first (startTime desc)");
+        assert.equal(episodes[episodes.length - 1].taskId, "task-0", "oldest episode must be last");
+        const limited = episodes.slice(0, 5);
+        assert.equal(limited[0].taskId, "task-11", "top-5 slice must include the newest episode");
+        assert.ok(limited.some((e) => e.taskId === "task-7"), "top-5 slice must hold the 5 most recent");
+        for (let i = 0; i < 12; i += 1) {
+            assert.ok(episodes.some((e) => e.taskId === `task-${i}`), `episode ${i} must be present`);
+        }
+    }
+    finally {
+        store.close();
+    }
+});
+
+// EPISODE_SCAN_ORDER (1.5.0): suggestRetryBudget's failedEpisodes[0] must be
+// the MOST RECENT failure (the reference error), not an arbitrary scan-order
+// row — recency ordering makes sameErrorCount/shouldStop well-defined.
+// Mutant: no-orderBy query leaves [0] arbitrary (oldest in a stable scan) and
+// fails this.
+test("integration: suggestRetryBudget uses the most recent failure as the reference error (EPISODE_SCAN_ORDER)", async () => {
+    const store = await newStore("mem-retry-ref-");
+    const mk = (id, taskId, startTime, errorMessage) => ({
+        id,
+        sessionId: `sess-${id}`,
+        scope: "global",
+        taskId,
+        state: "running",
+        startTime,
+        commandsJson: "[]",
+        validationOutcomesJson: "[]",
+        successPatternsJson: "[]",
+        retryAttemptsJson: "[]",
+        recoveryStrategiesJson: "[]",
+        metadataJson: "{}",
+        errorMessage,
+    });
+    try {
+        const base = Date.now() - 10_000;
+        for (const data of [
+            mk("ref-old", "ref-old", base, "OLD-ERROR"),
+            mk("ref-new", "ref-new", base + 5000, "NEW-ERROR"),
+            mk("ref-mid", "ref-mid", base + 2500, "OLD-ERROR"),
+            mk("ref-last", "ref-last", base + 7500, "OLD-ERROR"),
+        ]) {
+            await store.createTaskEpisode(data);
+            await store.updateTaskState(data.taskId, "failed", "global", "runtime", data.errorMessage);
+        }
+        const budget = await store.suggestRetryBudget("global", 4);
+        assert.ok(budget, "budget must be returned with 4 failed samples");
+        const failed = await store.queryTaskEpisodes("global", "failed");
+        assert.equal(failed[0].taskId, "ref-last", "most recent failure must be first");
+        assert.equal(failed[0].errorMessage, "OLD-ERROR", "most recent failure's error is the reference");
+        assert.equal(budget.suggestedRetries, 1, "no retry attempts -> median 0 -> suggest 1");
+        assert.equal(budget.shouldStop, false, "sameErrorCount < 3 -> no stop");
+    }
+    finally {
+        store.close();
+    }
+});
+
 // RETRY_BUDGET_PARSE (1.4.5): suggestRetryBudget used .length on the raw
 // retryAttemptsJson STRING (z.string() contract), so "[]" counted as 2 and
 // every failed episode looked "retried" — inflating the median into
