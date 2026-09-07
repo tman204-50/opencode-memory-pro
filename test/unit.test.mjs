@@ -6,7 +6,7 @@ import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, initializeStore } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, initializeStore } from "../dist/index.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
@@ -725,6 +725,62 @@ test("capture: handleSessionIdle swallows flush failure and still consolidates (
         warnMessages.some((m) => m.includes("failed to flush capture on session idle")),
         "flush failure must be logged as a warn, not propagated",
     );
+});
+
+// SESSION_LIFECYCLE_GUARD (1.4.6): handleSessionStart/End perform real store
+// I/O (createTaskEpisode / updateTaskState) with no try/catch — a transient
+// LanceDB failure propagated out of the event hook, and on session.deleted it
+// aborted the branch before the end-of-session dedup/consolidation pass.
+function makeLifecycleState() {
+    const state = {
+        initialized: true,
+        ensureInitialized: async () => { },
+        activeEpisodes: new Map(),
+        store: {},
+    };
+    return state;
+}
+
+function captureWarn() {
+    const warnMessages = [];
+    const originalWarn = console.warn;
+    console.warn = (msg) => { warnMessages.push(String(msg)); };
+    return { warnMessages, restore: () => { console.warn = originalWarn; } };
+}
+
+test("lifecycle: handleSessionStart swallows store failure (SESSION_LIFECYCLE_GUARD)", async () => {
+    const state = makeLifecycleState();
+    state.store.createTaskEpisode = async () => { throw new Error("lancedb transient failure"); };
+    const { warnMessages, restore } = captureWarn();
+    try {
+        await assert.doesNotReject(handleSessionStart("sess-start-1", state, { client: offlineClient, worktree: "/tmp/proj" }));
+    }
+    finally {
+        restore();
+    }
+    assert.ok(
+        warnMessages.some((m) => m.includes("failed to record session start")),
+        "session start failure must be logged as a warn, not propagated",
+    );
+    assert.ok(!state.activeEpisodes.has("sess-start-1"), "no episode entry when createTaskEpisode fails");
+});
+
+test("lifecycle: handleSessionEnd swallows store failure and retains episode for retry (SESSION_LIFECYCLE_GUARD)", async () => {
+    const state = makeLifecycleState();
+    state.activeEpisodes.set("sess-end-1", { taskId: "session-sess-end", scope: "proj" });
+    state.store.updateTaskState = async () => { throw new Error("lancedb transient failure"); };
+    const { warnMessages, restore } = captureWarn();
+    try {
+        await assert.doesNotReject(handleSessionEnd("sess-end-1", state, "success", undefined));
+    }
+    finally {
+        restore();
+    }
+    assert.ok(
+        warnMessages.some((m) => m.includes("failed to record session end")),
+        "session end failure must be logged as a warn, not propagated",
+    );
+    assert.ok(state.activeEpisodes.has("sess-end-1"), "episode entry retained so a retry can finalize it");
 });
 
 // EMBEDDING_CONFIG_REEMBED (1.4.5): a config-change embedder swap (new

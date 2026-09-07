@@ -1022,60 +1022,80 @@ function unwrapData(value) {
     return value;
 }
 async function handleSessionStart(sessionID, state, input) {
-    await state.ensureInitialized();
-    if (!state.initialized)
-        return;
-    // Resolve the session's actual directory rather than the static
-    // plugin-init worktree, since one opencode server process can host
-    // sessions across multiple project directories.
-    const activeScope = await resolveSessionScope(sessionID, input.client, deriveProjectScope(input.worktree));
-    const taskId = `session-${sessionID.slice(0, 8)}`;
-    const episode = {
-        id: generateId(),
-        sessionId: sessionID,
-        scope: activeScope,
-        taskId,
-        state: "running",
-        startTime: Date.now(),
-        commandsJson: "[]",
-        validationOutcomesJson: "[]",
-        successPatternsJson: "[]",
-        retryAttemptsJson: "[]",
-        recoveryStrategiesJson: "[]",
-        metadataJson: "{}",
-    };
-    await state.store.createTaskEpisode(episode);
-    state.activeEpisodes.set(sessionID, { taskId, scope: activeScope });
+    // SESSION_LIFECYCLE_GUARD (1.4.6): a transient store failure (e.g.
+    // createTaskEpisode rejecting on a LanceDB hiccup) used to propagate out
+    // of the event hook. A session whose episode record could not be created
+    // must still start normally — log and continue; persistSuccessPatterns
+    // below already has the same guard at the end path.
+    try {
+        await state.ensureInitialized();
+        if (!state.initialized)
+            return;
+        // Resolve the session's actual directory rather than the static
+        // plugin-init worktree, since one opencode server process can host
+        // sessions across multiple project directories.
+        const activeScope = await resolveSessionScope(sessionID, input.client, deriveProjectScope(input.worktree));
+        const taskId = `session-${sessionID.slice(0, 8)}`;
+        const episode = {
+            id: generateId(),
+            sessionId: sessionID,
+            scope: activeScope,
+            taskId,
+            state: "running",
+            startTime: Date.now(),
+            commandsJson: "[]",
+            validationOutcomesJson: "[]",
+            successPatternsJson: "[]",
+            retryAttemptsJson: "[]",
+            recoveryStrategiesJson: "[]",
+            metadataJson: "{}",
+        };
+        await state.store.createTaskEpisode(episode);
+        state.activeEpisodes.set(sessionID, { taskId, scope: activeScope });
+    }
+    catch (error) {
+        log("warn", `failed to record session start for ${sessionID}: ${toErrorMessage(error)}`);
+    }
 }
 async function handleSessionEnd(sessionID, state, outcome, errorMessage) {
-    await state.ensureInitialized();
-    if (!state.initialized)
-        return;
-    const entry = state.activeEpisodes.get(sessionID);
-    if (!entry)
-        return;
-    const finalState = outcome === "success" ? "success" : "failed";
-    // EPISODIC_FAILURE (1.3.0): when the bus gave us an error message,
-    // classify it (syntax/runtime/logic/resource/unknown) and persist it with
-    // the raw message. Truncated to match putEvent's 4000-char safety cap.
-    let failureType;
-    let failureMessage = errorMessage;
-    if (finalState === "failed" && typeof failureMessage === "string" && failureMessage.length > 0) {
-        failureType = classifyFailure(failureMessage);
-        failureMessage = failureMessage.slice(0, 4000);
+    // SESSION_LIFECYCLE_GUARD (1.4.6): mirrors the start-side guard — a
+    // rejected updateTaskState used to abort the session.deleted branch and
+    // skip the end-of-session dedup/consolidation pass. On failure the
+    // activeEpisodes entry is intentionally retained so a retry (e.g. a later
+    // duplicate deleted event) can still finalize the episode.
+    try {
+        await state.ensureInitialized();
+        if (!state.initialized)
+            return;
+        const entry = state.activeEpisodes.get(sessionID);
+        if (!entry)
+            return;
+        const finalState = outcome === "success" ? "success" : "failed";
+        // EPISODIC_FAILURE (1.3.0): when the bus gave us an error message,
+        // classify it (syntax/runtime/logic/resource/unknown) and persist it with
+        // the raw message. Truncated to match putEvent's 4000-char safety cap.
+        let failureType;
+        let failureMessage = errorMessage;
+        if (finalState === "failed" && typeof failureMessage === "string" && failureMessage.length > 0) {
+            failureType = classifyFailure(failureMessage);
+            failureMessage = failureMessage.slice(0, 4000);
+        }
+        await state.store.updateTaskState(entry.taskId, finalState, entry.scope, failureType, failureMessage);
+        if (finalState === "success") {
+            // Previously this scope-wide pattern extraction ran on every
+            // session.idle (i.e. every turn) and its result was discarded via a
+            // pointless updateTaskState(taskId, episode.state, ...) no-op that
+            // rewrote the episode with its own unchanged state. Moved here to
+            // run once, at actual task completion, and persist real patterns.
+            await persistSuccessPatterns(entry.taskId, entry.scope, state).catch((error) => {
+                log("warn", `failed to persist success patterns: ${toErrorMessage(error)}`);
+            });
+        }
+        state.activeEpisodes.delete(sessionID);
     }
-    await state.store.updateTaskState(entry.taskId, finalState, entry.scope, failureType, failureMessage);
-    if (finalState === "success") {
-        // Previously this scope-wide pattern extraction ran on every
-        // session.idle (i.e. every turn) and its result was discarded via a
-        // pointless updateTaskState(taskId, episode.state, ...) no-op that
-        // rewrote the episode with its own unchanged state. Moved here to
-        // run once, at actual task completion, and persist real patterns.
-        await persistSuccessPatterns(entry.taskId, entry.scope, state).catch((error) => {
-            log("warn", `failed to persist success patterns: ${toErrorMessage(error)}`);
-        });
+    catch (error) {
+        log("warn", `failed to record session end for ${sessionID}: ${toErrorMessage(error)}`);
     }
-    state.activeEpisodes.delete(sessionID);
 }
 async function persistSuccessPatterns(taskId, scope, state) {
     const patterns = await state.store.extractSuccessPatternsFromScope(scope);
@@ -1104,4 +1124,4 @@ function hasEmbeddingConfigChanged(current, next) {
 export default plugin;
 // CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
 // opencode plugin loading consumes the default export and ignores these.
-export { flushAutoCapture, handleSessionIdle };
+export { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd };
