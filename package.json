@@ -1,6 +1,6 @@
 {
   "name": "opencode-memory-pro",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "description": "LanceDB-backed long-term memory provider for OpenCode — standalone fork of lancedb-opencode-pro with entity graph, lifecycle, and retention",
   "type": "module",
   "main": "dist/index.js",
@@ -41,13 +41,13 @@
     "test:e2e": "node test/scenario-e2e.mjs",
     "verify": "npm test && npm pack --dry-run"
   },
-"dependencies": {
-        "@lancedb/lancedb": "^0.38.0",
-        "@opencode-ai/plugin": "^1.4.10",
-        "@opencode-ai/sdk": "^1.4.10",
-        "fuse.js": "^7.5.0",
-        "zod": "^4.1.8"
-    },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.38.0",
+    "@opencode-ai/plugin": "^1.4.10",
+    "@opencode-ai/sdk": "^1.4.10",
+    "fuse.js": "^7.5.0",
+    "zod": "^4.1.8"
+  },
   "devDependencies": {
     "@types/node": "^22.13.9",
     "typescript": "^5.8.2"
