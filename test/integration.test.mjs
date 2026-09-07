@@ -641,6 +641,29 @@ test("integration: scope cache reloads after age bound (cross-process staleness)
     }
 });
 
+// CACHE_TTL_DEFAULT (1.4.8): the default staleness bound was 60s — shorter
+// than a turn gap — so with per-put invalidation every recall rebuilt the
+// scope (observed 14/14 + 17/17 cacheMiss). The default is now 10 minutes;
+// an entry aged 5 minutes must still HIT under the default config. Mutant:
+// reverting the default to 60 * 1000 makes this a miss and the test fails.
+test("integration: scope cache hits within the default staleness bound", async () => {
+    const store = await newStore("mem-cachehit-");
+    try {
+        await store.put(makeRecord("cachehit-1", "cache hit regression memory about recall speed"));
+        await store.search(searchParams("cache hit regression", deterministicEmbed("cache hit regression")));
+        const entry = store.scopeCache.get("global");
+        assert.ok(entry, "scope cache entry must exist after the first search");
+        entry.loadedAt = Date.now() - 5 * 60 * 1000;
+        entry.lastAccessTimestamp = entry.loadedAt;
+        const hitsBefore = store.cacheStats.hits;
+        await store.search(searchParams("cache hit regression", deterministicEmbed("cache hit regression")));
+        assert.equal(store.cacheStats.hits, hitsBefore + 1, "entry aged 5 minutes must be a cache HIT under the 10-minute default");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: forced compaction is safe on a fresh store", async () => {
     const store = await newStore("mem-compact-");
     try {

@@ -240,6 +240,35 @@ async function _runEphemeralPrompt(client, llmConfig, system, userText, title) {
                 tools: {},
             },
         });
+        // PROMPT_USAGE_LOG (1.4.8): session.prompt blocks for the whole model
+        // round trip and llm.prompt spans (8-18s per capture.flush) could not
+        // be attributed — model swap (Phase 1) and provider swap (Phase 2) of
+        // the latency benchmark both failed to move latency, so the next
+        // discriminator is token volume: reasoning tokens burned before the
+        // JSON answer are provider-independent and would explain a slow call
+        // with a tiny visible reply. Logged at info for EVERY prompt,
+        // including prompts that fail the has-text check below, so failures
+        // are attributable too. Tolerant shape: info.tokens or info.usage,
+        // input/output or prompt_tokens/completion_tokens.
+        const payload = response && typeof response === "object" && "data" in response ? response.data : response;
+        const tokens = payload?.info?.tokens ?? payload?.info?.usage ?? null;
+        if (tokens && typeof tokens === "object") {
+            const input = tokens.input ?? tokens.prompt_tokens;
+            const output = tokens.output ?? tokens.completion_tokens;
+            const fields = [];
+            if (Number.isFinite(input))
+                fields.push(`in=${input}`);
+            if (Number.isFinite(output))
+                fields.push(`out=${output}`);
+            if (Number.isFinite(tokens.reasoning) && tokens.reasoning > 0)
+                fields.push(`reasoning=${tokens.reasoning}`);
+            const cacheRead = tokens.cache?.read;
+            if (Number.isFinite(cacheRead) && cacheRead > 0)
+                fields.push(`cacheRead=${cacheRead}`);
+            if (fields.length > 0) {
+                log("info", `[llm] ${title}: usage ${fields.join(" ")} (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+            }
+        }
         const text = extractAssistantText(response);
         if (!text) {
             log("warn", `[llm] ${title}: session.prompt succeeded but returned no text parts (provider=${llmConfig.provider}, model=${llmConfig.model})`);

@@ -17,6 +17,17 @@ function envInt(name, fallback, min, max) {
     const raw = Number(process.env[name]);
     return Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.floor(raw))) : fallback;
 }
+// CACHE_TTL_DEFAULT (1.4.8): the SCOPE_CACHE_STALENESS age bound shipped with
+// a 60s default — shorter than a single conversational turn gap — so with
+// per-put invalidateScope the cache NEVER hit and every recall paid a full
+// scope rebuild (readByScopes + tokenize + IDF + vecNorm over the whole
+// scope; observed 14/14 and 17/17 cacheMiss across sessions, growing
+// linearly with row count). Default is now 10 minutes and env-tunable:
+// same-process writes are still caught instantly by version invalidation
+// (store.put -> invalidateScope), so the age bound only bounds cross-process
+// staleness, where a 10-minute window is acceptable. 0 disables the age
+// check entirely (pure version gating, pre-1.4.0 behavior).
+const STALE_AFTER_MS = envInt("OPENCODE_MEMORY_PRO_STALE_AFTER_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000);
 // SCOPE_CACHE_CAP (1.4.3): the per-scope cache used to truncate to a
 // hardcoded 1000 newest records, silently making older memories invisible
 // to search once a scope outgrew it. Now env-overridable; the default stays
@@ -34,7 +45,7 @@ const DEFAULT_CACHE_CONFIG = {
     // staleness bound forces a reload after staleAfterMs even when the local
     // version is unchanged, bounding cross-process staleness without a schema
     // change. 0 disables the age check (pure version gating, pre-1.4.0).
-    staleAfterMs: 60 * 1000,
+    staleAfterMs: STALE_AFTER_MS,
 };
 const NPROBES = envInt("OPENCODE_MEMORY_PRO_NPROBES", 40, 1, 500);
 const ANN_QUERY_BATCH = envInt("OPENCODE_MEMORY_PRO_QUERY_BATCH", 16, 1, 256);

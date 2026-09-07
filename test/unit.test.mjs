@@ -199,6 +199,61 @@ test("llm: requestLLMDigest strips fences/commentary and returns text + sourceCo
     assert.equal(result.text, "Decisions: Go for services; sqlite for local caches.");
 });
 
+// PROMPT_USAGE_LOG (1.4.8): session.prompt usage must be logged so llm.prompt
+// latency can be attributed (reasoning tokens vs output vs input). Mutant:
+// removing the usage-logging block emits no line and this test fails.
+test("llm: session.prompt token usage is logged for latency attribution", async () => {
+    const originalInfo = console.info;
+    const captured = [];
+    console.info = (...args) => captured.push(args.map(String).join(" "));
+    try {
+        const fakeClient = {
+            session: {
+                create: async () => ({ data: { id: "ephemeral-usage" } }),
+                prompt: async () => ({
+                    data: {
+                        info: { tokens: { input: 2431, output: 187, reasoning: 4096, cache: { read: 512, write: 0 } } },
+                        parts: [{ type: "text", text: "[]" }],
+                    },
+                }),
+                delete: async () => { },
+            },
+        };
+        const result = await requestLLMCapture(fakeClient, { provider: "crof", model: "glm-5.3-flash" }, "some text", "sess-usage");
+        assert.deepEqual(result, [], "the call itself still succeeds");
+    }
+    finally {
+        console.info = originalInfo;
+    }
+    const usageLine = captured.find((line) => line.includes("[llm]") && line.includes("usage"));
+    assert.ok(usageLine, "a usage log line must be emitted for llm.prompt calls");
+    assert.ok(usageLine.includes("in=2431"), `usage line must include input tokens: ${usageLine}`);
+    assert.ok(usageLine.includes("out=187"), `usage line must include output tokens: ${usageLine}`);
+    assert.ok(usageLine.includes("reasoning=4096"), `usage line must include reasoning tokens: ${usageLine}`);
+    assert.ok(usageLine.includes("cacheRead=512"), `usage line must include cache reads: ${usageLine}`);
+    assert.ok(usageLine.includes("provider=crof"), `usage line must name the provider: ${usageLine}`);
+});
+
+test("llm: no usage line when the response carries no token info", async () => {
+    const originalInfo = console.info;
+    const captured = [];
+    console.info = (...args) => captured.push(args.map(String).join(" "));
+    try {
+        const fakeClient = {
+            session: {
+                create: async () => ({ data: { id: "ephemeral-nousage" } }),
+                prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: "[]" }] } }),
+                delete: async () => { },
+            },
+        };
+        await requestLLMCapture(fakeClient, { provider: "crof", model: "glm-5.3-flash" }, "some text", "sess-nousage");
+    }
+    finally {
+        console.info = originalInfo;
+    }
+    assert.equal(captured.find((line) => line.includes("usage")), undefined, "missing token info must not fabricate a usage line");
+});
+
 test("extractiveDigest: builds header, picks high-scoring sentences, respects budget", () => {
     const short = "Hi there.";
     const texts = [
