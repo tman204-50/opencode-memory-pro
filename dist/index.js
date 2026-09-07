@@ -2,7 +2,7 @@ import { resolveMemoryConfig } from "./config.js";
 import { createEmbedder } from "./embedder.js";
 import { extractCaptureCandidate } from "./extract.js";
 import { extractPreferenceSignals, aggregatePreferences, resolveConflicts, buildPreferenceInjection } from "./preference.js";
-import { buildScopeFilter, deriveProjectScope } from "./scope.js";
+import { buildScopeFilter, deriveProjectScope, setScopingConfigSource } from "./scope.js";
 import { MemoryStore } from "./store.js";
 import { generateId, classifyFailure } from "./utils.js";
 import { initLogger, configureLogger, log } from "./logger.js";
@@ -125,6 +125,10 @@ const plugin = async (input) => {
     const state = await createRuntimeState(input);
     const hooks = {
         config: async (config) => {
+            // SCOPING_CONFIG_SOURCE (1.4.5): share the real opencode config
+            // with scope.js — resolveScoping previously passed {} and
+            // silently ignored memory.scoping from opencode.json.
+            setScopingConfigSource(config);
             const nextConfig = resolveMemoryConfig(config, input.worktree);
             if (hasEmbeddingConfigChanged(state.config.embedding, nextConfig.embedding)) {
                 state.embedder = createEmbedder(nextConfig.embedding);

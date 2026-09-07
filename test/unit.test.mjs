@@ -549,6 +549,36 @@ test("scope: resolveScope collapses explicit scopes to global in global mode", (
     }
 });
 
+// SCOPING_CONFIG_SOURCE (1.4.5): opencode.json's memory.scoping only reaches
+// the plugin through the config hook; resolveScoping used to resolve with {}
+// and silently collapsed "project" to "global". The injected source must
+// drive scoping, env must still override it, and clearing must fall back.
+test("scope: injected opencode config drives scoping, env still overrides (SCOPING_CONFIG_SOURCE)", async () => {
+    const { setScopingConfigSource } = await import("../dist/scope.js");
+    const { stableHash } = await import("../dist/utils.js");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "omp-scope-src-")); // not a git repo → project:local:<hash>
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    try {
+        setScopingConfigSource({ memory: { scoping: "project" } });
+        assert.equal(resolveScope(undefined, dir), `project:local:${stableHash(dir).slice(0, 16)}`,
+            "memory.scoping from the injected opencode config must be honored");
+        assert.equal(resolveScope("my-project", dir), "my-project",
+            "explicit scope must be honored once project mode is active");
+        // Env override keeps precedence over the injected config.
+        process.env.OPENCODE_MEMORY_PRO_SCOPING = "global";
+        assert.equal(resolveScope(undefined, dir), "global", "env must still win over the config source");
+    } finally {
+        setScopingConfigSource(undefined);
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    }
+    assert.equal(resolveScope(undefined, dir), "global", "clearing the source restores the global fallback");
+});
+
 test("scope: resolveScope honors explicit scopes in project mode", () => {
     const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
     process.env.OPENCODE_MEMORY_PRO_SCOPING = "project";

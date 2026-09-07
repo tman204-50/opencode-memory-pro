@@ -38,9 +38,19 @@ export function resolveScope(scope, worktree) {
     }
     return scope ?? deriveProjectScope(worktree);
 }
+// SCOPING_CONFIG_SOURCE (1.4.5): resolveScoping used to call
+// resolveMemoryConfig({}, worktree) — the empty config meant opencode.json's
+// memory.scoping (which only reaches the plugin through the config hook)
+// was silently ignored and "project" collapsed to "global". The plugin now
+// injects the real config object via setScopingConfigSource(); sidecar and
+// env are still re-read on every call, and env keeps precedence.
+let scopingConfigSource;
+export function setScopingConfigSource(config) {
+    scopingConfigSource = config ?? undefined;
+}
 function resolveScoping(worktree) {
     try {
-        return resolveMemoryConfig({}, worktree).scoping === "project" ? "project" : "global";
+        return resolveMemoryConfig(scopingConfigSource ?? {}, worktree).scoping === "project" ? "project" : "global";
     }
     catch {
         return "global";
