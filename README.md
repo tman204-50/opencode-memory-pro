@@ -192,56 +192,6 @@ Env: `OPENCODE_MEMORY_PRO_RETRIEVAL_MODE`, `..._VECTOR_WEIGHT`,
 `..._RRF_K`, `..._RECENCY_BOOST`,
 `..._RECENCY_HALF_LIFE_HOURS`, `..._IMPORTANCE_WEIGHT`, `..._FEEDBACK_WEIGHT`.
 
-## Changelog
-
-### v1.4.3 (2026-09-06)
-
-Scaling & retention hardening for large stores:
-
-- **READ_CAP_FIX — deterministic, configurable read caps**: full-scope reads
-  (`readByScopes`, `readByScopesIncludingMerged`, `readAllActive`, event and
-  feedback reads) previously used a hard-coded `.limit(100000)` with **no
-  ORDER BY**, so beyond 100k rows a search silently truncated an arbitrary,
-  non-deterministic subset of the table. Reads now order by `timestamp DESC`
-  (latest-first when the cap binds) and the cap is configurable via
-  `OPENCODE_MEMORY_PRO_MAX_SCAN_ROWS` (default 5M; `0` = unlimited).
-  `exportAllRecords` (backup) is now unbounded and ordered — a truncated
-  backup was silent data loss.
-- **SCOPE_CACHE_CAP — configurable scope cache**: the per-scope cache used to
-  truncate to a hard-coded 1000 newest records, silently making older
-  memories invisible to search once a scope outgrew it. Now env-overridable
-  via `OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE` (default 1000, pre-1.4.3
-  behavior; explicit `cacheConfig.maxRecordsPerScope` wins over env).
-- **DIGEST_EXPIRY — digests now expire**: the retention sweep hard-deletes
-  `category:"digest"` rows older than `retention.memory.digestMaxAgeDays`
-  (default **365**; `0` disables). Previously digests lived forever, so the
-  store grew without bound no matter how often the sweep ran. Runs even when
-  no new memories qualify; pinned digests are protected; dry-runs list
-  candidates. New `memory_expire` arg + `memory_stats` reporting
-  (`digestMaxAgeDays` / `digestsEligible`).
-
-### v1.4.2 (2026-09-06)
-
-New **fuzzy search channel** — fuse.js joins the RRF merge as a third
-retrieval channel alongside vector and BM25, giving typo-tolerant matching
-out of the box:
-
-- **Typo tolerance**: `memory_search "lancedb vectr srch"` now surfaces the
-  right memory even when vector and BM25 both miss — useful for queries with
-  misspellings, partial words, or accented text (`ignoreDiacritics`).
-- **Zero-config**: `retrieval.fuzzyWeight` defaults to `0.15` (renormalized
-  with vector/BM25); set it to `0` to restore pre-1.4.2 scores exactly.
-- **Channel semantics**: records that don't appear in the fuzzy top-N
-  contribute no RRF rank, same as the other channels; `fuzzyThreshold`
-  (default `0.5`) drops weak matches.
-- **Fallback-aware**: the fuzzy channel stays active in the BM25-only
-  fallback (embedder unavailable) — that's exactly when typo tolerance helps
-  most — and is disabled only in explicit `retrieval.mode = "vector"`.
-- **Index lifecycle**: fuse.js index is built lazily over the scope cache,
-  reused across single-scope searches, and rebuilt automatically on cache
-  invalidation or threshold change.
-- `memory_stats` now reports the fuzzy channel (`enabled`/`weight`/`threshold`).
-
 ### Injection
 
 How memories are injected into the model context.
@@ -331,6 +281,9 @@ stale connections lose influence without ever being deleted.
   Preference extraction is unaffected (it runs at recall time, offline).
   On any LLM failure the pipeline **falls back to heuristics** and records a
   `llm-fallback` capture event.
+  Extraction runs with **reasoning suppressed** (the system prompt forbids
+  step-by-step thinking — 1.4.9) to keep `session.idle` latency down;
+  transcripts are capped at 60k chars, keeping the **newest tail** (1.4.9).
 
 The LLM is addressed by **OpenCode provider + model IDs** — OpenCode owns
 routing, auth, and base URLs, so no API key or baseUrl lives in the plugin
@@ -423,6 +376,11 @@ Env: `OPENCODE_MEMORY_PRO_SCOPING`, `..._INCLUDE_GLOBAL_SCOPE`,
   `"debug"` traces index creation, consolidation, compaction, and
   embedder/retrieval internals.
 - `file` — log file path (`~` expanded). Omit or set `null` to keep bus-only.
+- Named diagnostic lines (both at `info`): `[timing] <span> took <ms>` spans
+  (1.4.7+) for store/embedder/LLM/capture operations, and
+  `[llm] <title>: usage in=… out=… reasoning=… cacheRead=…` per-prompt token
+  usage (1.4.8+) — together they make `llm.prompt` / `capture.flush` latency
+  attributable from the log alone.
 
 Env: `OPENCODE_MEMORY_PRO_LOG_LEVEL`, `OPENCODE_MEMORY_PRO_LOG_FILE` (applied at
 plugin initialization, before sidecar resolution).
@@ -531,6 +489,156 @@ npm run verify      # tests + pack dry-run
 CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
+
+### v1.4.9 (2026-09-07)
+
+Scope-cache persistence + capture-LLM prompt hardening:
+
+- **CACHE_PATCH_USAGE — usage writes no longer evict the scope cache**:
+  `updateMemoryUsage` used to `table.update` + `invalidateScope` per recalled
+  result, bumping the scope version on every LLM request so the cache never
+  survived one round (20+/20+ cache misses, recalls 1279–1570ms). Usage fields
+  (`lastRecalled`/`recallCount`/`projectCount`) are not used by search scoring,
+  so the write now **patches the cached record in place** — the cache stays hot
+  and consumers still see fresh counters. Verified live: back-to-back recalls
+  hit at ~1ms and `recall.pipeline` dropped to 360–377ms.
+- **CAPTURE_NO_REASONING — extraction prompt suppresses chain-of-thought**:
+  live usage samples showed every `capture.flush` burning `reasoning=638–1173`
+  tokens before a tiny `out=168–671` JSON reply, with `llm.prompt` p50=20.4s /
+  p90=52.9s. The SDK prompt body exposes no `maxTokens`/`temperature`/`reasoning`
+  knobs, so the system prompt now explicitly forbids step-by-step reasoning.
+  Verdict via the `reasoning=` field in the usage log.
+- **CAPTURE_TAIL_KEEP — truncation keeps the newest tail**: transcripts
+  routinely rail at the 60k-char cap; truncation previously kept the HEAD,
+  discarding exactly the recent decisions a memory system should keep. Now the
+  tail (freshest context) survives.
+- `PLUGIN_VERSION` constant synced with `package.json` (the "initialized" log
+  no longer lies about the version).
+
+### v1.4.8 (2026-09-07)
+
+Latency-attribution release:
+
+- **CACHE_TTL_DEFAULT — scope-cache staleness default 60s → 10 min**
+  (`cache.staleAfterMs`, env-tunable; `0` restores pure version gating). The
+  60s default was shorter than the inter-turn gap, so the cache almost never
+  hit.
+- **PROMPT_USAGE_LOG — per-prompt token usage logged**: every ephemeral LLM
+  call now logs `[llm] <title>: usage in=… out=… reasoning=… cacheRead=…` so
+  `llm.prompt` latency is attributable (provider queue vs reasoning-token burn
+  vs input volume).
+
+### v1.4.7 (2026-09-07)
+
+**TIMING_SPANS — timing spans for performance tuning**: `[timing]` log lines
+(ms) for `store.search`, `store.getCachedScopes`, `store.put`,
+`store.putEvent`, `store.pruneScope`, `store.optimize`, `store.consolidate`,
+`consolidate.duplicates`, `retention.sweep`, `embedder.embed`, `llm.prompt`,
+and `capture.flush` (with `fragmentCount`) — per-flush and per-recall costs are
+attributable from the log alone.
+
+### v1.4.6 (2026-09-07)
+
+- **SESSION_LIFECYCLE_GUARD** — `session.start`/`session.end` store I/O is
+  try/caught; a transient LanceDB failure no longer propagates out of the event
+  hook or skips end-of-session dedup/consolidation (a failed session end
+  retains the episode for retry).
+- **PREFERENCE_BUDGET_CONFIG** — preference injection honors
+  `injection.budgetTokens` (was hard-coded 300; the `?? 500` fallback was
+  dead).
+- **CLEAR_SCOPE_COUNT_ALL** — `clearScope` counts every deleted row including
+  merged/digested/disabled (previously undercounted) and notifies their graph
+  nodes.
+- **OWN_SESSIONS_CAP** — the own-session ID set is FIFO-capped at 500.
+- **NONE_MODE_NO_TRUNCATE** — `summarization: "none"` no longer truncates at
+  `textThreshold*4`.
+- **PRUNE_SCOPE_BATCH_DELETE** — per-scope prune deletes in one batched
+  `id IN (...)` statement instead of a per-row loop.
+
+### v1.4.5 (2026-09-07)
+
+Bug-fix release — nine verified production bugs, each closed with a
+mutant-verified regression test:
+
+- **Single-flight init** — concurrent `ensureInitialized`/`store.init` calls
+  coalesce instead of double-running (createTable race, connection leak,
+  double graph backfill).
+- **Capture buffer survives deferred init** — fragments are retained and
+  retried when init is deferred, instead of being deleted before the guard.
+- **`session.idle` flush guarded** — a transient store failure inside
+  `flushAutoCapture` no longer aborts capture or skips consolidate/sweep.
+- **Auto-repair on embedding-dimension change** — `store.init` detects a
+  dimension mismatch and repairs (backup → rebuild → re-embed, ids preserved)
+  instead of silently corrupting vectors.
+- **BM25 index alignment** — BM25 scores the correct tokenized row after scope
+  filtering (a filtered-array index bug).
+- **Retry-budget parse** — `suggestRetryBudget` parses `retryAttemptsJson`
+  instead of measuring the JSON string's length (`"[]"` counted as 2).
+- **Merge entity GC** — merging memories now decrements shared entities'
+  mention counts and GCs them at zero (merged-away entities no longer leak).
+- **Reindex idempotent** — re-indexing a memory no longer inflates
+  `mention_count` (the count bumps only when a new link is inserted).
+- **Scoping config source honored** — `memory.scoping: "project"` in
+  `opencode.json` is respected (was silently ignored; everything collapsed to
+  `"global"`).
+
+### v1.4.4 (2026-09-07)
+
+- `zod` declared as a direct dependency (it was imported but undeclared).
+- JSON parse guards across store read paths — malformed rows can no longer
+  crash search/recall.
+- Read-modify-write locks serialize concurrent update paths (no lost updates
+  on concurrent feedback/usage writes).
+- Fuzzy channel wired into **auto-recall** (typos are recalled, not just
+  searched) and wasted duplicate query embeds dropped.
+
+### v1.4.3 (2026-09-06)
+
+Scaling & retention hardening for large stores:
+
+- **READ_CAP_FIX — deterministic, configurable read caps**: full-scope reads
+  (`readByScopes`, `readByScopesIncludingMerged`, `readAllActive`, event and
+  feedback reads) previously used a hard-coded `.limit(100000)` with **no
+  ORDER BY**, so beyond 100k rows a search silently truncated an arbitrary,
+  non-deterministic subset of the table. Reads now order by `timestamp DESC`
+  (latest-first when the cap binds) and the cap is configurable via
+  `OPENCODE_MEMORY_PRO_MAX_SCAN_ROWS` (default 5M; `0` = unlimited).
+  `exportAllRecords` (backup) is now unbounded and ordered — a truncated
+  backup was silent data loss.
+- **SCOPE_CACHE_CAP — configurable scope cache**: the per-scope cache used to
+  truncate to a hard-coded 1000 newest records, silently making older
+  memories invisible to search once a scope outgrew it. Now env-overridable
+  via `OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE` (default 1000, pre-1.4.3
+  behavior; explicit `cacheConfig.maxRecordsPerScope` wins over env).
+- **DIGEST_EXPIRY — digests now expire**: the retention sweep hard-deletes
+  `category:"digest"` rows older than `retention.memory.digestMaxAgeDays`
+  (default **365**; `0` disables). Previously digests lived forever, so the
+  store grew without bound no matter how often the sweep ran. Runs even when
+  no new memories qualify; pinned digests are protected; dry-runs list
+  candidates. New `memory_expire` arg + `memory_stats` reporting
+  (`digestMaxAgeDays` / `digestsEligible`).
+
+### v1.4.2 (2026-09-06)
+
+New **fuzzy search channel** — fuse.js joins the RRF merge as a third
+retrieval channel alongside vector and BM25, giving typo-tolerant matching
+out of the box:
+
+- **Typo tolerance**: `memory_search "lancedb vectr srch"` now surfaces the
+  right memory even when vector and BM25 both miss — useful for queries with
+  misspellings, partial words, or accented text (`ignoreDiacritics`).
+- **Zero-config**: `retrieval.fuzzyWeight` defaults to `0.15` (renormalized
+  with vector/BM25); set it to `0` to restore pre-1.4.2 scores exactly.
+- **Channel semantics**: records that don't appear in the fuzzy top-N
+  contribute no RRF rank, same as the other channels; `fuzzyThreshold`
+  (default `0.5`) drops weak matches.
+- **Fallback-aware**: the fuzzy channel stays active in the BM25-only
+  fallback (embedder unavailable) — that's exactly when typo tolerance helps
+  most — and is disabled only in explicit `retrieval.mode = "vector"`.
+- **Index lifecycle**: fuse.js index is built lazily over the scope cache,
+  reused across single-scope searches, and rebuilt automatically on cache
+  invalidation or threshold change.
+- `memory_stats` now reports the fuzzy channel (`enabled`/`weight`/`threshold`).
 
 ### v1.4.1 (2026-09-06)
 
