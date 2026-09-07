@@ -2264,7 +2264,20 @@ export class MemoryStore {
         let sameErrorCount = 0;
         const firstError = failedEpisodes[0]?.errorMessage;
         for (const ep of failedEpisodes) {
-            const attempts = ep.retryAttemptsJson;
+            // RETRY_BUDGET_PARSE (1.4.5): retryAttemptsJson is the JSON-encoded
+            // array (z.string() contract in types.js) — .length on the raw
+            // string counted CHARACTERS ("[]" → 2), inflating the median into
+            // triple-digit suggestedRetries and making shouldStop fire for
+            // episodes that never retried. Parse defensively; a malformed row
+            // is excluded from the median instead of masquerading as data.
+            let attempts;
+            try {
+                const parsed = JSON.parse(ep.retryAttemptsJson || "[]");
+                attempts = Array.isArray(parsed) ? parsed : [];
+            }
+            catch {
+                continue;
+            }
             retryCounts.push(attempts.length);
             if (ep.errorMessage === firstError && attempts.length > 0) {
                 sameErrorCount++;

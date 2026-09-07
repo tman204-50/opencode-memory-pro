@@ -746,6 +746,68 @@ test("integration: initializeStore auto-repairs dimension mismatch (EMBEDDING_CO
     }
 });
 
+// RETRY_BUDGET_PARSE (1.4.5): suggestRetryBudget used .length on the raw
+// retryAttemptsJson STRING (z.string() contract), so "[]" counted as 2 and
+// every failed episode looked "retried" — inflating the median into
+// triple-digit suggestedRetries and firing shouldStop for episodes that
+// never retried. The median must be over the PARSED array lengths.
+test("integration: suggestRetryBudget medians parsed retryAttemptsJson, not string length (RETRY_BUDGET_PARSE)", async () => {
+    const store = await newStore("mem-retry-budget-");
+    try {
+        const failed = async (taskId, errorMessage) => {
+            await store.createTaskEpisode({
+                id: `ep-${taskId}`,
+                sessionId: `sess-${taskId}`,
+                scope: "global",
+                taskId,
+                state: "running",
+                startTime: Date.now(),
+                commandsJson: "[]",
+                validationOutcomesJson: "[]",
+                successPatternsJson: "[]",
+                retryAttemptsJson: "[]",
+                recoveryStrategiesJson: "[]",
+                metadataJson: "{}",
+            });
+            await store.updateTaskState(taskId, "failed", "global", "resource", errorMessage);
+        };
+        const err = "ECONNREFUSED to 127.0.0.1:8080";
+        // Two failed episodes that never retried (retryAttemptsJson "[]").
+        for (const t of ["t-zero-a", "t-zero-b"]) {
+            await failed(t, err);
+        }
+        // Two failed episodes with real retry attempts (2 and 3).
+        for (const t of ["t-retried-a", "t-retried-b"]) {
+            await failed(t, err);
+        }
+        for (const t of ["t-retried-a", "t-retried-a"]) {
+            await store.addRetryAttempt(t, "global", { outcome: "failed", errorMessage: err });
+        }
+        for (const t of ["t-retried-b", "t-retried-b", "t-retried-b"]) {
+            await store.addRetryAttempt(t, "global", { outcome: "failed", errorMessage: err });
+        }
+        // One failed episode with a malformed retryAttemptsJson: excluded from
+        // the median instead of crashing or masquerading as a datapoint.
+        await failed("t-corrupt", err);
+        await store.requireEpisodicTaskTable().update({
+            where: `taskId = 't-corrupt' AND scope = 'global'`,
+            values: { retryAttemptsJson: "{not json" },
+        });
+
+        const budget = await store.suggestRetryBudget("global");
+        assert.ok(budget, "expected a budget suggestion");
+        assert.equal(budget.basedOnCount, 4, "malformed row must be excluded from the median");
+        // Parsed retryCounts = [0, 0, 2, 3] → median 2 → suggestedRetries 3.
+        assert.equal(budget.suggestedRetries, 3, `expected median of [0,0,2,3] + 1, got ${budget.suggestedRetries}`);
+        // Pre-fix: every episode "had attempts" (non-empty JSON string), so
+        // the shared error pushed sameErrorCount to 5 ≥ 3 → shouldStop true.
+        assert.equal(budget.shouldStop, false, "episodes that never retried must not trigger shouldStop");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: plugin E2E scenario (subprocess)", async () => {
     const result = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["test/scenario-e2e.mjs"], {
