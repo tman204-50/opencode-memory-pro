@@ -2,7 +2,7 @@ import { tool } from "@opencode-ai/plugin";
 import { deriveProjectScope, buildScopeFilter, resolveScope } from "../scope.js";
 import { generateId } from "../utils.js";
 import { getEmbedderHealth } from "../embedder.js";
-import { extractiveDigest, retentionCandidates } from "../store.js";
+import { extractiveDigest, retentionCandidates, expiredDigestCandidates } from "../store.js";
 import { requestLLMDigest } from "../llm.js";
 import { getLlmHealth } from "../llm.js";
 import { log } from "../logger.js";
@@ -294,14 +294,16 @@ export function createMemoryTools(state) {
                     : { enabled: false, entities: 0, memoryMappings: 0, edges: 0 };
                 // MEMORY_RETENTION (1.0): report how many memories currently
                 // qualify for the digest-then-hide expiry sweep (dry-run).
-                const memoryRetention = { enabled: false, unusedDays: 0, minAgeDays: 0, expiredCandidates: 0 };
+                const memoryRetention = { enabled: false, unusedDays: 0, minAgeDays: 0, digestMaxAgeDays: 0, expiredCandidates: 0, digestsEligible: 0 };
                 if (state.config.retention?.memory?.enabled !== false) {
                     try {
                         const sweep = await sweepExpiredMemories(state, { scope, dryRun: true });
                         memoryRetention.enabled = true;
                         memoryRetention.unusedDays = sweep.unusedDays ?? 0;
                         memoryRetention.minAgeDays = sweep.minAgeDays ?? 0;
+                        memoryRetention.digestMaxAgeDays = sweep.digestMaxAgeDays ?? 0;
                         memoryRetention.expiredCandidates = sweep.eligible ?? 0;
+                        memoryRetention.digestsEligible = sweep.digestsEligible ?? 0;
                     }
                     catch { }
                 }
@@ -1506,6 +1508,7 @@ ${explanations.join("\n")}`;
                 scope: tool.schema.string().optional(),
                 unusedDays: tool.schema.number().int().min(30).max(3650).optional(),
                 minAgeDays: tool.schema.number().int().min(30).max(3650).optional(),
+                digestMaxAgeDays: tool.schema.number().int().min(30).max(3650).optional(),
                 minGroupSize: tool.schema.number().int().min(1).max(100).optional(),
                 targetChars: tool.schema.number().int().min(100).max(2000).optional(),
                 dryRun: tool.schema.boolean().optional().default(false),
@@ -1522,6 +1525,7 @@ ${explanations.join("\n")}`;
                     dryRun: args.dryRun === true,
                     unusedDays: args.unusedDays,
                     minAgeDays: args.minAgeDays,
+                    digestMaxAgeDays: args.digestMaxAgeDays,
                     minGroupSize: args.minGroupSize,
                     targetChars: args.targetChars,
                 });
@@ -1548,6 +1552,7 @@ export async function sweepExpiredMemories(state, opts = {}) {
         targetChars: 500,
         minImportance: 0.3,
         protectedCategories: ["digest"],
+        digestMaxAgeDays: 365,
     };
     const enabledOverride = opts.enabledOverride;
     const disabled = enabledOverride === false || (enabledOverride === undefined && retCfg.enabled === false);
@@ -1566,10 +1571,36 @@ export async function sweepExpiredMemories(state, opts = {}) {
     const targetChars = opts.targetChars ?? retCfg.targetChars;
     const minImportance = opts.minImportance ?? retCfg.minImportance;
     const protectedCategories = opts.protectedCategories ?? retCfg.protectedCategories;
+    const digestMaxAgeDays = Math.max(1, Number(opts.digestMaxAgeDays ?? retCfg.digestMaxAgeDays ?? 365));
     const records = await state.store.readByScopes(scopes);
     const candidates = retentionCandidates(records, { unusedDays, minAgeDays, minImportance, protectedCategories });
+    // DIGEST_EXPIRY (1.4.3): digests themselves used to live forever as active
+    // rows, so the store grew without bound no matter how often the sweep ran.
+    // Once a digest passes digestMaxAgeDays (default 365) its source memories
+    // are long since digested and its summary is stale — hard-delete it
+    // (deleteByIdForce also strips its graph provenance and invalidates the
+    // scope cache). Runs even when no new candidates exist (the early return
+    // below would otherwise skip cleanup forever). dryRun lists without
+    // deleting.
+    const staleDigests = expiredDigestCandidates(records, digestMaxAgeDays);
+    const dryRun = opts.dryRun === true;
+    let digestsExpired = 0;
+    const expiredDigests = [];
+    if (staleDigests.length > 0 && !dryRun) {
+        for (const r of staleDigests) {
+            try {
+                if (await state.store.deleteByIdForce(r.id)) {
+                    digestsExpired += 1;
+                    expiredDigests.push({ id: r.id, category: r.category, digestChars: r.text?.length ?? 0 });
+                }
+            }
+            catch (error) {
+                log("warn", `[retention] digest expiry failed for "${r.id}": ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    }
     if (candidates.length === 0) {
-        return { enabled: !disabled, unusedDays, minAgeDays, eligible: 0, groups: 0, digestsCreated: 0, digested: 0, message: "No expired memories" };
+        return { enabled: !disabled, unusedDays, minAgeDays, digestMaxAgeDays, eligible: 0, groups: 0, digestsCreated: 0, digested: 0, digestsEligible: staleDigests.length, digestsExpired: dryRun ? 0 : digestsExpired, expiredDigests: dryRun ? [] : expiredDigests, dryRun: dryRun ? true : undefined, message: "No expired memories" };
     }
     const groups = new Map();
     for (const r of candidates) {
@@ -1578,7 +1609,6 @@ export async function sweepExpiredMemories(state, opts = {}) {
             groups.set(key, []);
         groups.get(key).push(r);
     }
-    const dryRun = opts.dryRun === true;
     const created = [];
     const dryRunSummary = [];
     let digestedTotal = 0;
@@ -1661,10 +1691,14 @@ export async function sweepExpiredMemories(state, opts = {}) {
         enabled: !disabled,
         unusedDays,
         minAgeDays,
+        digestMaxAgeDays,
         eligible: candidates.length,
         groups: created.length + dryRunSummary.length,
         digestsCreated: created.length,
         digested: digestedTotal,
+        digestsEligible: staleDigests.length,
+        digestsExpired: dryRun ? 0 : digestsExpired,
+        expiredDigests: dryRun ? [] : expiredDigests,
         dryRun: dryRun ? true : undefined,
         dryRunSummary,
         digests: created,

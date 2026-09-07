@@ -194,6 +194,32 @@ Env: `OPENCODE_MEMORY_PRO_RETRIEVAL_MODE`, `..._VECTOR_WEIGHT`,
 
 ## Changelog
 
+### v1.4.3 (2026-09-06)
+
+Scaling & retention hardening for large stores:
+
+- **READ_CAP_FIX — deterministic, configurable read caps**: full-scope reads
+  (`readByScopes`, `readByScopesIncludingMerged`, `readAllActive`, event and
+  feedback reads) previously used a hard-coded `.limit(100000)` with **no
+  ORDER BY**, so beyond 100k rows a search silently truncated an arbitrary,
+  non-deterministic subset of the table. Reads now order by `timestamp DESC`
+  (latest-first when the cap binds) and the cap is configurable via
+  `OPENCODE_MEMORY_PRO_MAX_SCAN_ROWS` (default 5M; `0` = unlimited).
+  `exportAllRecords` (backup) is now unbounded and ordered — a truncated
+  backup was silent data loss.
+- **SCOPE_CACHE_CAP — configurable scope cache**: the per-scope cache used to
+  truncate to a hard-coded 1000 newest records, silently making older
+  memories invisible to search once a scope outgrew it. Now env-overridable
+  via `OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE` (default 1000, pre-1.4.3
+  behavior; explicit `cacheConfig.maxRecordsPerScope` wins over env).
+- **DIGEST_EXPIRY — digests now expire**: the retention sweep hard-deletes
+  `category:"digest"` rows older than `retention.memory.digestMaxAgeDays`
+  (default **365**; `0` disables). Previously digests lived forever, so the
+  store grew without bound no matter how often the sweep ran. Runs even when
+  no new memories qualify; pinned digests are protected; dry-runs list
+  candidates. New `memory_expire` arg + `memory_stats` reporting
+  (`digestMaxAgeDays` / `digestsEligible`).
+
 ### v1.4.2 (2026-09-06)
 
 New **fuzzy search channel** — fuse.js joins the RRF merge as a third
@@ -359,11 +385,13 @@ Env: `OPENCODE_MEMORY_PRO_SUMMARIZE_ENABLED`, `..._SUMMARIZE_MIN_AGE_DAYS`,
 | `retention.memory.targetChars` | `500` | Digest length. |
 | `retention.memory.minImportance` | `0.3` | Importance floor — protects high-value rows. |
 | `retention.memory.protectedCategories` | `["digest"]` | Categories never expired. |
+| `retention.memory.digestMaxAgeDays` | `365` | Hard-expire digests older than this (0 disables digest expiry). |
 
 Env: `OPENCODE_MEMORY_PRO_RETENTION_EVENTS_DAYS`,
 `..._RETENTION_MEMORY_ENABLED`, `..._RETENTION_MEMORY_UNUSED_DAYS`,
 `..._RETENTION_MEMORY_MIN_AGE_DAYS`, `..._RETENTION_MEMORY_MIN_GROUP_SIZE`,
-`..._RETENTION_MEMORY_TARGET_CHARS`, `..._RETENTION_MEMORY_MIN_IMPORTANCE`.
+`..._RETENTION_MEMORY_TARGET_CHARS`, `..._RETENTION_MEMORY_MIN_IMPORTANCE`,
+`..._RETENTION_MEMORY_DIGEST_MAX_AGE_DAYS`.
 
 ### Scoping
 

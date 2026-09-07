@@ -7,18 +7,6 @@ import { log, logFileOnly } from "./logger.js";
 const TABLE_NAME = "memories";
 const EVENTS_TABLE_NAME = "effectiveness_events";
 const EVENTS_SOURCE_COLUMN = "source";
-const DEFAULT_CACHE_CONFIG = {
-    maxScopes: 10,
-    maxRecordsPerScope: 1000,
-    enabled: true,
-    // SCOPE_CACHE_STALENESS (1.4.0): the version counter only sees THIS
-    // process's writes, so when two opencode processes share one dbPath the
-    // scope cache could serve stale records forever. A modest age-based
-    // staleness bound forces a reload after staleAfterMs even when the local
-    // version is unchanged, bounding cross-process staleness without a schema
-    // change. 0 disables the age check (pure version gating, pre-1.4.0).
-    staleAfterMs: 60 * 1000,
-};
 // ANN_TUNABLES (1.3.0): nprobes controls IVF recall-vs-latency on filtered
 // vector searches; the consolidation query batch controls how many ANN
 // queries each batched vectorSearch call carries. Both were build-time
@@ -28,8 +16,36 @@ function envInt(name, fallback, min, max) {
     const raw = Number(process.env[name]);
     return Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.floor(raw))) : fallback;
 }
+// SCOPE_CACHE_CAP (1.4.3): the per-scope cache used to truncate to a
+// hardcoded 1000 newest records, silently making older memories invisible
+// to search once a scope outgrew it. Now env-overridable; the default stays
+// 1000 to preserve pre-1.4.3 behavior unless the operator opts in, so raising
+// the cap is an explicit, documented decision (memory cost: ~6KB/record for
+// the vector + tokenized + norms, so 50k ≈ 300-500MB/scope in JS).
+const MAX_RECORDS_PER_SCOPE = envInt("OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE", 1_000, 100, 5_000_000);
+const DEFAULT_CACHE_CONFIG = {
+    maxScopes: 10,
+    maxRecordsPerScope: MAX_RECORDS_PER_SCOPE,
+    enabled: true,
+    // SCOPE_CACHE_STALENESS (1.4.0): the version counter only sees THIS
+    // process's writes, so when two opencode processes share one dbPath the
+    // scope cache could serve stale records forever. A modest age-based
+    // staleness bound forces a reload after staleAfterMs even when the local
+    // version is unchanged, bounding cross-process staleness without a schema
+    // change. 0 disables the age check (pure version gating, pre-1.4.0).
+    staleAfterMs: 60 * 1000,
+};
 const NPROBES = envInt("OPENCODE_MEMORY_PRO_NPROBES", 40, 1, 500);
 const ANN_QUERY_BATCH = envInt("OPENCODE_MEMORY_PRO_QUERY_BATCH", 16, 1, 256);
+// READ_CAP_FIX (1.4.3): full-scope reads used a hard-coded .limit(100000)
+// with no ORDER BY, so beyond 100k rows a search silently truncated an
+// arbitrary subset of the table. Reads now order by timestamp DESC
+// (deterministic latest-first when the cap binds) and the cap is
+// configurable. 0 disables the cap (LanceDB limit() takes a u64;
+// MAX_SAFE_INTEGER is effectively unbounded).
+const MAX_SCAN_ROWS = envInt("OPENCODE_MEMORY_PRO_MAX_SCAN_ROWS", 5_000_000, 0, 100_000_000);
+const SCAN_LIMIT = MAX_SCAN_ROWS === 0 ? Number.MAX_SAFE_INTEGER : MAX_SCAN_ROWS;
+const SCAN_ORDER = Object.freeze([Object.freeze({ columnName: "timestamp", ascending: false })]);
 // Exported for use by consolidateDuplicates
 export function storeFastCosine(a, b, normA, normB) {
     if (a.length === 0 || b.length === 0 || a.length !== b.length)
@@ -108,7 +124,11 @@ export class MemoryStore {
     lastOptimizeAt = 0;
     constructor(dbPath, cacheConfig) {
         this.dbPath = dbPath;
-        this.cacheConfig = { ...DEFAULT_CACHE_CONFIG, ...cacheConfig };
+        this.cacheConfig = {
+            ...DEFAULT_CACHE_CONFIG,
+            maxRecordsPerScope: MAX_RECORDS_PER_SCOPE,
+            ...cacheConfig,
+        };
     }
     /**
      * Cross-process compaction lock. Returns true when this process owns the
@@ -702,9 +722,9 @@ export class MemoryStore {
             return true;
         }
         const table = this.requireTable();
-        const rows = await table.query().limit(100000).toArray();
-        if (rows.length === 100000) {
-            log("warn", "[store] deleteByIdForce fallback scan hit the 100000-row cap; the target may not be found if it lives beyond the cap");
+        const rows = await table.query().limit(SCAN_LIMIT).toArray();
+        if (MAX_SCAN_ROWS !== 0 && rows.length >= SCAN_LIMIT) {
+            log("warn", `[store] deleteByIdForce fallback scan hit the ${MAX_SCAN_ROWS}-row cap; the target may not be found if it lives beyond the cap`);
         }
         const match = rows.find((row) => this.matchesId(row.id, id));
         if (!match)
@@ -2322,7 +2342,8 @@ export class MemoryStore {
             "relatedMemoryId",
             "context",
         ])
-            .limit(100000)
+            .orderBy(SCAN_ORDER)
+            .limit(SCAN_LIMIT)
             .toArray();
         return rows
             .map((row) => normalizeEventRow(row))
@@ -2350,7 +2371,8 @@ export class MemoryStore {
             "feedbackType",
             "helpful",
         ])
-            .limit(100000)
+            .orderBy(SCAN_ORDER)
+            .limit(SCAN_LIMIT)
             .toArray();
         // Aggregate feedback per memory
         const feedbackMap = new Map();
@@ -2426,7 +2448,8 @@ export class MemoryStore {
             "citationStatus",
             "citationChain",
         ])
-            .limit(100000)
+            .orderBy(SCAN_ORDER)
+            .limit(SCAN_LIMIT)
             .toArray();
         return rows
             .map((row) => normalizeRow(row))
@@ -2518,7 +2541,7 @@ export class MemoryStore {
             "citationStatus",
             "citationChain",
         ])
-            .limit(100000)
+            .orderBy(SCAN_ORDER)
             .toArray();
         return rows
             .map((row) => normalizeRow(row))
@@ -2634,7 +2657,8 @@ export class MemoryStore {
             "citationStatus",
             "citationChain",
         ])
-            .limit(100000)
+            .orderBy(SCAN_ORDER)
+            .limit(SCAN_LIMIT)
             .toArray();
         return rows
             .map((row) => normalizeRow(row))
@@ -2676,7 +2700,8 @@ export class MemoryStore {
             "citationStatus",
             "citationChain",
         ])
-            .limit(100000)
+            .orderBy(SCAN_ORDER)
+            .limit(SCAN_LIMIT)
             .toArray();
         return rows
             .map((row) => normalizeRow(row))
@@ -3219,6 +3244,31 @@ export function retentionCandidates(records, opts = {}) {
         catch { }
         if (metadata.pinned === true)
             return false;
+        return true;
+    });
+}
+
+// DIGEST_EXPIRY (1.4.3): digests older than maxAgeDays are hard-expired by
+// the retention sweep (sweepExpiredMemories). Digests are active rows with
+// category "digest"; pinned ones are kept. Pure selector so the sweep can
+// unit-test its eligibility rule.
+export function expiredDigestCandidates(records, maxAgeDays) {
+    const days = Math.max(1, Number(maxAgeDays ?? 365));
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    return records.filter((r) => {
+        if (r.category !== "digest")
+            return false;
+        if (r.status && r.status !== "active")
+            return false;
+        const ts = Number(r.timestamp ?? 0);
+        if (ts <= 0 || ts > cutoff)
+            return false;
+        try {
+            const meta = JSON.parse(r.metadataJson || "{}");
+            if (meta.pinned === true)
+                return false;
+        }
+        catch { }
         return true;
     });
 }

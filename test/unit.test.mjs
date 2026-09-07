@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { extractiveDigest, retentionCandidates, storeFastCosine } from "../dist/store.js";
+import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCandidates } from "../dist/store.js";
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
@@ -258,6 +258,30 @@ test("retentionCandidates: never-recalled old memories are expirable", () => {
         metadataJson: "{}",
     };
     assert.equal(retentionCandidates([rec], { minAgeDays: 180, unusedDays: 60 }).length, 1);
+});
+
+test("expiredDigestCandidates: only old active digests are expirable", () => {
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
+    const oldDigest = {
+        id: "d-old",
+        status: undefined,
+        category: "digest",
+        timestamp: now - 400 * DAY,
+        metadataJson: "{}",
+    };
+    assert.equal(expiredDigestCandidates([oldDigest], 365).length, 1, "400-day digest is expirable");
+
+    const cases = [
+        { ...oldDigest, timestamp: now - 30 * DAY },
+        { ...oldDigest, status: "digested" },
+        { ...oldDigest, category: "fact" },
+        { ...oldDigest, timestamp: 0 },
+        { ...oldDigest, metadataJson: '{"pinned":true}' },
+    ];
+    for (const c of cases) {
+        assert.equal(expiredDigestCandidates([c], 365).length, 0, JSON.stringify(c));
+    }
 });
 
 test("storeFastCosine: basic similarity math", () => {

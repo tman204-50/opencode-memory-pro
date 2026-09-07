@@ -161,7 +161,8 @@
       "minImportance": 0.3,
       "protectedCategories": [
         "digest"
-      ]
+      ],
+      "digestMaxAgeDays": 365
     }
   },
   "logging": {
