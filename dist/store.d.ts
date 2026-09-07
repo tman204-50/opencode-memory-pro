@@ -32,7 +32,9 @@ export declare class MemoryStore {
         scopeBreakdown: Record<string, number>;
     }>;
     put(record: MemoryRecord): Promise<void>;
+    private _put;
     putEvent(event: MemoryEffectivenessEvent): Promise<void>;
+    private _putEvent;
     search(params: {
         query: string;
         queryVector: number[];
@@ -50,6 +52,7 @@ export declare class MemoryStore {
         feedbackWeight?: number;
         globalDiscountFactor?: number;
     }): Promise<SearchResult[]>;
+    private _search;
     deleteById(id: string, scopes: string[]): Promise<boolean>;
     deleteByIdRaw(id: string): Promise<boolean>;
     deleteByIdForce(id: string): Promise<boolean>;
@@ -61,11 +64,13 @@ export declare class MemoryStore {
     list(scope: string, limit: number): Promise<MemoryRecord[]>;
     listSince(scope: string, sinceTimestamp: number, limit?: number): Promise<MemoryRecord[]>;
     pruneScope(scope: string, maxEntries: number): Promise<number>;
+    private _pruneScope;
     consolidateDuplicates(scope: string, threshold: number, candidateLimit?: number): Promise<{
         mergedPairs: number;
         updatedRecords: number;
         skippedRecords: number;
     }>;
+    private _consolidateDuplicates;
     private findSimilarVectors;
     countIncompatibleVectors(scopes: string[], expectedDim: number): Promise<number>;
     private matchesId;
@@ -108,6 +113,7 @@ export declare class MemoryStore {
     listDistinctScopes(): Promise<string[]>;
     private invalidateScope;
     private getCachedScopes;
+    private _getCachedScopes;
     private enforceMaxScopes;
     private requireTable;
     private requireEventTable;

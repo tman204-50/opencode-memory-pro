@@ -11,7 +11,8 @@ import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
-const PLUGIN_VERSION = "1.4.6";
+import { startSpan } from "./timing.js";
+const PLUGIN_VERSION = "1.4.7";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
@@ -318,244 +319,11 @@ const plugin = async (input) => {
             const query = await getLastUserText(eventInput.sessionID, input.client);
             if (!query)
                 return;
-            // Resolve the session's actual directory rather than the static
-            // plugin-init worktree, since a single opencode server process can
-            // host sessions across multiple project directories (mirrors the
-            // fix already applied to flushAutoCapture/handleSessionStart/Idle).
-            // Without this, memories captured under the correct per-session
-            // scope become permanently invisible to recall whenever this
-            // server's static init worktree diverges from the session's
-            // actual directory.
-            const activeScope = await resolveSessionScope(eventInput.sessionID, input.client, deriveProjectScope(input.worktree));
-            const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
-            let messages = [];
-            try {
-                const rawMessages = await input.client.session.messages({ path: { id: eventInput.sessionID } });
-                const unwrapped = rawMessages.data;
-                if (Array.isArray(unwrapped)) {
-                    messages = unwrapped;
-                }
-            }
-            catch {
-                messages = [];
-            }
-            const taskType = detectTaskType(messages);
-            const profile = state.config.injection.taskTypeProfiles[taskType] ?? state.config.injection.taskTypeProfiles.general;
-            const categoryWeights = getCategoryWeights(taskType, state.config.injection.taskTypeProfiles);
-            let queryVector = [];
-            let embedderFailed = false;
-            try {
-                queryVector = await state.embedder.embed(query);
-            }
-            catch (error) {
-                embedderFailed = true;
-                log("warn", `embedding unavailable during recall: ${toErrorMessage(error)}`);
-                queryVector = [];
-            }
-            const isFallback = embedderFailed || queryVector.length === 0;
-            const effectiveVectorWeight = isFallback ? 0 : (state.config.retrieval.mode === "vector" ? 1 : state.config.retrieval.vectorWeight);
-            const effectiveBm25Weight = isFallback ? 1 : (state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.bm25Weight);
-            // FUZZY_CHANNEL (1.4.2): auto-recall previously omitted the fuzzy
-            // params entirely, and store.search treats absent fuzzyWeight as 0 —
-            // so the configured fuzzy channel only ever ran for manual
-            // memory_search. Mirror the tools/memory.js semantics: fuzzy stays
-            // on in the bm25-only fallback (typo tolerance helps most there)
-            // and is disabled only in explicit vector-only mode.
-            const effectiveFuzzyWeight = state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.fuzzyWeight;
-            if (isFallback) {
-                log("info", "Using BM25-only search (embedder unavailable)");
-            }
-            const results = await state.store.search({
-                query,
-                queryVector,
-                scopes,
-                limit: profile.maxMemories * 2,
-                vectorWeight: effectiveVectorWeight,
-                bm25Weight: effectiveBm25Weight,
-                fuzzyWeight: effectiveFuzzyWeight,
-                fuzzyThreshold: state.config.retrieval.fuzzyThreshold,
-                minScore: Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor),
-                rrfK: state.config.retrieval.rrfK,
-                recencyBoost: state.config.retrieval.recencyBoost,
-                recencyHalfLifeHours: state.config.retrieval.recencyHalfLifeHours,
-                importanceWeight: state.config.retrieval.importanceWeight,
-                feedbackWeight: state.config.retrieval.feedbackWeight,
-                globalDiscountFactor: state.config.globalDiscountFactor,
-            });
-            // GRAPH_STORE_PHASE1: entity-co-occurrence boost on top of the
-            // hybrid score. Multiplicative, conservative (1 + lambda*strength),
-            // and a no-op when the graph is disabled or the query has no
-            // extractable entities.
-            let graphBoostedResults = results;
-            if (state.config.graph?.enabled && state.graph?.enabled) {
-                try {
-                    graphBoostedResults = state.graph.boostResults(query, results, state.config.graph.boostLambda);
-                }
-                catch (error) {
-                    log("warn", `graph boost failed: ${toErrorMessage(error)}`);
-                }
-            }
-            const weightedResults = graphBoostedResults.map((r) => {
-                const catWeight = categoryWeights[r.record.category] ?? 1.0;
-                return { ...r, score: r.score * catWeight };
-            }).sort((a, b) => b.score - a.score);
-            // GRAPH_STORE_PHASE2B: graph-expansion recall for injection. BFS
-            // from the query's entities; reachable memories that did NOT
-            // text/vector-match are appended with a graph-origin score below
-            // the weakest real match, so they only get injected when the
-            // primary recall comes up thin (injectionLimit caps the block).
-            const graphExpanded = [];
-            if (state.config.graph?.enabled && state.graph?.enabled && state.config.graph.expansionEnabled !== false) {
-                try {
-                    const candidates = state.graph.expandRecall(query, {
-                        maxHops: state.config.graph.maxHops,
-                        expansionLimit: state.config.graph.expansionLimit,
-                        expansionLambda: state.config.graph.expansionLambda,
-                    });
-                    if (candidates.length > 0) {
-                        const expandedRecords = await state.store.findRecordsByIds(candidates.map((c) => c.memoryId), scopes);
-                        const recordById = new Map(expandedRecords.map((r) => [r.id, r]));
-                        const existingIds = new Set(weightedResults.map((r) => r.record.id));
-                        const floorScore = weightedResults.length > 0
-                            ? Math.min(...weightedResults.map((r) => r.score))
-                            : Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor);
-                        for (const candidate of candidates) {
-                            const record = recordById.get(candidate.memoryId);
-                            if (!record || existingIds.has(record.id))
-                                continue;
-                            graphExpanded.push({
-                                record,
-                                score: floorScore * candidate.scoreFactor,
-                                vectorScore: 0,
-                                bm25Score: 0,
-                                graphBFS: { hops: candidate.hops, relation: candidate.relation, typed: candidate.typed, path: candidate.path },
-                            });
-                        }
-                    }
-                }
-                catch (error) {
-                    log("warn", `graph expansion failed: ${toErrorMessage(error)}`);
-                }
-            }
-            const mergedResults = [...weightedResults, ...graphExpanded].sort((a, b) => b.score - a.score);
-            // RECENCY_FACTORS (1.2.0): was a display stub (ageHours:0/
-            // withinHalfLife:true/decayFactor:1) — kept in sync with the
-            // manual-search path in tools/memory.js and store.explainMemory.
-            const recencyHalfLifeHours = Math.max(1, state.config.retrieval.recencyHalfLifeHours ?? 72);
-            state.lastRecall = {
-                timestamp: Date.now(),
-                query,
-                results: mergedResults.map((r) => {
-                    const ageHours = (Date.now() - r.record.timestamp) / 3_600_000;
-                    return {
-                        memoryId: r.record.id,
-                        score: r.score,
-                        factors: {
-                            relevance: { overall: r.score, vectorScore: r.vectorScore, bm25Score: r.bm25Score },
-                            recency: { timestamp: r.record.timestamp, ageHours, withinHalfLife: ageHours <= recencyHalfLifeHours, decayFactor: Math.exp(-ageHours / recencyHalfLifeHours) },
-                            citation: r.record.citationSource ? { source: r.record.citationSource, status: r.record.citationStatus } : undefined,
-                            importance: r.record.importance,
-                            scope: { memoryScope: r.record.scope, matchesCurrentScope: r.record.scope === activeScope, isGlobal: r.record.scope === "global" },
-                            graph: r.graphBFS ? { bfs: { hops: r.graphBFS.hops, relation: r.graphBFS.relation, typed: r.graphBFS.typed } }
-                                : r.graphBoost ? { boost: r.graphBoost, overlap: r.graphOverlap ?? 0 } : undefined,
-                        },
-                    };
-                }),
-            };
-            // Extract preference signals from memories
-            // Extract preference signals from memories, bucketed by the MEMORY's own
-            // scope. Both filters previously tested activeScope — the same value
-            // for both branches — so one profile was always empty and, under
-            // scoping:"project" with includeGlobalScope, signals from global
-            // memories were misattributed to the project profile (and vice
-            // versa). Pair each signal with its record's scope and bucket there;
-            // behavior is unchanged in the default global mode (every record is
-            // scope "global").
-            const allSignals = results.flatMap((r) => extractPreferenceSignals(r.record).map((signal) => ({ signal, memoryScope: r.record.scope })));
-            const projectSignals = allSignals.filter((s) => !s.memoryScope.startsWith("global")).map((s) => s.signal);
-            const globalSignals = allSignals.filter((s) => s.memoryScope.startsWith("global")).map((s) => s.signal);
-            const projectProfile = aggregatePreferences(projectSignals, "project");
-            const globalProfile = aggregatePreferences(globalSignals, "global");
-            const effectivePreferences = resolveConflicts(projectProfile.preferences, globalProfile.preferences);
-            const preferenceInjection = buildPreferenceInjection(effectivePreferences, preferenceInjectionConfig(state.config.injection, profile));
-            // Apply injection control with task-type profile
-            const injectionConfig = {
-                ...state.config.injection,
-                maxMemories: profile.maxMemories,
-                budgetTokens: profile.budgetTokens,
-                summaryTargetChars: profile.summaryTargetChars,
-            };
-            const injectionLimit = calculateInjectionLimit(mergedResults, injectionConfig);
-            const limitedResults = mergedResults.slice(0, injectionLimit);
-            await state.store.putEvent({
-                id: generateId(),
-                type: "recall",
-                source: "system-transform",
-                scope: activeScope,
-                sessionID: eventInput.sessionID,
-                timestamp: Date.now(),
-                resultCount: limitedResults.length,
-                injected: limitedResults.length > 0,
-                metadataJson: JSON.stringify({
-                    source: "system-transform",
-                    includeGlobalScope: state.config.includeGlobalScope,
-                    injectionMode: state.config.injection.mode,
-                    injectionLimit: injectionLimit,
-                }),
-            });
-            if (limitedResults.length === 0)
-                return;
-            for (const result of limitedResults) {
-                state.store.updateMemoryUsage(result.record.id, activeScope, scopes).catch(() => { });
-            }
-            // EPISODE_RECALL_USED (1.3.5): stamp the session's task episode so
-            // memory_kpi's memory-lift metric can actually separate tasks that
-            // used recall from tasks that didn't (nothing ever set it before).
-            const recallEpisode = state.activeEpisodes.get(eventInput.sessionID);
-            if (recallEpisode) {
-                state.store.markEpisodeRecallUsed(recallEpisode.taskId, recallEpisode.scope)
-                    .catch((error) => log("warn", `failed to mark episode recall used: ${toErrorMessage(error)}`));
-            }
-            // Apply summarization if configured
-            const summarizationConfig = createSummarizationConfig(state.config.injection);
-            const processedResults = limitedResults.map((item) => {
-                if (state.config.injection.summarization === "none") {
-                    return { ...item, text: item.record.text };
-                }
-                const summarized = summarizeContent(item.record.text, summarizationConfig);
-                return { ...item, text: summarized.content };
-            });
-            const blocks = [];
-            if (preferenceInjection) {
-                blocks.push(preferenceInjection);
-            }
-            blocks.push("[Memory Recall - optional historical context]", ...processedResults.map((item, index) => {
-                const citationInfo = item.record.citationSource
-                    ? ` [${item.record.citationSource}|${item.record.citationStatus ?? "pending"}]`
-                    : "";
-                return `${index + 1}. [${item.record.id}]${citationInfo}${item.graphBFS ? ` [graph-bfs: ${item.graphBFS.hops} hop${item.graphBFS.hops === 1 ? "" : "s"}]` : ""} (${item.record.scope}) ${item.text}`;
-            }), "Use these as optional hints only; prioritize current user intent and current repo state.");
-            // === Similar Task Recall (Episodic Learning) ===
-            // findSimilarTasks matches by keyword only (its vector branch was
-            // dead code), so no embedding is needed here — the previous
-            // re-embed of the query was computed every recall turn and unused.
-            try {
-                const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.85);
-                if (similarTasks.length > 0) {
-                    const taskContext = similarTasks.slice(0, 2).map((ep) => {
-                        const commands = JSON.parse(ep.commandsJson || "[]");
-                        const outcomes = JSON.parse(ep.validationOutcomesJson || "[]");
-                        const passed = outcomes.filter((o) => o.status === "pass").length;
-                        const total = outcomes.length;
-                        return `Similar task: ${ep.taskId} (${ep.state}) - Commands: ${commands.slice(0, 3).join(" → ")} - Validations: ${passed}/${total} passed`;
-                    });
-                    blocks.push("[Similar Task Recall - based on past successful solutions]", ...taskContext, "Consider these approaches for solving the current task.");
-                }
-            }
-            catch (error) {
-                log("warn", `similar task recall failed: ${toErrorMessage(error)}`);
-            }
-            eventOutput.system.push(blocks.join("\n\n"));
+            // TIMING_SPANS (1.4.7): the recall pipeline is extracted into a named
+            // function (test seam, mirrors handleSessionIdle) so the timing span
+            // covers the whole turn: scope resolution, messages fetch, embed,
+            // hybrid search, graph boost/expansion, and injection assembly.
+            await runRecallPipeline(eventInput, eventOutput, state, input, query);
         },
         tool: {
             ...createMemoryTools(state),
@@ -680,6 +448,265 @@ export async function initializeStore(state) {
     }
     state.initialized = true;
 }
+// TIMING_SPANS (1.4.7): full recall turn, measured end to end. The stop() in
+// the finally also fires on early throws, so degraded paths still report time.
+async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
+    const stop = startSpan("recall.pipeline");
+    try {
+                // Resolve the session's actual directory rather than the static
+                // plugin-init worktree, since a single opencode server process can
+                // host sessions across multiple project directories (mirrors the
+                // fix already applied to flushAutoCapture/handleSessionStart/Idle).
+                // Without this, memories captured under the correct per-session
+                // scope become permanently invisible to recall whenever this
+                // server's static init worktree diverges from the session's
+                // actual directory.
+                const activeScope = await resolveSessionScope(eventInput.sessionID, input.client, deriveProjectScope(input.worktree));
+                const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
+                let messages = [];
+                try {
+                    const rawMessages = await input.client.session.messages({ path: { id: eventInput.sessionID } });
+                    const unwrapped = rawMessages.data;
+                    if (Array.isArray(unwrapped)) {
+                        messages = unwrapped;
+                    }
+                }
+                catch {
+                    messages = [];
+                }
+                const taskType = detectTaskType(messages);
+                const profile = state.config.injection.taskTypeProfiles[taskType] ?? state.config.injection.taskTypeProfiles.general;
+                const categoryWeights = getCategoryWeights(taskType, state.config.injection.taskTypeProfiles);
+                let queryVector = [];
+                let embedderFailed = false;
+                try {
+                    queryVector = await state.embedder.embed(query);
+                }
+                catch (error) {
+                    embedderFailed = true;
+                    log("warn", `embedding unavailable during recall: ${toErrorMessage(error)}`);
+                    queryVector = [];
+                }
+                const isFallback = embedderFailed || queryVector.length === 0;
+                const effectiveVectorWeight = isFallback ? 0 : (state.config.retrieval.mode === "vector" ? 1 : state.config.retrieval.vectorWeight);
+                const effectiveBm25Weight = isFallback ? 1 : (state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.bm25Weight);
+                // FUZZY_CHANNEL (1.4.2): auto-recall previously omitted the fuzzy
+                // params entirely, and store.search treats absent fuzzyWeight as 0 —
+                // so the configured fuzzy channel only ever ran for manual
+                // memory_search. Mirror the tools/memory.js semantics: fuzzy stays
+                // on in the bm25-only fallback (typo tolerance helps most there)
+                // and is disabled only in explicit vector-only mode.
+                const effectiveFuzzyWeight = state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.fuzzyWeight;
+                if (isFallback) {
+                    log("info", "Using BM25-only search (embedder unavailable)");
+                }
+                const results = await state.store.search({
+                    query,
+                    queryVector,
+                    scopes,
+                    limit: profile.maxMemories * 2,
+                    vectorWeight: effectiveVectorWeight,
+                    bm25Weight: effectiveBm25Weight,
+                    fuzzyWeight: effectiveFuzzyWeight,
+                    fuzzyThreshold: state.config.retrieval.fuzzyThreshold,
+                    minScore: Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor),
+                    rrfK: state.config.retrieval.rrfK,
+                    recencyBoost: state.config.retrieval.recencyBoost,
+                    recencyHalfLifeHours: state.config.retrieval.recencyHalfLifeHours,
+                    importanceWeight: state.config.retrieval.importanceWeight,
+                    feedbackWeight: state.config.retrieval.feedbackWeight,
+                    globalDiscountFactor: state.config.globalDiscountFactor,
+                });
+                // GRAPH_STORE_PHASE1: entity-co-occurrence boost on top of the
+                // hybrid score. Multiplicative, conservative (1 + lambda*strength),
+                // and a no-op when the graph is disabled or the query has no
+                // extractable entities.
+            let graphBoostedResults = results;
+            if (state.config.graph?.enabled && state.graph?.enabled) {
+                // TIMING_SPANS (1.4.7): entity extraction + BFS per recall turn.
+                const stopGraphBoost = startSpan("graph.boost");
+                try {
+                    graphBoostedResults = state.graph.boostResults(query, results, state.config.graph.boostLambda);
+                }
+                catch (error) {
+                    log("warn", `graph boost failed: ${toErrorMessage(error)}`);
+                }
+                finally {
+                    stopGraphBoost({ results: results.length });
+                }
+            }
+                const weightedResults = graphBoostedResults.map((r) => {
+                    const catWeight = categoryWeights[r.record.category] ?? 1.0;
+                    return { ...r, score: r.score * catWeight };
+                }).sort((a, b) => b.score - a.score);
+                // GRAPH_STORE_PHASE2B: graph-expansion recall for injection. BFS
+                // from the query's entities; reachable memories that did NOT
+                // text/vector-match are appended with a graph-origin score below
+                // the weakest real match, so they only get injected when the
+                // primary recall comes up thin (injectionLimit caps the block).
+            const graphExpanded = [];
+            if (state.config.graph?.enabled && state.graph?.enabled && state.config.graph.expansionEnabled !== false) {
+                // TIMING_SPANS (1.4.7): BFS expansion + findRecordsByIds per turn.
+                const stopGraphExpand = startSpan("graph.expand");
+                try {
+                    const candidates = state.graph.expandRecall(query, {
+                        maxHops: state.config.graph.maxHops,
+                        expansionLimit: state.config.graph.expansionLimit,
+                        expansionLambda: state.config.graph.expansionLambda,
+                    });
+                        if (candidates.length > 0) {
+                            const expandedRecords = await state.store.findRecordsByIds(candidates.map((c) => c.memoryId), scopes);
+                            const recordById = new Map(expandedRecords.map((r) => [r.id, r]));
+                            const existingIds = new Set(weightedResults.map((r) => r.record.id));
+                            const floorScore = weightedResults.length > 0
+                                ? Math.min(...weightedResults.map((r) => r.score))
+                                : Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor);
+                            for (const candidate of candidates) {
+                                const record = recordById.get(candidate.memoryId);
+                                if (!record || existingIds.has(record.id))
+                                    continue;
+                                graphExpanded.push({
+                                    record,
+                                    score: floorScore * candidate.scoreFactor,
+                                    vectorScore: 0,
+                                    bm25Score: 0,
+                                    graphBFS: { hops: candidate.hops, relation: candidate.relation, typed: candidate.typed, path: candidate.path },
+                                });
+                            }
+                        }
+                    }
+                    catch (error) {
+                        log("warn", `graph expansion failed: ${toErrorMessage(error)}`);
+                    }
+                    finally {
+                        stopGraphExpand();
+                    }
+                }
+                const mergedResults = [...weightedResults, ...graphExpanded].sort((a, b) => b.score - a.score);
+                // RECENCY_FACTORS (1.2.0): was a display stub (ageHours:0/
+                // withinHalfLife:true/decayFactor:1) — kept in sync with the
+                // manual-search path in tools/memory.js and store.explainMemory.
+                const recencyHalfLifeHours = Math.max(1, state.config.retrieval.recencyHalfLifeHours ?? 72);
+                state.lastRecall = {
+                    timestamp: Date.now(),
+                    query,
+                    results: mergedResults.map((r) => {
+                        const ageHours = (Date.now() - r.record.timestamp) / 3_600_000;
+                        return {
+                            memoryId: r.record.id,
+                            score: r.score,
+                            factors: {
+                                relevance: { overall: r.score, vectorScore: r.vectorScore, bm25Score: r.bm25Score },
+                                recency: { timestamp: r.record.timestamp, ageHours, withinHalfLife: ageHours <= recencyHalfLifeHours, decayFactor: Math.exp(-ageHours / recencyHalfLifeHours) },
+                                citation: r.record.citationSource ? { source: r.record.citationSource, status: r.record.citationStatus } : undefined,
+                                importance: r.record.importance,
+                                scope: { memoryScope: r.record.scope, matchesCurrentScope: r.record.scope === activeScope, isGlobal: r.record.scope === "global" },
+                                graph: r.graphBFS ? { bfs: { hops: r.graphBFS.hops, relation: r.graphBFS.relation, typed: r.graphBFS.typed } }
+                                    : r.graphBoost ? { boost: r.graphBoost, overlap: r.graphOverlap ?? 0 } : undefined,
+                            },
+                        };
+                    }),
+                };
+                // Extract preference signals from memories
+                // Extract preference signals from memories, bucketed by the MEMORY's own
+                // scope. Both filters previously tested activeScope — the same value
+                // for both branches — so one profile was always empty and, under
+                // scoping:"project" with includeGlobalScope, signals from global
+                // memories were misattributed to the project profile (and vice
+                // versa). Pair each signal with its record's scope and bucket there;
+                // behavior is unchanged in the default global mode (every record is
+                // scope "global").
+                const allSignals = results.flatMap((r) => extractPreferenceSignals(r.record).map((signal) => ({ signal, memoryScope: r.record.scope })));
+                const projectSignals = allSignals.filter((s) => !s.memoryScope.startsWith("global")).map((s) => s.signal);
+                const globalSignals = allSignals.filter((s) => s.memoryScope.startsWith("global")).map((s) => s.signal);
+                const projectProfile = aggregatePreferences(projectSignals, "project");
+                const globalProfile = aggregatePreferences(globalSignals, "global");
+                const effectivePreferences = resolveConflicts(projectProfile.preferences, globalProfile.preferences);
+                const preferenceInjection = buildPreferenceInjection(effectivePreferences, preferenceInjectionConfig(state.config.injection, profile));
+                // Apply injection control with task-type profile
+                const injectionConfig = {
+                    ...state.config.injection,
+                    maxMemories: profile.maxMemories,
+                    budgetTokens: profile.budgetTokens,
+                    summaryTargetChars: profile.summaryTargetChars,
+                };
+                const injectionLimit = calculateInjectionLimit(mergedResults, injectionConfig);
+                const limitedResults = mergedResults.slice(0, injectionLimit);
+                await state.store.putEvent({
+                    id: generateId(),
+                    type: "recall",
+                    source: "system-transform",
+                    scope: activeScope,
+                    sessionID: eventInput.sessionID,
+                    timestamp: Date.now(),
+                    resultCount: limitedResults.length,
+                    injected: limitedResults.length > 0,
+                    metadataJson: JSON.stringify({
+                        source: "system-transform",
+                        includeGlobalScope: state.config.includeGlobalScope,
+                        injectionMode: state.config.injection.mode,
+                        injectionLimit: injectionLimit,
+                    }),
+                });
+                if (limitedResults.length === 0)
+                    return;
+                for (const result of limitedResults) {
+                    state.store.updateMemoryUsage(result.record.id, activeScope, scopes).catch(() => { });
+                }
+                // EPISODE_RECALL_USED (1.3.5): stamp the session's task episode so
+                // memory_kpi's memory-lift metric can actually separate tasks that
+                // used recall from tasks that didn't (nothing ever set it before).
+                const recallEpisode = state.activeEpisodes.get(eventInput.sessionID);
+                if (recallEpisode) {
+                    state.store.markEpisodeRecallUsed(recallEpisode.taskId, recallEpisode.scope)
+                        .catch((error) => log("warn", `failed to mark episode recall used: ${toErrorMessage(error)}`));
+                }
+                // Apply summarization if configured
+                const summarizationConfig = createSummarizationConfig(state.config.injection);
+                const processedResults = limitedResults.map((item) => {
+                    if (state.config.injection.summarization === "none") {
+                        return { ...item, text: item.record.text };
+                    }
+                    const summarized = summarizeContent(item.record.text, summarizationConfig);
+                    return { ...item, text: summarized.content };
+                });
+                const blocks = [];
+                if (preferenceInjection) {
+                    blocks.push(preferenceInjection);
+                }
+                blocks.push("[Memory Recall - optional historical context]", ...processedResults.map((item, index) => {
+                    const citationInfo = item.record.citationSource
+                        ? ` [${item.record.citationSource}|${item.record.citationStatus ?? "pending"}]`
+                        : "";
+                    return `${index + 1}. [${item.record.id}]${citationInfo}${item.graphBFS ? ` [graph-bfs: ${item.graphBFS.hops} hop${item.graphBFS.hops === 1 ? "" : "s"}]` : ""} (${item.record.scope}) ${item.text}`;
+                }), "Use these as optional hints only; prioritize current user intent and current repo state.");
+                // === Similar Task Recall (Episodic Learning) ===
+                // findSimilarTasks matches by keyword only (its vector branch was
+                // dead code), so no embedding is needed here — the previous
+                // re-embed of the query was computed every recall turn and unused.
+                try {
+                    const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.85);
+                    if (similarTasks.length > 0) {
+                        const taskContext = similarTasks.slice(0, 2).map((ep) => {
+                            const commands = JSON.parse(ep.commandsJson || "[]");
+                            const outcomes = JSON.parse(ep.validationOutcomesJson || "[]");
+                            const passed = outcomes.filter((o) => o.status === "pass").length;
+                            const total = outcomes.length;
+                            return `Similar task: ${ep.taskId} (${ep.state}) - Commands: ${commands.slice(0, 3).join(" → ")} - Validations: ${passed}/${total} passed`;
+                        });
+                        blocks.push("[Similar Task Recall - based on past successful solutions]", ...taskContext, "Consider these approaches for solving the current task.");
+                    }
+                }
+                catch (error) {
+                    log("warn", `similar task recall failed: ${toErrorMessage(error)}`);
+                }
+                eventOutput.system.push(blocks.join("\n\n"));
+    }
+    finally {
+        stop();
+    }
+}
+
 async function getLastUserText(sessionID, client) {
     try {
         const response = await client.session.messages({ path: { id: sessionID } });
@@ -702,6 +729,18 @@ async function getLastUserText(sessionID, client) {
     }
 }
 async function flushAutoCapture(sessionID, state, client) {
+    // TIMING_SPANS (1.4.7): capture flush (LLM or heuristics + store writes)
+    // is the main session-idle cost; fragmentCount sizes the work per flush.
+    const stop = startSpan("capture.flush");
+    const fragmentCount = (state.captureBuffer.get(sessionID) ?? []).length;
+    try {
+        return await _flushAutoCapture(sessionID, state, client);
+    }
+    finally {
+        stop({ fragmentCount });
+    }
+}
+async function _flushAutoCapture(sessionID, state, client) {
     const fragments = state.captureBuffer.get(sessionID) ?? [];
     if (fragments.length === 0) {
         await recordCaptureEvent(state, {
@@ -949,10 +988,15 @@ async function maybeConsolidateDuplicates(state, scope, force = false) {
     }
     state.lastConsolidateAt.set(scope, Date.now());
     state.consolidationInProgress.set(scope, true);
+    // TIMING_SPANS (1.4.7): fire-and-forget, so the span stops in the chain.
+    const stopConsolidateSpan = startSpan("consolidate.duplicates");
     state.store
         .consolidateDuplicates(scope, state.config.dedup.consolidateThreshold, state.config.dedup.candidateLimit)
         .catch(() => { })
-        .finally(() => state.consolidationInProgress.delete(scope));
+        .finally(() => {
+            stopConsolidateSpan();
+            state.consolidationInProgress.delete(scope);
+        });
 }
 // MEMORY_RETENTION (1.0): digest-then-hide expiry sweep, fired alongside
 // consolidation on session.idle/compacted/deleted + once at init. Shares the
@@ -972,6 +1016,8 @@ async function maybeSweepExpiredMemories(state, scope, force = false) {
     }
     state.lastSweepAt.set(scope, Date.now());
     state.sweepInProgress.set(scope, true);
+    // TIMING_SPANS (1.4.7): fire-and-forget, so the span stops in the chain.
+    const stopSweepSpan = startSpan("retention.sweep");
     sweepExpiredMemories(state, { scope })
         .then((result) => {
             if (result.digestsCreated > 0) {
@@ -979,7 +1025,10 @@ async function maybeSweepExpiredMemories(state, scope, force = false) {
             }
         })
         .catch((error) => log("warn", `[retention] sweep failed: ${toErrorMessage(error)}`))
-        .finally(() => state.sweepInProgress.delete(scope));
+        .finally(() => {
+            stopSweepSpan();
+            state.sweepInProgress.delete(scope);
+        });
 }
 async function recordCaptureEvent(state, input) {
     if (!state.initialized)
@@ -1132,4 +1181,4 @@ function hasEmbeddingConfigChanged(current, next) {
 export default plugin;
 // CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
 // opencode plugin loading consumes the default export and ignores these.
-export { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig };
+export { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline };

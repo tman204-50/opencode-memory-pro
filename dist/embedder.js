@@ -1,4 +1,5 @@
 import { log } from "./logger.js";
+import { startSpan } from "./timing.js";
 let globalEmbedderHealth = {
     status: "healthy",
     lastError: null,
@@ -25,6 +26,18 @@ async function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 async function embedWithRetry(embedder, config, text) {
+    // TIMING_SPANS (1.4.7): the embedding call is the dominant network cost on
+    // both recall and capture; attempts exposes retry amplification.
+    const spanExtra = {};
+    const stop = startSpan("embedder.embed");
+    try {
+        return await _embedWithRetry(embedder, config, text, spanExtra);
+    }
+    finally {
+        stop(spanExtra);
+    }
+}
+async function _embedWithRetry(embedder, config, text, spanExtra = {}) {
     const retry = config.retry ?? {
         enabled: true,
         maxAttempts: 3,
@@ -38,6 +51,7 @@ async function embedWithRetry(embedder, config, text) {
     let attempt = 0;
     while (attempt < retry.maxAttempts) {
         attempt++;
+        spanExtra.attempts = attempt;
         try {
             const result = await embedder.embed(text);
             globalEmbedderHealth.lastSuccess = Date.now();
@@ -66,6 +80,7 @@ async function embedWithRetry(embedder, config, text) {
     }
     globalEmbedderHealth.status = "degraded";
     globalEmbedderHealth.fallbackActive = true;
+    spanExtra.degraded = true;
     log("warn", `Embedder unavailable after ${retry.maxAttempts} attempts, falling back to BM25-only search`);
     throw lastError;
 }

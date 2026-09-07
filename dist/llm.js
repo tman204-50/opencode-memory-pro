@@ -1,6 +1,7 @@
 // LLM_CAPTURE (1.1): SDK-transport LLM extraction and digest generation for
 // opencode-memory-pro.
 import { log } from "./logger.js";
+import { startSpan } from "./timing.js";
 //
 // Transport rules (per design):
 //   - The LLM is addressed by opencode provider ID + model ID. opencode owns
@@ -205,6 +206,17 @@ export async function requestLLMDigest(client, llmConfig, texts, targetChars, gr
  * delete (in finally). Returns the assistant's text, or null on failure.
  */
 async function runEphemeralPrompt(client, llmConfig, system, userText, title) {
+    // TIMING_SPANS (1.4.7): ephemeral session create + prompt + delete; in
+    // capture.mode="llm" this round trip dominates session-idle latency.
+    const stop = startSpan("llm.prompt");
+    try {
+        return await _runEphemeralPrompt(client, llmConfig, system, userText, title);
+    }
+    finally {
+        stop({ title });
+    }
+}
+async function _runEphemeralPrompt(client, llmConfig, system, userText, title) {
     let sessionId = null;
     try {
         globalLlmHealth.lastConfig = { provider: llmConfig?.provider ?? null, model: llmConfig?.model ?? null };

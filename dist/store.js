@@ -4,6 +4,7 @@ import Fuse from "fuse.js";
 import { validateEpisodicRecord, validateEpisodicRecordArray } from "./types.js";
 import { tokenize } from "./utils.js";
 import { log, logFileOnly } from "./logger.js";
+import { startSpan } from "./timing.js";
 const TABLE_NAME = "memories";
 const EVENTS_TABLE_NAME = "effectiveness_events";
 const EVENTS_SOURCE_COLUMN = "source";
@@ -241,6 +242,19 @@ export class MemoryStore {
      * stderr (uninterceptable), so the lock is what keeps it out of the TUI.
      */
     async maybeOptimizeAll(force = false) {
+        // TIMING_SPANS (1.4.7): compaction is the usual suspect for write-path
+        // latency spikes; spanExtra.attempted distinguishes real compaction
+        // runs from the frequent interval-guard early returns.
+        const spanExtra = {};
+        const stop = startSpan("store.optimize");
+        try {
+            return await this._maybeOptimizeAll(force, spanExtra);
+        }
+        finally {
+            stop(spanExtra);
+        }
+    }
+    async _maybeOptimizeAll(force = false, spanExtra = {}) {
         if (this.optimizing)
             return;
         // OPTIMIZE_GUARD (1.3.6): set the in-process guard synchronously,
@@ -251,6 +265,7 @@ export class MemoryStore {
         // concurrently — another way into the "Compaction commit failed" race.
         this.optimizing = true;
         let attempted = false;
+        spanExtra.attempted = false;
         try {
             const elapsed = Date.now() - this.lastOptimizeAt;
             if (!force && elapsed < MemoryStore.OPTIMIZE_INTERVAL_MS)
@@ -323,6 +338,7 @@ export class MemoryStore {
         }
         finally {
             this.optimizing = false;
+            spanExtra.attempted = attempted;
             if (attempted) {
                 this.lastOptimizeAt = Date.now();
             }
@@ -561,6 +577,16 @@ export class MemoryStore {
         return { enabled, retentionDays, expiredCount, scopeBreakdown };
     }
     async put(record) {
+        // TIMING_SPANS (1.4.7): write-path latency (table.add + optimize trigger).
+        const stop = startSpan("store.put");
+        try {
+            return await this._put(record);
+        }
+        finally {
+            stop();
+        }
+    }
+    async _put(record) {
         const table = this.requireTable();
         const recordWithDefaults = {
             ...record,
@@ -590,6 +616,17 @@ export class MemoryStore {
         this.invalidateScope(record.scope);
     }
     async putEvent(event) {
+        // TIMING_SPANS (1.4.7): telemetry writes fire on every recall/capture;
+        // they share the LanceDB write path with memories.
+        const stop = startSpan("store.putEvent");
+        try {
+            return await this._putEvent(event);
+        }
+        finally {
+            stop();
+        }
+    }
+    async _putEvent(event) {
         const feedbackEvent = event.type === "feedback" ? event : null;
         const captureEvent = event.type === "capture" ? event : null;
         // EVENT_TEXT_BOUND (1.1.7): capture events carry the whole transcript
@@ -625,6 +662,20 @@ export class MemoryStore {
         ]);
     }
     async search(params) {
+        // TIMING_SPANS (1.4.7): hybrid search is the recall hot path. The span
+        // covers cache read + scoring; spanExtra.candidates (filled by _search)
+        // reports how many rows were scanned so tuning can correlate latency
+        // with scope-cache size.
+        const spanExtra = {};
+        const stop = startSpan("store.search");
+        try {
+            return await this._search(params, spanExtra);
+        }
+        finally {
+            stop(spanExtra.candidates !== undefined ? { candidates: spanExtra.candidates } : undefined);
+        }
+    }
+    async _search(params, spanExtra = {}) {
         const cached = await this.getCachedScopes(params.scopes);
         if (cached.records.length === 0)
             return [];
@@ -664,6 +715,7 @@ export class MemoryStore {
         });
         if (candidates.length === 0)
             return [];
+        spanExtra.candidates = candidates.length;
         const vectorRanks = useVectorChannel ? buildRankMap(candidates, (item) => item.vectorScore) : null;
         const bm25Ranks = useBm25Channel ? buildRankMap(candidates, (item) => item.bm25Score) : null;
         const feedbackStatsMap = feedbackWeight > 0
@@ -828,6 +880,17 @@ export class MemoryStore {
             .slice(0, limit);
     }
     async pruneScope(scope, maxEntries) {
+        // TIMING_SPANS (1.4.7): retention prune scans up to 100k rows + batch
+        // delete; worth watching alongside optimize on the write path.
+        const stop = startSpan("store.pruneScope");
+        try {
+            return await this._pruneScope(scope, maxEntries);
+        }
+        finally {
+            stop();
+        }
+    }
+    async _pruneScope(scope, maxEntries) {
         const rows = await this.list(scope, 100000);
         if (rows.length === 100000) {
             log("warn", `[store] pruneScope scanned up to the 100000-row cap for scope=${scope}; entries older than the newest 100k are not candidates for pruning`);
@@ -865,6 +928,18 @@ export class MemoryStore {
         return toDelete.length;
     }
     async consolidateDuplicates(scope, threshold, candidateLimit = 50) {
+        // TIMING_SPANS (1.4.7): consolidation is throttled but heavy (ANN batch
+        // scan + batched writes); track it separately from the search path.
+        const spanExtra = {};
+        const stop = startSpan("store.consolidate");
+        try {
+            return await this._consolidateDuplicates(scope, threshold, candidateLimit, spanExtra);
+        }
+        finally {
+            stop(spanExtra.rows !== undefined ? { rows: spanExtra.rows } : undefined);
+        }
+    }
+    async _consolidateDuplicates(scope, threshold, candidateLimit = 50, spanExtra = {}) {
         // MERGE_STATUS_FILTER (1.3.5): consolidation used to run over
         // readByScopesIncludingMerged and only consulted METADATA
         // status:merged/mergedFrom — so digested (retention-hidden) and
@@ -874,6 +949,7 @@ export class MemoryStore {
         // rows may participate.
         let rows = await this.readByScopesIncludingMerged([scope]);
         rows = rows.filter((r) => r.status === undefined || r.status === null || r.status === "" || r.status === "active");
+        spanExtra.rows = rows.length;
         if (rows.length === 0) {
             return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0, clearedFlags: 0 };
         }
@@ -1829,7 +1905,21 @@ export class MemoryStore {
         this.scopeVersions.set(scope, (this.scopeVersions.get(scope) ?? 0) + 1);
     }
     async getCachedScopes(scopes) {
+        // TIMING_SPANS (1.4.7): the scope cache decides whether a search pays a
+        // full table read + tokenize + IDF rebuild. spanExtra.cacheMiss marks
+        // reloads so search latency can be attributed to cache misses.
+        const spanExtra = {};
+        const stop = startSpan("store.getCachedScopes");
+        try {
+            return await this._getCachedScopes(scopes, spanExtra);
+        }
+        finally {
+            stop(spanExtra.cacheMiss !== undefined ? { cacheMiss: spanExtra.cacheMiss } : undefined);
+        }
+    }
+    async _getCachedScopes(scopes, spanExtra = {}) {
         if (!this.cacheConfig.enabled) {
+            spanExtra.cacheMiss = true;
             const allRecords = [];
             const allTokenized = [];
             const allNorms = new Map();
@@ -1854,6 +1944,7 @@ export class MemoryStore {
             const maxAgeMs = Number.isFinite(this.cacheConfig.staleAfterMs) ? this.cacheConfig.staleAfterMs : 0;
             const staleByAge = maxAgeMs > 0 && (entry ? Date.now() - (entry.loadedAt ?? entry.lastAccessTimestamp) > maxAgeMs : false);
             if (!entry || entry.version !== currentVersion || staleByAge) {
+                spanExtra.cacheMiss = true;
                 if (entry) {
                     this.cacheStats.evictions++;
                 }

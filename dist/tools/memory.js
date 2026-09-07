@@ -6,6 +6,7 @@ import { extractiveDigest, retentionCandidates, expiredDigestCandidates } from "
 import { requestLLMDigest } from "../llm.js";
 import { getLlmHealth } from "../llm.js";
 import { log } from "../logger.js";
+import { getTimingStats } from "../timing.js";
 function unavailableMessage(provider) {
     return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
 }
@@ -424,6 +425,11 @@ export function createMemoryTools(state) {
                     eventTtl,
                     graph: graphStats,
                     memoryRetention,
+                    // TIMING_SPANS (1.4.7): cumulative span stats (count/total/
+                    // avg/max per op) since process start, hottest ops first.
+                    // Set OPENCODE_MEMORY_PRO_TIMING=1 to also stream each span
+                    // to the log as it completes.
+                    timing: getTimingStats(),
                     degradedFlags: computeDegradedFlags(state, embedderHealth, graphStats),
                 }, null, 2);
             },

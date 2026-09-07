@@ -968,3 +968,73 @@ test("search: bm25 stays aligned with unfiltered records when dim-mismatched row
         await fsRm(dir, { recursive: true, force: true });
     }
 });
+
+// TIMING_SPANS (1.4.7): span utility tests — aggregation, extra passthrough,
+// reset, and never-throw contract.
+import { startSpan, getTimingStats, resetTimingStats } from "../dist/timing.js";
+
+test("timing: startSpan aggregates count/total/max/last per op", async () => {
+    resetTimingStats();
+    const stopA = startSpan("test.opA");
+    await sleepMs(15);
+    stopA();
+    const stopB = startSpan("test.opA");
+    stopB();
+    const stopC = startSpan("test.opA");
+    await sleepMs(5);
+    stopC();
+    const stats = getTimingStats().filter((s) => s.op === "test.opA");
+    assert.equal(stats.length, 1);
+    const s = stats[0];
+    assert.equal(s.count, 3);
+    assert.ok(s.totalMs >= 15, `totalMs should include both sleeps, got ${s.totalMs}`);
+    assert.ok(s.maxMs >= 10, `maxMs should be the ~15ms span, got ${s.maxMs}`);
+    assert.ok(s.lastMs >= 2, `lastMs should be the ~5ms span, got ${s.lastMs}`);
+    assert.ok(s.avgMs > 0 && s.avgMs <= s.maxMs, `avgMs out of range: ${s.avgMs}`);
+});
+
+test("timing: stop(extra) records lastExtra and getTimingStats sorts by totalMs", async () => {
+    resetTimingStats();
+    startSpan("test.sortA")({ n: 1 });
+    const stopBig = startSpan("test.sortB");
+    await sleepMs(10);
+    stopBig({ candidates: 42 });
+    const stats = getTimingStats();
+    const b = stats.findIndex((s) => s.op === "test.sortB");
+    const a = stats.findIndex((s) => s.op === "test.sortA");
+    assert.ok(a === -1 || b < a, "sortB (10ms) must sort before sortA (~0ms)");
+    const entry = stats.find((s) => s.op === "test.sortB");
+    assert.deepEqual(entry.lastExtra, { candidates: 42 });
+});
+
+test("timing: resetTimingStats clears all aggregates", () => {
+    startSpan("test.reset")();
+    assert.ok(getTimingStats().some((s) => s.op === "test.reset"));
+    resetTimingStats();
+    assert.equal(getTimingStats().some((s) => s.op === "test.reset"), false);
+});
+
+test("timing: stop is idempotent-safe across early throws and bad names", async () => {
+    resetTimingStats();
+    // Bad name: no-op stop that returns 0 and records nothing.
+    assert.equal(startSpan("")(), 0);
+    assert.equal(getTimingStats().some((s) => s.op === ""), false);
+    // Stop without extra, twice (double-stop must not throw).
+    const stop = startSpan("test.double");
+    stop();
+    assert.doesNotThrow(() => stop());
+    // Nested spans measure independently.
+    const outer = startSpan("test.outer");
+    await sleepMs(5);
+    const inner = startSpan("test.inner");
+    await sleepMs(5);
+    inner();
+    outer();
+    const stats = new Map(getTimingStats().map((s) => [s.op, s]));
+    assert.ok(stats.get("test.outer").lastMs >= stats.get("test.inner").lastMs,
+        "outer span must cover at least the inner span duration");
+});
+
+function sleepMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
