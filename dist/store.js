@@ -647,9 +647,15 @@ export class MemoryStore {
         const fuzzyResults = useFuzzyChannel ? this.getFuzzyIndex(cached, params.scopes, fuzzyThreshold).search(params.query.trim(), { limit: Math.max(50, params.limit * 4) }) : [];
         const fuzzyRanks = useFuzzyChannel ? buildRankMap(fuzzyResults.map((r) => ({ record: r.item, fuzzyScore: 1 - (r.score ?? 1) })), (item) => item.fuzzyScore) : null;
         const fuzzyScoreMap = new Map(fuzzyResults.map((r) => [r.item.id, 1 - (r.score ?? 1)]));
+        // BM25_INDEX_ALIGN (1.4.5): cached.tokenized is aligned with the
+        // UNFILTERED cached.records, so the tokenized index must be captured
+        // BEFORE the dimension-mismatch filter. Mapping with the filtered
+        // index silently scored every row after a filtered-out row against
+        // the WRONG document's tokens.
         const candidates = cached.records
-            .filter((record) => params.queryVector.length === 0 || record.vector.length === params.queryVector.length)
-            .map((record, index) => {
+            .map((record, index) => ({ record, index }))
+            .filter(({ record }) => params.queryVector.length === 0 || record.vector.length === params.queryVector.length)
+            .map(({ record, index }) => {
             const recordNorm = cached.norms.get(record.id) ?? vecNorm(record.vector);
             const vectorScore = useVectorChannel ? fastCosine(params.queryVector, record.vector, queryNorm, recordNorm) : 0;
             const bm25Score = useBm25Channel ? bm25LikeScore(queryTokens, cached.tokenized[index], cached.idf) : 0;

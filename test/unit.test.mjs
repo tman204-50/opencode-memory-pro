@@ -706,3 +706,52 @@ test("repair: repairEmbeddingDimension no-ops when dims already match", async ()
     assert.equal(result.mismatch, false, "matching dims must report no mismatch");
     assert.equal(state.droppedTable, undefined, "nothing dropped");
 });
+
+// BM25_INDEX_ALIGN (1.4.5): cached.tokenized is aligned with the UNFILTERED
+// cached.records. search() used to map BM25 scores with the FILTERED index,
+// so once the dimension-mismatch filter dropped a row, every later row was
+// scored against the wrong document's tokens. Records arrive newest-first
+// (SCAN_ORDER), so the dim-mismatched row sits FIRST here — the exact shape
+// a null/legacy-vector row produces in production.
+test("search: bm25 stays aligned with unfiltered records when dim-mismatched rows are filtered (BM25_INDEX_ALIGN)", async () => {
+    const { tokenize } = await import("../dist/utils.js");
+    const dir = await mkdtemp(join(tmpdir(), "omp-bm25-align-"));
+    try {
+        const store = new MemoryStore(dir, {});
+        const records = [
+            // Newest (SCAN_ORDER puts it first) and dim-mismatched: the filter drops it.
+            { id: "stale-dim", text: "quasar calibration constants for the deep space antenna", vector: Array.from({ length: 8 }, () => 0.1), scope: "global", timestamp: Date.now(), importance: 0.5, category: "other" },
+            // Older, correct dim: query tokens absent from its text.
+            { id: "unrelated", text: "grocery list reminders for the weekend farmers market", vector: Array.from({ length: 16 }, () => 0.2), scope: "global", timestamp: Date.now() - 60_000, importance: 0.5, category: "other" },
+            // Older still, correct dim: the true best bm25 match.
+            { id: "target", text: "quasar calibration procedure documented for the radio telescope crew", vector: Array.from({ length: 16 }, () => 0.3), scope: "global", timestamp: Date.now() - 120_000, importance: 0.5, category: "other" },
+        ];
+        store.getCachedScopes = async () => ({
+            records,
+            tokenized: records.map((r) => tokenize(r.text)),
+            idf: new Map(),
+            norms: new Map(),
+            lastAccessTimestamp: Date.now(),
+        });
+        const results = await store.search({
+            query: "quasar calibration",
+            queryVector: Array.from({ length: 16 }, () => 0.1),
+            scopes: ["global"],
+            limit: 5,
+            vectorWeight: 0,
+            bm25Weight: 1,
+            minScore: 0,
+            rrfK: 60,
+            recencyBoost: false,
+            importanceWeight: 0,
+            feedbackWeight: 0,
+        });
+        const byId = new Map(results.map((r) => [r.record.id, r]));
+        assert.ok(byId.has("target"), `target must be returned, got ${[...byId.keys()].join(",")}`);
+        assert.equal(results[0].record.id, "target", `target must rank first, got ${results[0]?.record?.id}`);
+        assert.ok(byId.get("target").bm25Score > 0, "target must score on its own tokens");
+        assert.equal(byId.get("unrelated")?.bm25Score ?? 0, 0, "unrelated row must not inherit the filtered row's tokens");
+    } finally {
+        await fsRm(dir, { recursive: true, force: true });
+    }
+});
