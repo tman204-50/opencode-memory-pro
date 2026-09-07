@@ -9,7 +9,7 @@ import { initLogger, configureLogger, log } from "./logger.js";
 import { calculateInjectionLimit, createSummarizationConfig, summarizeContent, truncateText } from "./summarize.js";
 import { requestLLMCapture, isOwnSession } from "./llm.js";
 import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./tools/index.js";
-import { sweepExpiredMemories } from "./tools/memory.js";
+import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 const PLUGIN_VERSION = "1.4.4";
 const SCHEMA_VERSION = 1;
@@ -631,9 +631,7 @@ async function createRuntimeState(input) {
                 return state.initPromise;
             state.initPromise = (async () => {
                 try {
-                    const dim = await state.embedder.dim();
-                    await state.store.init(dim);
-                    state.initialized = true;
+                    await initializeStore(state);
                     if (state.graph?.enabled) {
                         // One-time backfill: index existing memories into the graph
                         // so recall boosts work immediately, not only for new captures.
@@ -663,6 +661,24 @@ async function createRuntimeState(input) {
         },
     };
     return state;
+}
+// EMBEDDING_CONFIG_REEMBED (1.4.5): init + auto-repair, extracted from
+// ensureInitialized so the config-change scenario is unit-testable. When the
+// embedder's dimension no longer matches the store's physical vector column
+// (embedding.provider/model changed to a different-output-size model),
+// store.init flags indexState.dimensionMismatch — but LanceDB does NOT reject
+// the mismatched write; it silently coerces it into the old fixed-width
+// column (corrupting the vector), so proceeding would corrupt every new
+// memory. Repair (backup → drop → rebuild → re-embed) before marking the
+// store initialized.
+export async function initializeStore(state) {
+    const dim = await state.embedder.dim();
+    await state.store.init(dim);
+    if (state.store.indexState?.dimensionMismatch) {
+        const result = await repairEmbeddingDimension(state, dim);
+        log("warn", `[embedding] dimension mismatch auto-repaired: ${result.message}`);
+    }
+    state.initialized = true;
 }
 async function getLastUserText(sessionID, client) {
     try {

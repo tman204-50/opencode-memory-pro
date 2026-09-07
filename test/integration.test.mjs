@@ -14,6 +14,7 @@ process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
 process.env.OPENCODE_MEMORY_PRO_LOG_LEVEL = "error";
 
 const { MemoryStore, storeFastCosine } = await import("../dist/store.js");
+const { initializeStore } = await import("../dist/index.js");
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -697,6 +698,51 @@ test("integration: concurrent store.init calls coalesce (single-flight)", async 
     }
     finally {
         store.close();
+    }
+});
+
+test("integration: initializeStore auto-repairs dimension mismatch (EMBEDDING_CONFIG_REEMBED)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "reembed-auto-"));
+    const dbPath = join(dir, "lancedb");
+    const store1 = new MemoryStore(dbPath);
+    try {
+        await store1.init(DIM);
+        await store1.put(makeRecord("orig-1", "the original memory before the embedding switch"));
+    }
+    finally {
+        store1.close();
+    }
+    // Reopen the same store with a different-dim embedder (what a config hook
+    // swap produces: new embedder + initialized=false). initializeStore must
+    // auto-repair instead of silently corrupting the old fixed-width column.
+    const NEW_DIM = 8;
+    const store2 = new MemoryStore(dbPath);
+    try {
+        const state = {
+            initialized: false,
+            embedder: {
+                model: "test-embed-new",
+                dim: async () => NEW_DIM,
+                embed: async (text) => deterministicEmbed(text).slice(0, NEW_DIM),
+            },
+            store: store2,
+            config: { provider: "test", dbPath },
+        };
+        await initializeStore(state);
+        assert.equal(state.initialized, true, "auto-repair must leave the store initialized");
+        assert.equal(store2.getIndexHealth().dimensionMismatch, false, "no mismatch after auto-repair");
+        assert.equal(await store2.getPhysicalVectorDim(), NEW_DIM, "table must be physically rebuilt at the new dim");
+        const scopes = await store2.listDistinctScopes();
+        const records = await store2.exportAllRecords(scopes);
+        assert.equal(records.length, 1, "data must survive the rebuild");
+        assert.equal(records[0].id, "orig-1", "original id preserved");
+        assert.equal(records[0].vector.length, NEW_DIM, "row carries a vector at the new dim");
+        assert.equal(records[0].embeddingModel, "test-embed-new", "row records the new embedding model");
+        const results = await store2.search(searchParams("original memory", deterministicEmbed("original memory").slice(0, NEW_DIM)));
+        assert.ok(results.some((r) => r.record.id === "orig-1"), "rebuilt store must be searchable at the new dim");
+    }
+    finally {
+        store2.close();
     }
 });
 

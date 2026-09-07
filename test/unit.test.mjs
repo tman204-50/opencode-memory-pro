@@ -6,7 +6,8 @@ import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, initializeStore } from "../dist/index.js";
+import { repairEmbeddingDimension } from "../dist/tools/memory.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
 
@@ -413,7 +414,7 @@ test("utils: classifyFailure buckets error messages", async () => {
 // lock, making two instances both "own" it and race optimize() — which puts
 // "Compaction commit failed" on the TUI. The fix waits through the
 // open->write window instead of reclaiming immediately.
-import { open as fsOpen, mkdtemp, rm as fsRm, readFile, writeFile } from "node:fs/promises";
+import { open as fsOpen, mkdtemp, rm as fsRm, readFile, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore } from "../dist/store.js";
@@ -619,4 +620,89 @@ test("capture: handleSessionIdle swallows flush failure and still consolidates (
         warnMessages.some((m) => m.includes("failed to flush capture on session idle")),
         "flush failure must be logged as a warn, not propagated",
     );
+});
+
+// EMBEDDING_CONFIG_REEMBED (1.4.5): a config-change embedder swap (new
+// provider/model with a different output dimension) sets initialized=false;
+// the next ensureInitialized → store.init(newDim) hits the old fixed-width
+// vector column, which LanceDB silently coerces (corrupting writes) instead
+// of rejecting. initializeStore must auto-repair (backup → drop → rebuild →
+// re-embed) before marking the store initialized.
+function makeDimensionState({ physicalDim, records }) {
+    const initCalls = [];
+    const puts = [];
+    const state = {
+        initialized: false,
+        embedder: {
+            model: "test-embed-new",
+            dim: async () => 16,
+            embed: async () => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+        },
+        config: { provider: "test", dbPath: join(tmpdir(), `reembed-unit-${Date.now()}-${Math.random()}`, "lancedb") },
+        store: {
+            physicalDim,
+            indexState: { dimensionMismatch: false },
+            initCalls,
+            puts,
+            table: {},
+            async init(dim) {
+                initCalls.push(dim);
+                if (this.table === null)
+                    this.physicalDim = dim;
+                this.indexState.dimensionMismatch = this.physicalDim !== null && this.physicalDim !== dim;
+            },
+            async getPhysicalVectorDim() { return this.physicalDim; },
+            async listDistinctScopes() { return ["global"]; },
+            async exportAllRecords() { return records; },
+            connection: { dropTable: async (name) => { state.droppedTable = name; } },
+            async put(record) { puts.push(record); },
+            async ensureIndexes() { },
+        },
+    };
+    return state;
+}
+
+test("init: initializeStore auto-repairs embedding dimension mismatch (EMBEDDING_CONFIG_REEMBED)", async () => {
+    const records = [
+        { id: "m1", text: "first memory", scope: "global", category: "fact" },
+        { id: "m2", text: "second memory", scope: "global", category: "fact" },
+    ];
+    const state = makeDimensionState({ physicalDim: 8, records });
+    await initializeStore(state);
+    assert.equal(state.initialized, true, "store must be marked initialized after auto-repair");
+    assert.equal(state.droppedTable, "memories", "repair must drop and rebuild the memories table");
+    assert.deepEqual(state.store.initCalls, [16, 16], "init runs once to detect the mismatch, once to rebuild at the new dim");
+    assert.equal(state.store.puts.length, 2, "every record must be re-embedded");
+    assert.ok(
+        state.store.puts.every((r) => r.vector.length === 16 && r.embeddingModel === "test-embed-new"),
+        "re-embedded rows must carry new-dim vectors and the new model",
+    );
+    assert.ok(
+        state.store.puts.some((r) => r.id === "m1") && state.store.puts.some((r) => r.id === "m2"),
+        "original ids must survive the rebuild",
+    );
+    const dbDirEnd = state.config.dbPath.lastIndexOf("/");
+    const backupDir = (dbDirEnd > 0 ? state.config.dbPath.slice(0, dbDirEnd) : ".") + "/backups";
+    const files = await readdir(backupDir);
+    const backupFile = files.find((f) => f.startsWith("reembed-repair-"));
+    assert.ok(backupFile, "backup must be written before the drop");
+    const backup = JSON.parse(await readFile(join(backupDir, backupFile), "utf8"));
+    assert.equal(backup.count, 2, "backup must contain every record");
+    assert.equal(backup.fromDim, 8, "backup records the old physical dim");
+    assert.equal(backup.toDim, 16, "backup records the new embedder dim");
+});
+
+test("init: initializeStore skips repair when dimensions match (EMBEDDING_CONFIG_REEMBED)", async () => {
+    const state = makeDimensionState({ physicalDim: 16, records: [] });
+    await initializeStore(state);
+    assert.equal(state.initialized, true);
+    assert.equal(state.droppedTable, undefined, "no drop when dims already match");
+    assert.deepEqual(state.store.initCalls, [16], "single init, no rebuild");
+});
+
+test("repair: repairEmbeddingDimension no-ops when dims already match", async () => {
+    const state = makeDimensionState({ physicalDim: 16, records: [] });
+    const result = await repairEmbeddingDimension(state, 16);
+    assert.equal(result.mismatch, false, "matching dims must report no mismatch");
+    assert.equal(state.droppedTable, undefined, "nothing dropped");
 });

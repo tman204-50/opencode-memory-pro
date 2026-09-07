@@ -62,6 +62,89 @@ export async function buildGroupDigest(state, group, targetChars, groupKey, enti
     const digest = extractiveDigest(texts, targetChars, Array.from(entityNames ?? []), groupKey);
     return digest ? { ...digest, llm: false } : null;
 }
+// EMBEDDING_CONFIG_REEMBED (1.4.5): the dimension-mismatch repair core,
+// shared by the memory_reembed tool and the plugin's automatic repair path
+// (initializeStore in index.js). A mismatch happens when embedding config
+// changed to a different-output-dimension model without resetting the store
+// — LanceDB silently coerces new writes into the old fixed-width vector
+// column instead of rejecting them. The vector column's physical width is
+// fixed for the whole table (set by the first row ever written), not
+// per-scope, so this operates on every scope in the store — unlike every
+// other tool here, it does not take a `scope` argument. Backs up first
+// (always) so the operation is never riskier than memory_export followed by
+// memory_import(replace). Returns a result object the callers serialize.
+export async function repairEmbeddingDimension(state, actualDim) {
+    const expectedDim = await state.store.getPhysicalVectorDim();
+    if (expectedDim === null || expectedDim === actualDim) {
+        return {
+            mismatch: false,
+            expectedDim,
+            actualDim,
+            message: "No dimension mismatch detected. Nothing to repair.",
+        };
+    }
+    const scopes = await state.store.listDistinctScopes();
+    const records = await state.store.exportAllRecords(scopes);
+    // BACKUP_ALWAYS_FIRST: same JSON shape as memory_export, so
+    // memory_import can restore from it independently if anything below
+    // fails partway through.
+    const fs = await import("node:fs");
+    const dbDirEnd = state.config.dbPath.lastIndexOf("/");
+    const backupDir = (dbDirEnd > 0 ? state.config.dbPath.slice(0, dbDirEnd) : ".") + "/backups";
+    await fs.promises.mkdir(backupDir, { recursive: true }).catch(() => { });
+    const backupPath = `${backupDir}/reembed-repair-${Date.now()}.json`;
+    await fs.promises.writeFile(backupPath, JSON.stringify({
+        format: "opencode-memory-pro/backup",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        provider: state.config.provider,
+        dbPath: state.config.dbPath,
+        reason: "pre-reembed-repair-backup",
+        fromDim: expectedDim,
+        toDim: actualDim,
+        scopes,
+        count: records.length,
+        memories: records,
+    }, null, 2));
+    await state.store.connection.dropTable("memories");
+    state.store.table = null;
+    await state.store.init(actualDim);
+    let repaired = 0;
+    let failed = 0;
+    const failures = [];
+    for (const record of records) {
+        try {
+            const vector = await state.embedder.embed(record.text || "");
+            await state.store.put({
+                ...record,
+                vector,
+                vectorDim: vector.length,
+                embeddingModel: state.embedder.model,
+            });
+            repaired += 1;
+        }
+        catch (error) {
+            failed += 1;
+            failures.push({ id: record.id, reason: error instanceof Error ? error.message : String(error) });
+        }
+    }
+    await state.store.ensureIndexes();
+    return {
+        mismatch: true,
+        fromDim: expectedDim,
+        toDim: actualDim,
+        scopes,
+        recordCount: records.length,
+        backupPath,
+        repaired,
+        failed,
+        failures,
+        message: failed > 0
+            ? `Repaired ${repaired}/${records.length}. ${failed} failed but remain intact in the ` +
+                `backup at ${backupPath} — re-run memory_reembed once the embedder issue is fixed.`
+            : `Repaired all ${repaired} memories at ${actualDim}-dim. Backup retained at ${backupPath}.`,
+    };
+}
 export function createMemoryTools(state) {
     return {
         memory_search: tool({
@@ -1304,63 +1387,14 @@ ${explanations.join("\n")}`;
                             "table (like memory_clear/memory_forget, destructive operations require confirm:true).",
                     }, null, 2);
                 }
-                // BACKUP_ALWAYS_FIRST: same JSON shape as memory_export, so
-                // memory_import can restore from it independently if anything
-                // below fails partway through.
-                const fs = await import("node:fs");
-                const dbDirEnd = state.config.dbPath.lastIndexOf("/");
-                const backupDir = (dbDirEnd > 0 ? state.config.dbPath.slice(0, dbDirEnd) : ".") + "/backups";
-                await fs.promises.mkdir(backupDir, { recursive: true }).catch(() => { });
-                const backupPath = `${backupDir}/reembed-repair-${Date.now()}.json`;
-                await fs.promises.writeFile(backupPath, JSON.stringify({
-                    format: "opencode-memory-pro/backup",
-                    version: 1,
-                    exportedAt: new Date().toISOString(),
-                    provider: state.config.provider,
-                    dbPath: state.config.dbPath,
-                    reason: "pre-reembed-repair-backup",
-                    fromDim: expectedDim,
-                    toDim: actualDim,
-                    scopes,
-                    count: records.length,
-                    memories: records,
-                }, null, 2));
-                await state.store.connection.dropTable("memories");
-                state.store.table = null;
-                await state.store.init(actualDim);
-                let repaired = 0;
-                let failed = 0;
-                const failures = [];
-                for (const record of records) {
-                    try {
-                        const vector = await state.embedder.embed(record.text || "");
-                        await state.store.put({
-                            ...record,
-                            vector,
-                            vectorDim: vector.length,
-                            embeddingModel: state.embedder.model,
-                        });
-                        repaired += 1;
-                    }
-                    catch (error) {
-                        failed += 1;
-                        failures.push({ id: record.id, reason: error instanceof Error ? error.message : String(error) });
-                    }
-                }
-                await state.store.ensureIndexes();
+                // EMBEDDING_CONFIG_REEMBED (1.4.5): shared with the plugin's
+                // automatic repair path (initializeStore) — backup → drop →
+                // rebuild → re-embed, all under the original ids.
+                const result = await repairEmbeddingDimension(state, actualDim);
                 return JSON.stringify({
                     mismatch: true,
-                    repaired,
-                    failed,
-                    failures: failures.slice(0, 10),
-                    fromDim: expectedDim,
-                    toDim: actualDim,
-                    backupPath,
-                    scopes,
-                    message: failed > 0
-                        ? `Repaired ${repaired}/${records.length}. ${failed} failed but remain intact in the ` +
-                            `backup at ${backupPath} — re-run memory_reembed once the embedder issue is fixed.`
-                        : `Repaired all ${repaired} memories at ${actualDim}-dim. Backup retained at ${backupPath}.`,
+                    ...result,
+                    failures: result.failures.slice(0, 10),
                 }, null, 2);
             },
         }),
