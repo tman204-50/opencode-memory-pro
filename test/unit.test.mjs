@@ -6,7 +6,8 @@ import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, initializeStore } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore } from "../dist/index.js";
+import { buildPreferenceInjection } from "../dist/preference.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
@@ -781,6 +782,31 @@ test("lifecycle: handleSessionEnd swallows store failure and retains episode for
         "session end failure must be logged as a warn, not propagated",
     );
     assert.ok(state.activeEpisodes.has("sess-end-1"), "episode entry retained so a retry can finalize it");
+});
+
+// PREFERENCE_BUDGET_CONFIG (1.4.6): the recall path hardcoded tokenBudget: 300
+// for the preference block — the user-configurable injection.budgetTokens
+// never reached it and preference.js's ?? 500 fallback was dead.
+test("preference: preferenceInjectionConfig reuses configured budgetTokens (PREFERENCE_BUDGET_CONFIG)", () => {
+    const cfg = preferenceInjectionConfig({ mode: "budget", budgetTokens: 4096 }, { maxMemories: 7 });
+    assert.deepEqual(cfg, { mode: "budget", maxMemories: 7, tokenBudget: 4096 });
+    const adaptive = preferenceInjectionConfig({ mode: "adaptive", budgetTokens: 2048 }, { maxMemories: 3 });
+    assert.equal(adaptive.mode, "fixed", "adaptive maps to fixed for the preference block");
+    assert.equal(adaptive.tokenBudget, 2048);
+});
+
+test("preference: buildPreferenceInjection budget mode consumes tokenBudget and falls back to 500", () => {
+    const prefs = [
+        { category: "tool", value: "x".repeat(40), confidence: 0.9 }, // ~10 tokens
+        { category: "tool", value: "y".repeat(40), confidence: 0.8 },
+        { category: "tool", value: "z".repeat(40), confidence: 0.7 },
+    ];
+    const small = buildPreferenceInjection(prefs, { mode: "budget", maxMemories: 10, tokenBudget: 20 });
+    const smallItems = small.split("\n").length - 1; // minus header
+    assert.equal(smallItems, 2, "third item would exceed the 20-token budget");
+    const fallback = buildPreferenceInjection(prefs, { mode: "budget", maxMemories: 10 });
+    const fallbackItems = fallback.split("\n").length - 1;
+    assert.equal(fallbackItems, 3, "missing tokenBudget falls back to 500 (all items fit)");
 });
 
 // EMBEDDING_CONFIG_REEMBED (1.4.5): a config-change embedder swap (new

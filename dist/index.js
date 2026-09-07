@@ -477,11 +477,7 @@ const plugin = async (input) => {
             const projectProfile = aggregatePreferences(projectSignals, "project");
             const globalProfile = aggregatePreferences(globalSignals, "global");
             const effectivePreferences = resolveConflicts(projectProfile.preferences, globalProfile.preferences);
-            const preferenceInjection = buildPreferenceInjection(effectivePreferences, {
-                mode: state.config.injection.mode === "adaptive" ? "fixed" : state.config.injection.mode,
-                maxMemories: profile.maxMemories,
-                tokenBudget: 300,
-            });
+            const preferenceInjection = buildPreferenceInjection(effectivePreferences, preferenceInjectionConfig(state.config.injection, profile));
             // Apply injection control with task-type profile
             const injectionConfig = {
                 ...state.config.injection,
@@ -1001,6 +997,18 @@ async function recordCaptureEvent(state, input) {
         metadataJson: JSON.stringify({ source: "auto-capture" }),
     });
 }
+function preferenceInjectionConfig(injection, profile) {
+    // PREFERENCE_BUDGET_CONFIG (1.4.6): tokenBudget was hardcoded to 300, so
+    // the user-configurable injection.budgetTokens (config.js, per-env) never
+    // reached the preferences block and preference.js's ?? 500 fallback was
+    // dead. Reuse the configured budget; adaptive still maps to fixed (the
+    // preference block has no per-item scoring to adapt on).
+    return {
+        mode: injection.mode === "adaptive" ? "fixed" : injection.mode,
+        maxMemories: profile.maxMemories,
+        tokenBudget: injection.budgetTokens,
+    };
+}
 async function resolveSessionScope(sessionID, client, fallback) {
     try {
         const response = await client.session.get({ path: { id: sessionID } });
@@ -1124,4 +1132,4 @@ function hasEmbeddingConfigChanged(current, next) {
 export default plugin;
 // CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
 // opencode plugin loading consumes the default export and ignores these.
-export { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd };
+export { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig };
