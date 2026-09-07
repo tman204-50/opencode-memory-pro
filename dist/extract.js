@@ -169,13 +169,23 @@ function clipText(text, maxLen) {
 export function detectGlobalWorthiness(content) {
     const lower = content.toLowerCase();
     let matches = 0;
-    for (const keyword of GLOBAL_KEYWORDS) {
-        if (lower.includes(keyword)) {
+    for (const re of GLOBAL_KEYWORD_REGEXES) {
+        if (re.test(lower)) {
             matches += 1;
         }
     }
     return matches;
 }
+
 export function isGlobalCandidate(content, threshold) {
     return detectGlobalWorthiness(content) >= threshold;
 }
+
+// Word-boundary matchers for GLOBAL_KEYWORDS (precompiled once). Plain
+// substring includes() produced false positives — "cap[al]ital" contains
+// "api", "di[g]italocean" contains "git" — inflating global-worthiness
+// counts. Mirrors graph.js's keyword matching, which already used \b.
+const GLOBAL_KEYWORD_REGEXES = GLOBAL_KEYWORDS.map((keyword) => {
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`, "i");
+});

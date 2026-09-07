@@ -217,7 +217,14 @@ export function createMemoryTools(state) {
                 return finalResults
                     .map((item, idx) => {
                     const percent = Math.round(item.score * 100);
-                    const meta = JSON.parse(item.record.metadataJson || "{}");
+                    // Same degrade-silently rule as store.js's parse guards: one
+                    // record with malformed metadataJson must not throw the
+                    // whole memory_search output away.
+                    let meta = {};
+                    try {
+                        meta = JSON.parse(item.record.metadataJson || "{}");
+                    }
+                    catch { }
                     const duplicateMarker = meta.isPotentialDuplicate ? " (duplicate)" : "";
                     const citationInfo = item.record.citationSource
                         ? ` [${item.record.citationSource}|${item.record.citationStatus ?? "pending"}]`

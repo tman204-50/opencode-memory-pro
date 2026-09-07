@@ -87,7 +87,14 @@ async function dimWithRetry(embedder, config) {
             const result = await embedder.dim();
             globalEmbedderHealth.lastSuccess = Date.now();
             globalEmbedderHealth.lastError = null;
+            // EMBEDDER_HEALTH_RESET (mirrors embedWithRetry): a dim() success
+            // after an outage must clear the degraded state too, or
+            // memory_stats reports "degraded" until the next embed() call.
             globalEmbedderHealth.fallbackActive = false;
+            if (globalEmbedderHealth.status === "degraded") {
+                globalEmbedderHealth.status = "healthy";
+                log("info", "Embedder recovered, resuming normal mode");
+            }
             return result;
         }
         catch (error) {
