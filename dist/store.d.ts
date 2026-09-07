@@ -125,7 +125,7 @@ export declare class MemoryStore {
     addCommandToEpisode(taskId: string, scope: string, command: string): Promise<boolean>;
     addValidationOutcome(taskId: string, scope: string, outcome: ValidationOutcome): Promise<boolean>;
     addSuccessPatterns(taskId: string, scope: string, patterns: SuccessPattern[]): Promise<boolean>;
-    findSimilarTasks(scope: string, taskDescription: string, minSimilarity?: number, queryVector?: number[]): Promise<EpisodicTaskRecord[]>;
+    findSimilarTasks(scope: string, taskDescription: string, minSimilarity?: number): Promise<EpisodicTaskRecord[]>;
     extractSuccessPatternsFromScope(scope: string): Promise<{
         pattern: SuccessPattern;
         count: number;

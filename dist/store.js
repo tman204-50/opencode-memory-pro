@@ -2102,7 +2102,7 @@ export class MemoryStore {
             return true;
         });
     }
-    async findSimilarTasks(scope, taskDescription, minSimilarity = 0.85, queryVector) {
+    async findSimilarTasks(scope, taskDescription, minSimilarity = 0.85) {
         await this.ensureEpisodicTaskTable(384);
         const table = this.requireEpisodicTaskTable();
         const rows = await table.query().where(`scope = '${escapeSql(scope)}' AND state = 'success'`).toArray();
@@ -2111,7 +2111,10 @@ export class MemoryStore {
         // never reachable — createTaskEpisode never writes a vector, and the
         // column is declared at 384 dims while the real embedder is 1536, so
         // `length === queryVector.length` never matched. Keyword matching is
-        // the only live path; the vector branch is removed.
+        // the only live path; the vector branch (and its queryVector parameter)
+        // is removed. Callers no longer need to embed the query — the
+        // parameter's removal also deletes two wasted per-call embedder calls
+        // (index.js system-transform + similar_task_recall tool).
         const keywords = taskDescription.toLowerCase().split(/\s+/).filter((k) => k.length > 2);
         const scored = episodes.map((ep) => {
             const metadata = (JSON.parse(ep.metadataJson || "{}"));

@@ -359,6 +359,13 @@ const plugin = async (input) => {
             const isFallback = embedderFailed || queryVector.length === 0;
             const effectiveVectorWeight = isFallback ? 0 : (state.config.retrieval.mode === "vector" ? 1 : state.config.retrieval.vectorWeight);
             const effectiveBm25Weight = isFallback ? 1 : (state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.bm25Weight);
+            // FUZZY_CHANNEL (1.4.2): auto-recall previously omitted the fuzzy
+            // params entirely, and store.search treats absent fuzzyWeight as 0 —
+            // so the configured fuzzy channel only ever ran for manual
+            // memory_search. Mirror the tools/memory.js semantics: fuzzy stays
+            // on in the bm25-only fallback (typo tolerance helps most there)
+            // and is disabled only in explicit vector-only mode.
+            const effectiveFuzzyWeight = state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.fuzzyWeight;
             if (isFallback) {
                 log("info", "Using BM25-only search (embedder unavailable)");
             }
@@ -369,6 +376,8 @@ const plugin = async (input) => {
                 limit: profile.maxMemories * 2,
                 vectorWeight: effectiveVectorWeight,
                 bm25Weight: effectiveBm25Weight,
+                fuzzyWeight: effectiveFuzzyWeight,
+                fuzzyThreshold: state.config.retrieval.fuzzyThreshold,
                 minScore: Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor),
                 rrfK: state.config.retrieval.rrfK,
                 recencyBoost: state.config.retrieval.recencyBoost,
@@ -458,9 +467,17 @@ const plugin = async (input) => {
                 }),
             };
             // Extract preference signals from memories
-            const allSignals = results.map((r) => extractPreferenceSignals(r.record)).flat();
-            const projectSignals = allSignals.filter((s) => !activeScope.startsWith("global"));
-            const globalSignals = allSignals.filter((s) => activeScope.startsWith("global"));
+            // Extract preference signals from memories, bucketed by the MEMORY's own
+            // scope. Both filters previously tested activeScope — the same value
+            // for both branches — so one profile was always empty and, under
+            // scoping:"project" with includeGlobalScope, signals from global
+            // memories were misattributed to the project profile (and vice
+            // versa). Pair each signal with its record's scope and bucket there;
+            // behavior is unchanged in the default global mode (every record is
+            // scope "global").
+            const allSignals = results.flatMap((r) => extractPreferenceSignals(r.record).map((signal) => ({ signal, memoryScope: r.record.scope })));
+            const projectSignals = allSignals.filter((s) => !s.memoryScope.startsWith("global")).map((s) => s.signal);
+            const globalSignals = allSignals.filter((s) => s.memoryScope.startsWith("global")).map((s) => s.signal);
             const projectProfile = aggregatePreferences(projectSignals, "project");
             const globalProfile = aggregatePreferences(globalSignals, "global");
             const effectivePreferences = resolveConflicts(projectProfile.preferences, globalProfile.preferences);
@@ -527,9 +544,11 @@ const plugin = async (input) => {
                 return `${index + 1}. [${item.record.id}]${citationInfo}${item.graphBFS ? ` [graph-bfs: ${item.graphBFS.hops} hop${item.graphBFS.hops === 1 ? "" : "s"}]` : ""} (${item.record.scope}) ${item.text}`;
             }), "Use these as optional hints only; prioritize current user intent and current repo state.");
             // === Similar Task Recall (Episodic Learning) ===
+            // findSimilarTasks matches by keyword only (its vector branch was
+            // dead code), so no embedding is needed here — the previous
+            // re-embed of the query was computed every recall turn and unused.
             try {
-                const queryVector = await state.embedder.embed(query);
-                const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.85, queryVector);
+                const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.85);
                 if (similarTasks.length > 0) {
                     const taskContext = similarTasks.slice(0, 2).map((ep) => {
                         const commands = JSON.parse(ep.commandsJson || "[]");

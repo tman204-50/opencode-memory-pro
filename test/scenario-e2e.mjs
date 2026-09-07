@@ -71,13 +71,20 @@ process.env.OPENCODE_MEMORY_PRO_MIN_CAPTURE_CHARS = "30";
 const { default: plugin } = await import("../dist/index.js");
 
 const sessionID = "e2e-session-1";
+// getLastUserText / detectTaskType both read session.messages; a fixed user
+// message gives the system.transform hook a real query to recall with.
+const recallQuery = "standardized on Goo for bakend servces and Postgres storage";
 const client = {
     app: {
         log: async () => { },
     },
     session: {
         get: async () => ({ data: { id: sessionID, directory: worktree } }),
-        messages: async () => ({ data: [] }),
+        messages: async () => ({
+            data: [
+                { info: { role: "user" }, parts: [{ type: "text", text: recallQuery }] },
+            ],
+        }),
     },
 };
 
@@ -114,6 +121,17 @@ const searchOut = await hooks.tool.memory_search.execute(
 summary.searchFound = searchOut.includes(memoryId);
 if (!summary.searchFound) {
     fail(`memory_search did not return remembered memory:\n${searchOut}`);
+}
+
+// Auto-recall path (experimental.chat.system.transform): the hook must inject
+// the remembered memory into the system prompt for a typo'd query — this is
+// the wiring that previously omitted fuzzyWeight/fuzzyThreshold entirely.
+const systemOutput = { system: [] };
+await hooks["experimental.chat.system.transform"]({ sessionID }, systemOutput);
+summary.autoRecallBlocks = systemOutput.system.length;
+summary.autoRecallInjected = systemOutput.system.some((block) => block.includes(memoryId));
+if (!summary.autoRecallInjected) {
+    fail(`auto-recall (system.transform) did not inject the remembered memory:\n${JSON.stringify(systemOutput.system)}`);
 }
 
 const captureText = "The team decided to use LanceDB for long-term memory storage because it supports vector search natively and never deletes memories.";

@@ -74,14 +74,8 @@ export function createEpisodicTools(state) {
                 if (!state.initialized)
                     return unavailableMessage(state.config.embedding.provider);
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
-                let queryVector = [];
-                try {
-                    queryVector = await state.embedder.embed(args.query);
-                }
-                catch {
-                    queryVector = [];
-                }
-                const similar = await state.store.findSimilarTasks(activeScope, args.query, args.threshold ?? 0.85, queryVector);
+                // findSimilarTasks matches by keyword only — no embedding needed.
+                const similar = await state.store.findSimilarTasks(activeScope, args.query, args.threshold ?? 0.85);
                 if (similar.length === 0) {
                     return `No similar tasks found for "${args.query}"`;
                 }
