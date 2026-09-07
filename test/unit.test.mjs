@@ -401,6 +401,81 @@ test("graph: expandRecall ranks fresh edges above stale ones (recency decay)", a
     store.db.close();
 });
 
+function makeGraphStore(dir) {
+    return import("../dist/graph.js").then(async ({ GraphStore }) => {
+        const { DatabaseSync } = await import("node:sqlite");
+        const { mkdtempSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        return new GraphStore({
+            dbPath: join(mkdtempSync(join(tmpdir(), dir)), "graph.db"),
+            maxEntitiesPerMemory: 20,
+            maxEdgeProvenance: 20,
+            typedEdges: true,
+        }, { ctor: DatabaseSync, name: "node:sqlite" });
+    });
+}
+
+// MERGE_ENTITY_GC (1.4.5): onMemoryMerged must decrement mention_count for
+// the links that COLLAPSE (entity mentioned by both memories) and GC entities
+// that hit zero — mirroring onMemoryRemoved. Moved links (entity only on the
+// older memory) keep their count. Pre-fix the duplicate kept its count, so
+// removing the surviving memory left the entity at 1 with zero references,
+// leaking forever.
+test("graph: onMemoryMerged decrements collapsed entity counts and GCs on later removal (MERGE_ENTITY_GC)", async () => {
+    const store = await makeGraphStore("graph-merge-gc-");
+    try {
+        const ts = Date.now();
+        store.indexMemory("m-old", "the plugin uses docker and postgres", ts);
+        store.indexMemory("m-new", "the plugin uses docker and redis", ts + 1);
+        // Pre-merge: docker is referenced by both memories.
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 2);
+        store.onMemoryMerged("m-old", "m-new");
+        // The duplicate (docker) collapses: count drops 2 → 1. The moved
+        // link (postgres) keeps its count; it now points at m-new.
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 1,
+            "collapsed duplicate must decrement exactly once");
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'postgres'").get().mention_count, 1,
+            "moved link must keep its count");
+        assert.equal(store.stats().memoryMappings, 4, "m-new now carries docker, redis + moved postgres/plugin");
+        // Removing the survivor must GC every entity: pre-fix docker sat at
+        // 2 after the merge, so this removal left it at 1 forever.
+        store.onMemoryRemoved("m-new");
+        assert.equal(store.stats().entities, 0, "no entity may survive the survivor's removal");
+        assert.equal(store.stats().memoryMappings, 0);
+    }
+    finally {
+        store.db.close();
+    }
+});
+
+// REINDEX_COUNT_IDEMPOTENT (1.4.5): re-indexing the same memory must not
+// inflate mention_count — memory_entities is INSERT OR IGNORE, so the extra
+// increment had no matching link and blocked GC after onMemoryRemoved.
+test("graph: indexMemory re-index keeps mention_count in sync with links (REINDEX_COUNT_IDEMPOTENT)", async () => {
+    const store = await makeGraphStore("graph-reindex-");
+    try {
+        const ts = Date.now();
+        store.indexMemory("m1", "the plugin uses docker and postgres", ts);
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 1);
+        // Re-index the SAME memory (update/re-embed/backfill shape).
+        store.indexMemory("m1", "the plugin uses docker and postgres", ts + 1000);
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 1,
+            "re-index must not double-count");
+        // A genuinely new memory still bumps the count.
+        store.indexMemory("m2", "the plugin uses docker", ts + 2000);
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 2);
+        // Removal unwinds exactly: both memories gone → count 0 → GC.
+        store.onMemoryRemoved("m1");
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 1);
+        store.onMemoryRemoved("m2");
+        assert.equal(store.stats().entities, 0, "entity must be GC'd once all references are gone");
+    }
+    finally {
+        store.db.close();
+    }
+});
+
 test("utils: classifyFailure buckets error messages", async () => {
     const { classifyFailure } = await import("../dist/utils.js");
     assert.equal(classifyFailure("SyntaxError: Unexpected token '}'"), "syntax");

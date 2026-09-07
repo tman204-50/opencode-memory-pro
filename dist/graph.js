@@ -279,16 +279,23 @@ export class GraphStore {
         this.begin();
         try {
             for (const entity of entities) {
-                this.db.prepare(`
-                    INSERT INTO entities (name, type, first_seen, last_seen, mention_count)
-                    VALUES (?, ?, ?, ?, 1)
-                    ON CONFLICT(name) DO UPDATE SET
-                        last_seen = excluded.last_seen,
-                        mention_count = mention_count + 1
-                `).run(entity.name, entity.type, timestamp, timestamp);
-                this.db.prepare(`
+                // REINDEX_COUNT_IDEMPOTENT (1.4.5): mention_count must only
+                // grow when a NEW memory->entity link is created. The link
+                // table is INSERT OR IGNORE, so re-indexing the same memory
+                // (update, re-embed, backfill) previously bumped the count
+                // while the link set stayed the same — inflated counts then
+                // survived onMemoryRemoved's -1 and blocked GC forever.
+                const link = this.db.prepare(`
                     INSERT OR IGNORE INTO memory_entities (memory_id, entity_name) VALUES (?, ?)
                 `).run(memoryId, entity.name);
+                const bump = link.changes > 0 ? 1 : 0;
+                this.db.prepare(`
+                    INSERT INTO entities (name, type, first_seen, last_seen, mention_count)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        last_seen = excluded.last_seen,
+                        mention_count = mention_count + ?
+                `).run(entity.name, entity.type, timestamp, timestamp, bump, bump);
             }
             for (let i = 0; i < entities.length; i += 1) {
                 for (let j = i + 1; j < entities.length; j += 1) {
@@ -422,11 +429,31 @@ export class GraphStore {
             return;
         this.begin();
         try {
+            // MERGE_ENTITY_GC (1.4.5): links the OLDER memory shares with the
+            // NEWER one collapse into a single memory_entities row via the
+            // INSERT OR IGNORE below, but mention_count kept the extra
+            // reference — when the surviving memory was later removed it was
+            // decremented once and the entity sat at 1 with zero references,
+            // never GC'd. Decrement exactly the duplicated links (moved links
+            // keep their count: one reference, under the newer memory) and
+            // GC entities that hit zero, mirroring onMemoryRemoved.
+            const dupNames = this.db.prepare(`
+                SELECT o.entity_name FROM memory_entities o
+                JOIN memory_entities n ON n.memory_id = ? AND n.entity_name = o.entity_name
+                WHERE o.memory_id = ?
+            `).all(newerId, olderId).map((r) => r.entity_name);
             this.db.prepare(`
                 INSERT OR IGNORE INTO memory_entities (memory_id, entity_name)
                 SELECT ?, entity_name FROM memory_entities WHERE memory_id = ?
             `).run(newerId, olderId);
             this.db.prepare("DELETE FROM memory_entities WHERE memory_id = ?").run(olderId);
+            for (const name of dupNames) {
+                this.db.prepare("UPDATE entities SET mention_count = mention_count - 1 WHERE name = ?").run(name);
+                const entity = this.db.prepare("SELECT mention_count FROM entities WHERE name = ?").get(name);
+                if (entity && entity.mention_count <= 0) {
+                    this.db.prepare("DELETE FROM entities WHERE name = ?").run(name);
+                }
+            }
             const edges = this.db.prepare(`
                 SELECT src, dst, relation, weight, provenance FROM edges
                 WHERE instr(provenance, ?) > 0
