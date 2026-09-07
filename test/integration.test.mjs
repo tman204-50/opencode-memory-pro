@@ -670,6 +670,36 @@ test("integration: dimension-mismatch is detected on init, and repair rebuilds t
     }
 });
 
+test("integration: concurrent store.init calls coalesce (single-flight)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "init-race-"));
+    const store = new MemoryStore(join(dir, "lancedb"));
+    try {
+        // INIT_SINGLE_FLIGHT regression: two concurrent inits on a FRESH
+        // directory. Before the guard, both failed openTable and raced
+        // createTable, so one threw "table already exists" and leaked its
+        // connection; both callers in ensureInitialized could also double-run
+        // the graph backfill (compounding the non-idempotent mention_count).
+        // Single-flight coalesces them onto one init, so both resolve.
+        await Promise.all([
+            store.init(DIM),
+            store.init(DIM),
+        ]);
+        // Store must be fully usable after coalesced init.
+        await store.put(makeRecord("race-1", "concurrent init must not corrupt the store"));
+        const results = await store.search(searchParams("concurrent init", deterministicEmbed("concurrent init")));
+        assert.ok(results.some((r) => r.record.id === "race-1"), "record written after concurrent init must be searchable");
+        // A third init AFTER completion re-runs (single-flight only coalesces
+        // in-flight calls, not completed ones — re-init must stay possible for
+        // the embedding-config-change path).
+        await store.init(DIM);
+        const again = await store.search(searchParams("concurrent init", deterministicEmbed("concurrent init")));
+        assert.ok(again.some((r) => r.record.id === "race-1"), "store still usable after sequential re-init");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: plugin E2E scenario (subprocess)", async () => {
     const result = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["test/scenario-e2e.mjs"], {

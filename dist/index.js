@@ -611,6 +611,12 @@ async function createRuntimeState(input) {
         graph: graph ?? { enabled: false, extract: () => [], boostResults: (_q, r) => r, indexMemory: () => { } },
         defaultScope: deriveProjectScope(input.worktree),
         initialized: false,
+        // INIT_SINGLE_FLIGHT (1.4.5): memoizes the in-flight ensureInitialized
+        // promise so concurrent callers (session.created, session.idle,
+        // system.transform, tool.execute.after) coalesce onto one init instead
+        // of each probing the embedder and calling store.init — which raced
+        // createTable on a fresh store and leaked the loser's connection.
+        initPromise: null,
         startupLogged: false,
         captureBuffer: new Map(),
         activeEpisodes: new Map(),
@@ -629,31 +635,39 @@ async function createRuntimeState(input) {
         ensureInitialized: async () => {
             if (state.initialized)
                 return;
-            try {
-                const dim = await state.embedder.dim();
-                await state.store.init(dim);
-                state.initialized = true;
-                if (state.graph?.enabled) {
-                    // One-time backfill: index existing memories into the graph
-                    // so recall boosts work immediately, not only for new captures.
-                    // GRAPH_BACKFILL_ALL (1.3.5): was readByScopes(["global"]),
-                    // which skipped every project-scoped memory.
-                    try {
-                        const records = await state.store.readAllActive();
-                        state.graph.reindexMemories(records);
+            if (state.initPromise)
+                return state.initPromise;
+            state.initPromise = (async () => {
+                try {
+                    const dim = await state.embedder.dim();
+                    await state.store.init(dim);
+                    state.initialized = true;
+                    if (state.graph?.enabled) {
+                        // One-time backfill: index existing memories into the graph
+                        // so recall boosts work immediately, not only for new captures.
+                        // GRAPH_BACKFILL_ALL (1.3.5): was readByScopes(["global"]),
+                        // which skipped every project-scoped memory.
+                        try {
+                            const records = await state.store.readAllActive();
+                            state.graph.reindexMemories(records);
+                        }
+                        catch (error) {
+                            log("warn", `graph backfill failed: ${toErrorMessage(error)}`);
+                        }
                     }
-                    catch (error) {
-                        log("warn", `graph backfill failed: ${toErrorMessage(error)}`);
-                    }
+                    // MEMORY_RETENTION (1.0): one pass at startup so a long-idle
+                    // store gets its expired memories digested without waiting for
+                    // the next session.idle event.
+                    maybeSweepExpiredMemories(state, state.defaultScope, true).catch(() => { });
                 }
-                // MEMORY_RETENTION (1.0): one pass at startup so a long-idle
-                // store gets its expired memories digested without waiting for
-                // the next session.idle event.
-                maybeSweepExpiredMemories(state, state.defaultScope, true).catch(() => { });
-            }
-            catch (error) {
-                log("warn", `initialization deferred: ${toErrorMessage(error)}`);
-            }
+                catch (error) {
+                    log("warn", `initialization deferred: ${toErrorMessage(error)}`);
+                }
+                finally {
+                    state.initPromise = null;
+                }
+            })();
+            return state.initPromise;
         },
     };
     return state;

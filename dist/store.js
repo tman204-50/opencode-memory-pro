@@ -67,6 +67,12 @@ export class MemoryStore {
     table = null;
     eventTable = null;
     episodicTaskTable = null;
+    // INIT_SINGLE_FLIGHT (1.4.5): memoizes the in-flight init() promise so
+    // concurrent callers coalesce onto one init instead of each opening a
+    // connection and racing createTable (which throws "table already exists"
+    // on a fresh store and leaks the loser's connection). Cleared in finally
+    // so a failed init can be retried on the next call.
+    initPromise = null;
     indexState = {
         vector: false,
         fts: false,
@@ -323,6 +329,17 @@ export class MemoryStore {
         }
     }
     async init(vectorDim) {
+        if (this.initPromise)
+            return this.initPromise;
+        this.initPromise = this._init(vectorDim);
+        try {
+            return await this.initPromise;
+        }
+        finally {
+            this.initPromise = null;
+        }
+    }
+    async _init(vectorDim) {
         await mkdir(this.dbPath, { recursive: true });
         await mkdir(dirname(this.dbPath), { recursive: true });
         this.lancedb = await import("@lancedb/lancedb");
