@@ -6,6 +6,7 @@ import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession } from "../dist/llm.js";
 import { resolveScope } from "../dist/scope.js";
+import { flushAutoCapture } from "../dist/index.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
 
@@ -512,4 +513,75 @@ test("config: fuzzy channel defaults on (0.15) and renormalizes three channels",
     const off = resolveMemoryConfig({ memory: { retrieval: { fuzzyWeight: 0 } } }, "/tmp");
     assert.equal(off.retrieval.fuzzyWeight, 0, "fuzzyWeight 0 must fully disable the channel");
     assert.ok(Math.abs((off.retrieval.vectorWeight + off.retrieval.bm25Weight) - 1) < 1e-9, "vector+bm25 renormalize when fuzzy is off");
+});
+
+// CAPTURE_RETRY_ON_DEFERRED (1.4.5): flushAutoCapture owns the capture-buffer
+// delete — fragments must survive a deferred-init flush and be consumed only
+// once storage provably proceeds past init.
+function makeFlushState({ initialized, minCaptureChars = 0 }) {
+    const events = [];
+    const storedRecords = [];
+    const state = {
+        captureBuffer: new Map(),
+        defaultScope: "global",
+        initialized,
+        ensureInitialized: async () => { },
+        config: {
+            capture: { mode: "heuristics" },
+            dedup: { enabled: false },
+            graph: { enabled: false },
+            embedding: { model: "test-model" },
+            minCaptureChars,
+            maxEntriesPerScope: 100,
+        },
+        embedder: { embed: async () => [0.1, 0.2, 0.3] },
+        store: {
+            putEvent: async (event) => { events.push(event); },
+            put: async (record) => { storedRecords.push(record); },
+            pruneScope: async () => { },
+        },
+    };
+    return { state, events, storedRecords };
+}
+
+const offlineClient = { session: { get: async () => { throw new Error("client offline in test"); } } };
+
+test("capture: flushAutoCapture retains buffered fragments when init is deferred (CAPTURE_RETRY_ON_DEFERRED)", async () => {
+    const { state } = makeFlushState({ initialized: false });
+    const fragments = ["decided to use SQLite for the cache"];
+    state.captureBuffer.set("sess-1", [...fragments]);
+    await flushAutoCapture("sess-1", state, offlineClient);
+    assert.ok(state.captureBuffer.has("sess-1"), "fragments must survive a deferred-init flush");
+    assert.deepEqual(state.captureBuffer.get("sess-1"), fragments);
+});
+
+test("capture: flushAutoCapture deletes buffer once initialized (no double-flush regression)", async () => {
+    const { state, events } = makeFlushState({ initialized: true, minCaptureChars: 100000 });
+    state.captureBuffer.set("sess-2", ["some transcript fragment"]);
+    await flushAutoCapture("sess-2", state, offlineClient);
+    assert.ok(!state.captureBuffer.has("sess-2"), "initialized flush must consume the buffer");
+    const outcomes = events.map((e) => e.outcome);
+    assert.ok(outcomes.includes("considered"), "flush must reach the post-guard path");
+    assert.ok(outcomes.includes("skipped"), "below-min text records an explicit skipped event");
+});
+
+test("capture: flushAutoCapture retry after init recovery consumes and stores retained fragments", async () => {
+    const { state, events, storedRecords } = makeFlushState({ initialized: false });
+    let attempt = 0;
+    state.ensureInitialized = async () => {
+        attempt += 1;
+        if (attempt >= 2)
+            state.initialized = true;
+    };
+    const fragments = ["fixed the flaky test by resetting the SQLite cache before each run"];
+    state.captureBuffer.set("sess-3", [...fragments]);
+    await flushAutoCapture("sess-3", state, offlineClient);
+    assert.ok(state.captureBuffer.has("sess-3"), "first flush (init deferred) retains fragments");
+    await flushAutoCapture("sess-3", state, offlineClient);
+    assert.ok(!state.captureBuffer.has("sess-3"), "recovered flush consumes the buffer");
+    assert.equal(storedRecords.length, 1);
+    assert.equal(storedRecords[0].text, fragments[0]);
+    const storedEvent = events.find((e) => e.outcome === "stored");
+    assert.ok(storedEvent, "stored capture event must be recorded");
+    assert.equal(storedEvent.memoryId, storedRecords[0].id);
 });

@@ -705,13 +705,22 @@ async function flushAutoCapture(sessionID, state, client) {
         });
         return;
     }
-    state.captureBuffer.delete(sessionID);
     const combined = fragments.join("\n").trim();
     const activeScope = await resolveSessionScope(sessionID, client, state.defaultScope);
     await state.ensureInitialized();
     if (!state.initialized) {
+        // CAPTURE_RETRY_ON_DEFERRED (1.4.5): keep the fragments in the buffer.
+        // The next session.idle/compacted/deleted flush retries them once init
+        // recovers; deleting before this guard silently destroyed every
+        // buffered fragment for the session after a single transient init
+        // failure.
         return;
     }
+    // CAPTURE_RETRY_ON_DEFERRED (1.4.5): the buffer owns its fragments until
+    // flush provably proceeds past init. Edge: a session.deleted flush while
+    // init is still deferred retains the entry (bounded string-array leak)
+    // rather than dropping the data.
+    state.captureBuffer.delete(sessionID);
     await recordCaptureEvent(state, {
         sessionID,
         scope: activeScope,
@@ -1056,3 +1065,6 @@ function hasEmbeddingConfigChanged(current, next) {
         || (current.timeoutMs ?? 0) !== (next.timeoutMs ?? 0));
 }
 export default plugin;
+// CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
+// opencode plugin loading consumes the default export and ignores these.
+export { flushAutoCapture };
