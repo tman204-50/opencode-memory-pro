@@ -490,6 +490,41 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.1 (2026-09-07)
+
+Performance review — four fixes cutting blocking subprocess spawns, full-table
+scans, and redundant re-scans out of the hot paths (dedup on capture,
+consolidation, recall usage-tracking, scoping):
+
+- **NO_GIT_SCOPE — project scoping no longer shells out to git**:
+  `deriveProjectScope` ran a BLOCKING `git config --get remote.origin.url`
+  subprocess on every call in project mode. Dropped entirely; the project
+  scope is now always derived from the worktree path alone. Trade-off: two
+  clones/worktrees of the same repo now get different scopes (they shared one
+  via the remote URL before).
+- **SCOPING_CACHE — `resolveScoping` cached per worktree (5s TTL, 20
+  entries)**: it previously re-read + re-parsed config sidecars on every tool
+  call. The cache is keyed on the `OPENCODE_MEMORY_PRO_SCOPING` env value and
+  cleared by `setScopingConfigSource`, so runtime env flips and config-hook
+  injection are never served stale.
+- **FAST_PATH_USAGE_LOOKUP — `updateMemoryUsage` no longer full-scans the
+  table per recalled row**: it checks the warm scope cache first (zero I/O),
+  then an id-bounded `findRecordsByIds` query, and only falls back to the
+  full scan (which also supports id-prefix matching). Manual `memory_search`
+  now fires usage updates without awaiting, matching the auto-recall path.
+- **CACHE_REUSE_DEDUP — no-index vector dedup reuses the warm scope cache**:
+  the brute-force fallback in `findSimilarVectors`/`findSimilarVectorsBatch`
+  issued a fresh full-scope scan on every capture dedup check and every
+  consolidation batch. It now reuses version- and age-checked cached rows
+  (precomputed norms included) and returns nothing on any miss so callers
+  fall back unchanged.
+- **INDEX_RECHECK_INTERVAL_MS — vector index builds without a restart**:
+  `ensureIndexes` ran exactly once at init, so a store crossing
+  `MIN_ROWS_FOR_INDEX` (256 rows) mid-process stayed on the brute-force cosine
+  fallback forever. `maybeOptimizeAll` (after every write path) now kicks an
+  independently throttled, fire-and-forget recheck (5-min interval) that
+  rebuilds the ANN index once the store is eligible.
+
 ### v1.5.0 (2026-09-07)
 
 Episodic-task query ordering fix (bug report: `task_episode_query` silently

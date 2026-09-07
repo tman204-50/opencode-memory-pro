@@ -1001,6 +1001,54 @@ test("integration: suggestRetryBudget medians parsed retryAttemptsJson, not stri
     }
 });
 
+// FAST_PATH_USAGE_LOOKUP (perf review): updateMemoryUsage now finds the row
+// via the warm scope cache, then an id-bounded findRecordsByIds, and only
+// falls back to the full readByScopes scan. Behavior must be preserved across
+// all three paths: full-id updates hit the cache path; prefix-id updates with
+// a COLD cache must still land via the scan fallback (findRecordsByIds is
+// exact-id only). Mutant: dropping the scan fallback loses the prefix update.
+test("integration: updateMemoryUsage updates rows via cache and via fallback scan (FAST_PATH_USAGE_LOOKUP)", async () => {
+    const store = await newStore("mem-usagefast-");
+    try {
+        await store.put(makeRecord("usage-fast-1", "fast path usage lookup memory"));
+        // Warm the scope cache, then update by FULL id → cache path.
+        await store.search(searchParams("fast path usage", deterministicEmbed("fast path usage")));
+        await store.updateMemoryUsage("usage-fast-1", "project:probe", ["global"]);
+        // Cold cache (entry dropped) + PREFIX id (findRecordsByIds is
+        // exact-id only, so this exercises the scan fallback) → still lands.
+        store.scopeCache.delete("global");
+        await store.updateMemoryUsage("usage-fast", "project:probe2", ["global"]);
+        const row = (await store.readByScopes(["global"])).find((r) => r.id === "usage-fast-1");
+        assert.equal(row.recallCount, 2, "both updates must land (cache path + fallback scan)");
+        const meta = JSON.parse(row.metadataJson);
+        assert.equal((meta.recalledProjects ?? []).length, 2, "both project scopes must register");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// INDEX_RECHECK_INTERVAL_MS (perf review): a store that crosses
+// MIN_ROWS_FOR_INDEX mid-process must build the vector ANN index on the next
+// recheck instead of staying on the brute-force fallback until restart.
+// Mutant (pre-fix): no recheck exists, so indexState.vector stays false.
+test("integration: store crossing MIN_ROWS_FOR_INDEX builds the vector index on recheck (INDEX_RECHECK_INTERVAL_MS)", async () => {
+    const store = await newStore("mem-indexrecheck-");
+    try {
+        const N = MemoryStore.MIN_ROWS_FOR_INDEX + 1;
+        for (let i = 0; i < N; i += 1) {
+            await store.put(makeRecord(`idx-${i}`, `index recheck row ${i} with some filler text about the memory plugin`));
+        }
+        assert.equal(store.indexState.vector, false, "index not built at init (store started below the threshold)");
+        store.lastIndexCheckAt = 0;
+        await store.maybeRecheckVectorIndex();
+        assert.equal(store.indexState.vector, true, "recheck must build the vector index once rows cross the threshold");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: plugin E2E scenario (subprocess)", async () => {
     const result = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["test/scenario-e2e.mjs"], {

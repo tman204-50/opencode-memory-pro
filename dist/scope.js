@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { stableHash } from "./utils.js";
 import { resolveMemoryConfig } from "./config.js";
 // SCOPING_TOGGLE: runtime switch between two scoping modes, driven by the
@@ -8,17 +7,21 @@ import { resolveMemoryConfig } from "./config.js";
 //             any session/directory. (This supersedes the old
 //             SINGLE_USER_GLOBAL_SCOPE hardcode.)
 //   "project" — upstream behavior: memories are partitioned per project by
-//             git remote URL (or local directory path hash); the "global"
+//             a hash of the worktree's local directory path; the "global"
 //             scope is still searched when includeGlobalScope is enabled.
-// The mode is re-read on every call (cheap sidecar read), so flipping the
-// config file takes effect in running processes without a restart.
+// NO_GIT_SCOPE (perf review): this used to also try a `git config --get
+// remote.origin.url` lookup (so clones of the same repo at different paths
+// shared one scope) via execFileSync — a BLOCKING subprocess spawn on every
+// call in "project" mode. Dropped entirely; project scope is now always
+// derived from the worktree path alone. Trade-off: two clones/worktrees of
+// the same repo now get different scopes (they didn't before); nothing
+// shells out anymore.
+// The mode is re-read on every call, cached briefly (see resolveScoping)
+// so flipping the config file takes effect in running processes without a
+// restart, without paying a full config re-resolution on every tool call.
 export function deriveProjectScope(worktree) {
     if (resolveScoping(worktree) !== "project") {
         return "global";
-    }
-    const remote = tryGetGitRemote(worktree);
-    if (remote) {
-        return `project:${stableHash(remote).slice(0, 16)}`;
     }
     return `project:local:${stableHash(worktree).slice(0, 16)}`;
 }
@@ -47,24 +50,46 @@ export function resolveScope(scope, worktree) {
 let scopingConfigSource;
 export function setScopingConfigSource(config) {
     scopingConfigSource = config ?? undefined;
+    // SCOPING_CACHE (perf review): the config object just changed, so any
+    // cached scoping decisions computed against the old one are invalid.
+    scopingCache.clear();
 }
+// SCOPING_CACHE (perf review): resolveScoping used to call
+// resolveMemoryConfig() — up to 4 sync existsSync+readFileSync+JSON.parse
+// sidecar reads plus a full re-resolution of every config section — on
+// EVERY tool call and every recall turn, just to read one boolean field.
+// Cache the resolved value per worktree for a short TTL so repeated calls
+// within one turn/session don't repay that cost, while still picking up
+// sidecar edits or `setScopingConfigSource` calls (which clear the cache
+// outright) without a process restart. The cache entry is additionally
+// keyed on the current OPENCODE_MEMORY_PRO_SCOPING env value (a free
+// read, no I/O) so a runtime env override — the one thing that can change
+// the outcome without going through setScopingConfigSource — is never
+// served stale.
+const SCOPING_CACHE_TTL_MS = Number.isFinite(Number(process.env.OPENCODE_MEMORY_PRO_SCOPING_CACHE_TTL_MS))
+    ? Math.max(0, Number(process.env.OPENCODE_MEMORY_PRO_SCOPING_CACHE_TTL_MS))
+    : 5000;
+const SCOPING_CACHE_MAX_ENTRIES = 20;
+const scopingCache = new Map();
 function resolveScoping(worktree) {
+    const key = worktree ?? "";
+    const envScoping = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    const now = Date.now();
+    const cached = scopingCache.get(key);
+    if (cached && cached.envScoping === envScoping && now < cached.expiresAt) {
+        return cached.value;
+    }
+    let value;
     try {
-        return resolveMemoryConfig(scopingConfigSource ?? {}, worktree).scoping === "project" ? "project" : "global";
+        value = resolveMemoryConfig(scopingConfigSource ?? {}, worktree).scoping === "project" ? "project" : "global";
     }
     catch {
-        return "global";
+        value = "global";
     }
-}
-function tryGetGitRemote(worktree) {
-    try {
-        const output = execFileSync("git", ["-C", worktree, "config", "--get", "remote.origin.url"], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
-        return output.length > 0 ? output : null;
+    scopingCache.set(key, { value, envScoping, expiresAt: now + SCOPING_CACHE_TTL_MS });
+    if (scopingCache.size > SCOPING_CACHE_MAX_ENTRIES) {
+        const oldestKey = scopingCache.keys().next().value;
+        scopingCache.delete(oldestKey);
     }
-    catch {
-        return null;
-    }
+    return value;
 }

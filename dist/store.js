@@ -145,8 +145,20 @@ export class MemoryStore {
     // the compaction), and only reclaims after the pid should have been
     // written or the 30min TTL passes.
     static OPTIMIZE_LOCK_WAIT_MS = 10 * 1000;
+    // INDEX_RECHECK_INTERVAL_MS (perf review): ensureIndexes() previously ran
+    // exactly once, from _init(). A store that crosses MIN_ROWS_FOR_INDEX
+    // (256 rows) mid-process — a handful of capture-heavy sessions on a
+    // fresh store — never got the vector ANN index built for the rest of
+    // that process's lifetime, staying on the brute-force cosine fallback in
+    // findSimilarVectors/findSimilarVectorsBatch (dedup-check-on-capture and
+    // consolidation) until restart. maybeOptimizeAll already runs after
+    // every write path, so piggyback a cheap, independently-throttled
+    // re-check there: table.listIndices()+countRows() is metadata-only, far
+    // cheaper than the scans it unblocks, so a short interval is safe.
+    static INDEX_RECHECK_INTERVAL_MS = 5 * 60 * 1000;
     optimizing = false;
     lastOptimizeAt = 0;
+    lastIndexCheckAt = 0;
     constructor(dbPath, cacheConfig) {
         this.dbPath = dbPath;
         this.cacheConfig = {
@@ -260,6 +272,13 @@ export class MemoryStore {
      * stderr (uninterceptable), so the lock is what keeps it out of the TUI.
      */
     async maybeOptimizeAll(force = false) {
+        // INDEX_RECHECK_INTERVAL_MS (perf review): independent of compaction
+        // — fire-and-forget so it never adds latency to the write path that
+        // triggered this call, and skipped while a compaction is in flight in
+        // this process to avoid two concurrent native calls against the same
+        // table handle (the next write's call picks it up a few minutes
+        // later either way).
+        void this.maybeRecheckVectorIndex().catch(() => { });
         // TIMING_SPANS (1.4.7): compaction is the usual suspect for write-path
         // latency spikes; spanExtra.attempted distinguishes real compaction
         // runs from the frequent interval-guard early returns.
@@ -270,6 +289,20 @@ export class MemoryStore {
         }
         finally {
             stop(spanExtra);
+        }
+    }
+    async maybeRecheckVectorIndex() {
+        if (this.indexState.vector || this.optimizing)
+            return;
+        const now = Date.now();
+        if (now - this.lastIndexCheckAt < MemoryStore.INDEX_RECHECK_INTERVAL_MS)
+            return;
+        this.lastIndexCheckAt = now;
+        try {
+            await this.ensureIndexes();
+        }
+        catch (error) {
+            log("debug", `[store] periodic vector index recheck failed: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
     async _maybeOptimizeAll(force = false, spanExtra = {}) {
@@ -1233,6 +1266,35 @@ export class MemoryStore {
 // against the most-similar neighbors (probes boosted to improve recall on
 // filtered queries). Without an index (small stores) it falls back to a
 // CORRECT brute-force scan of the whole scope instead of a truncated one.
+    // CACHE_REUSE_DEDUP (perf review): the no-index fallback in
+    // findSimilarVectors/findSimilarVectorsBatch used to always issue a
+    // fresh `select(["id","vector"])` scan of the whole scope — on every
+    // capture's dedup check (findSimilarVectors) and every consolidation
+    // batch (findSimilarVectorsBatch), until MIN_ROWS_FOR_INDEX rows exist.
+    // When the scope cache already holds a fresh (version- and age-checked)
+    // in-memory copy of the same rows — warm from a recent search or prior
+    // capture in this scope — reuse it instead of a second full scan; the
+    // norms are already precomputed too. Returns null on any cache miss so
+    // callers fall back to the real query unchanged.
+    getCachedVectorCandidates(scope) {
+        if (!this.cacheConfig.enabled)
+            return null;
+        const entry = this.scopeCache.get(scope);
+        if (!entry)
+            return null;
+        const currentVersion = this.scopeVersions.get(scope) ?? 0;
+        if (entry.version !== currentVersion)
+            return null;
+        const maxAgeMs = Number.isFinite(this.cacheConfig.staleAfterMs) ? this.cacheConfig.staleAfterMs : 0;
+        if (maxAgeMs > 0 && Date.now() - (entry.loadedAt ?? entry.lastAccessTimestamp) > maxAgeMs) {
+            return null;
+        }
+        return entry.records.map((r) => ({
+            id: r.id,
+            vector: r.vector,
+            norm: entry.norms.get(r.id) ?? vecNorm(r.vector),
+        }));
+    }
     async findSimilarVectors(queryVector, scope, limit) {
         try {
             const table = this.requireTable();
@@ -1256,19 +1318,21 @@ export class MemoryStore {
                 scored.sort((a, b) => b.score - a.score);
                 return scored.slice(0, safeLimit);
             }
-            const results = await table.query()
+            const cachedCandidates = this.getCachedVectorCandidates(scope);
+            const candidates = cachedCandidates ?? (await table.query()
                 .where(`scope = '${escapeSql(scope)}'`)
                 .select(["id", "vector"])
-                .toArray();
+                .toArray()).map((r) => ({
+                id: r.id,
+                vector: Array.from(r.vector ?? []).map((item) => Number(item)),
+                norm: undefined,
+            }));
             const queryNorm = vecNorm(queryVector);
-            const scored = results.map((r) => {
-                const vec = Array.from(r.vector ?? []).map((item) => Number(item));
-                return {
-                    id: r.id,
-                    vector: vec,
-                    score: storeFastCosine(queryVector, vec, queryNorm, vecNorm(vec)),
-                };
-            });
+            const scored = candidates.map((r) => ({
+                id: r.id,
+                vector: r.vector,
+                score: storeFastCosine(queryVector, r.vector, queryNorm, r.norm ?? vecNorm(r.vector)),
+            }));
             scored.sort((a, b) => b.score - a.score);
             return scored.slice(0, safeLimit);
         }
@@ -1312,13 +1376,14 @@ export class MemoryStore {
             }
             return out;
         }
-        const results = await table.query()
+        const cachedCandidates = this.getCachedVectorCandidates(scope);
+        const allRows = cachedCandidates ?? (await table.query()
             .where(`scope = '${escapeSql(scope)}'`)
             .select(["id", "vector"])
-            .toArray();
-        const allRows = results.map((r) => ({
+            .toArray()).map((r) => ({
             id: r.id,
             vector: Array.from(r.vector ?? []).map((item) => Number(item)),
+            norm: undefined,
         }));
         const out = [];
         for (const qv of queryVectors) {
@@ -1326,7 +1391,7 @@ export class MemoryStore {
             const scored = allRows.map((r) => ({
                 id: r.id,
                 vector: r.vector,
-                score: storeFastCosine(qv, r.vector, queryNorm, vecNorm(r.vector)),
+                score: storeFastCosine(qv, r.vector, queryNorm, r.norm ?? vecNorm(r.vector)),
             }));
             scored.sort((a, b) => b.score - a.score);
             out.push(scored.slice(0, safeLimit));
@@ -1348,6 +1413,22 @@ export class MemoryStore {
         if (typeof query !== "string" || query.length < 8)
             return false;
         return candidateId.startsWith(query);
+    }
+    // FAST_PATH_USAGE_LOOKUP (perf review): zero-I/O lookup of a record
+    // already sitting in the warm scope cache, for callers that just want to
+    // find-by-id a row they (almost always) already retrieved via a recent
+    // search. Returns null on any miss (cache absent/stale/doesn't have it)
+    // so callers can fall back to a real query.
+    findCachedRecordByScopes(id, scopes) {
+        for (const scope of scopes) {
+            const entry = this.scopeCache.get(scope);
+            if (!entry)
+                continue;
+            const record = entry.records.find((row) => this.matchesId(row.id, id));
+            if (record)
+                return record;
+        }
+        return null;
     }
     async hasMemory(id, scopes) {
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -1372,8 +1453,27 @@ export class MemoryStore {
         // row via different prefixes would still slip past, but that is not a
         // real call pattern.
         return this.withKeyLock(`updateMemoryUsage\u0000${id}`, async () => {
-            const rows = await this.readByScopes(scopes);
-            const match = rows.find((row) => this.matchesId(row.id, id));
+            // FAST_PATH_USAGE_LOOKUP (perf review): this previously called
+            // readByScopes(scopes) unconditionally — a full-column, full-scope
+            // table scan — just to find one row by id. updateMemoryUsage runs
+            // on every recall result of every chat turn (index.js) and,
+            // worse, is awaited sequentially per result on manual
+            // memory_search (tools/memory.js), so that scan's cost multiplied
+            // by result count landed directly in tool latency. The caller
+            // almost always just pulled this exact row out of the warm scope
+            // cache moments earlier, so check that first (zero I/O), then an
+            // id-bounded query (findRecordsByIds — already used by graph
+            // expansion for the same reason), and only fall back to the full
+            // scan (which also supports id-prefix matching) if both miss.
+            let match = this.findCachedRecordByScopes(id, scopes);
+            if (!match) {
+                const fast = await this.findRecordsByIds([id], scopes);
+                match = fast[0] ?? null;
+            }
+            if (!match) {
+                const rows = await this.readByScopes(scopes);
+                match = rows.find((row) => this.matchesId(row.id, id)) ?? null;
+            }
             if (!match)
                 return;
             const now = Date.now();

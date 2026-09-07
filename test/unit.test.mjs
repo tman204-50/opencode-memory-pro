@@ -683,6 +683,94 @@ test("scope: resolveScope honors explicit scopes in project mode", () => {
     }
 });
 
+// NO_GIT_SCOPE (perf review): deriveProjectScope used to shell out to
+// `git config --get remote.origin.url` on EVERY call in project mode — a
+// blocking subprocess spawn — and derive the scope from the remote URL, so
+// clones of the same repo at different paths shared one scope. Project scope
+// is now always derived from the worktree path alone. Mutant: restoring the
+// git-remote lookup makes this fail (a repo with an origin remote would
+// derive project:<hash(remote)> instead of project:local:<hash(worktree)>).
+test("scope: project scope derives from the worktree path alone, never from git remotes (NO_GIT_SCOPE)", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { spawnSync } = await import("node:child_process");
+    const { stableHash } = await import("../dist/utils.js");
+    const dir = mkdtempSync(join(tmpdir(), "omp-nogit-"));
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    process.env.OPENCODE_MEMORY_PRO_SCOPING = "project";
+    try {
+        // A REAL git repo with an origin remote: the pre-fix code read the
+        // remote URL via a blocking git subprocess and scoped by it.
+        spawnSync("git", ["init", "-q", dir], { stdio: "ignore" });
+        spawnSync("git", ["-C", dir, "remote", "add", "origin", "https://example.com/team/repo.git"], { stdio: "ignore" });
+        const derived = resolveScope(undefined, dir);
+        assert.equal(derived, `project:local:${stableHash(dir).slice(0, 16)}`,
+            `git remote must not influence the derived project scope, got ${derived}`);
+        assert.ok(!derived.includes(stableHash("https://example.com/team/repo.git").slice(0, 16)),
+            "scope must not be derived from the remote URL");
+    }
+    finally {
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// SCOPING_CACHE (perf review): resolveScoping caches decisions per worktree
+// for a short TTL to avoid re-reading + re-parsing config sidecars on every
+// tool call. The cache is keyed on the OPENCODE_MEMORY_PRO_SCOPING env value
+// (the one input that changes without setScopingConfigSource), so a runtime
+// env flip must never be served stale. Mutant: keying the cache on the
+// worktree alone serves the stale "project" decision and this fails.
+test("scope: scoping cache never serves a stale decision across an env flip (SCOPING_CACHE)", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "omp-scopecache-"));
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    try {
+        process.env.OPENCODE_MEMORY_PRO_SCOPING = "project";
+        assert.ok(resolveScope(undefined, dir).startsWith("project:"), "first call resolves project mode");
+        process.env.OPENCODE_MEMORY_PRO_SCOPING = "global";
+        assert.equal(resolveScope(undefined, dir), "global",
+            "env flip to global must not be served a stale cached project decision");
+    }
+    finally {
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// SCOPING_CACHE (perf review): setScopingConfigSource must invalidate cached
+// scoping decisions — the injected config is the other input that changes the
+// outcome, and the cache is only correct if it is cleared on injection.
+// Mutant: dropping the clear serves a stale "project" decision after the
+// source flips to global and this fails.
+test("scope: setScopingConfigSource clears cached scoping decisions (SCOPING_CACHE)", async () => {
+    const { setScopingConfigSource } = await import("../dist/scope.js");
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "omp-scopeclear-"));
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    try {
+        setScopingConfigSource({ memory: { scoping: "project" } });
+        assert.ok(resolveScope(undefined, dir).startsWith("project:"), "project source honored");
+        setScopingConfigSource({ memory: { scoping: "global" } });
+        assert.equal(resolveScope(undefined, dir), "global",
+            "flipping the injected source must not be served a stale cached project decision");
+    }
+    finally {
+        setScopingConfigSource(undefined);
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("config: shipped example file is valid, resolves cleanly, and leaks no secrets", async () => {
     const fs = await import("node:fs");
     const raw = JSON.parse(fs.readFileSync(new URL("../opencode-memory-pro.example.json", import.meta.url), "utf8"));
@@ -1126,3 +1214,135 @@ test("timing: stop is idempotent-safe across early throws and bad names", async 
 function sleepMs(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// FAST_PATH_USAGE_LOOKUP (perf review): updateMemoryUsage used to pay a full
+// readByScopes table scan per recall result to find one row; it now checks the
+// warm scope cache first (zero I/O). findCachedRecordByScopes must find exact
+// and prefix ids in a warm cache and return null on any miss so callers fall
+// back to a real query. Mutant: removing the method (pre-fix) fails outright.
+test("store: findCachedRecordByScopes finds exact and prefix ids in the warm cache (FAST_PATH_USAGE_LOOKUP)", () => {
+    const store = new MemoryStore("/tmp/omp-unused", {});
+    const records = [
+        { id: "rec-12345678-extra", text: "alpha", vector: [0.1, 0.2], recallCount: 0 },
+        { id: "rec-87654321", text: "beta", vector: [0.2, 0.1], recallCount: 0 },
+    ];
+    store.scopeCache.set("global", { records, norms: new Map(), tokenized: [], idf: new Map(), loadedAt: Date.now(), lastAccessTimestamp: Date.now(), version: 0 });
+    assert.equal(store.findCachedRecordByScopes("rec-12345678", ["global"]), records[0], "prefix query matches the cached id");
+    assert.equal(store.findCachedRecordByScopes("rec-87654321", ["global"]), records[1], "exact id matches");
+    assert.equal(store.findCachedRecordByScopes("rec-87654321", ["global", "other"]), records[1], "first matching scope wins");
+    assert.equal(store.findCachedRecordByScopes("rec-99999999", ["global"]), null, "unknown id must miss");
+    assert.equal(store.findCachedRecordByScopes("rec-87654321", ["other"]), null, "absent scope must miss");
+});
+
+// CACHE_REUSE_DEDUP (perf review): the no-index vector fallback used to issue
+// a fresh full-scope scan on every dedup check even when the scope cache held
+// a warm copy. getCachedVectorCandidates must reuse version- and age-checked
+// cached rows (with precomputed norms) and return null on ANY miss so callers
+// fall back to the real query unchanged. Mutant: dropping the version check
+// serves stale rows; removing the method (pre-fix) fails outright.
+test("store: getCachedVectorCandidates reuses fresh cache rows and nulls on any miss (CACHE_REUSE_DEDUP)", () => {
+    const store = new MemoryStore("/tmp/omp-unused", { enabled: true, staleAfterMs: 60_000 });
+    const records = [
+        { id: "vec-1", vector: [1, 0], recallCount: 0 },
+        { id: "vec-2", vector: [0, 1], recallCount: 0 },
+    ];
+    const norms = new Map([["vec-1", 1], ["vec-2", 1]]);
+    store.scopeVersions.set("global", 3);
+    store.scopeCache.set("global", { records, norms, tokenized: [], idf: new Map(), loadedAt: Date.now(), lastAccessTimestamp: Date.now(), version: 3 });
+    const candidates = store.getCachedVectorCandidates("global");
+    assert.equal(candidates.length, 2);
+    assert.deepEqual(candidates.map((c) => c.id), ["vec-1", "vec-2"]);
+    assert.ok(candidates.every((c) => c.norm === 1), "precomputed norms must be reused");
+    assert.deepEqual(candidates[0].vector, [1, 0]);
+
+    // Version mismatch (a write happened) → miss → caller falls back to SQL.
+    store.scopeVersions.set("global", 4);
+    assert.equal(store.getCachedVectorCandidates("global"), null, "version mismatch must be a miss");
+    store.scopeVersions.set("global", 3);
+
+    // Age bound exceeded → miss.
+    store.scopeCache.get("global").loadedAt = Date.now() - 120_000;
+    assert.equal(store.getCachedVectorCandidates("global"), null, "stale-by-age entry must be a miss");
+    store.scopeCache.get("global").loadedAt = Date.now();
+
+    // Cache disabled / absent scope → miss.
+    const disabled = new MemoryStore("/tmp/omp-unused", { enabled: false });
+    disabled.scopeCache.set("global", store.scopeCache.get("global"));
+    assert.equal(disabled.getCachedVectorCandidates("global"), null, "disabled cache must be a miss");
+    assert.equal(store.getCachedVectorCandidates("other"), null, "absent scope must be a miss");
+});
+
+// CACHE_REUSE_DEDUP (perf review): with a warm, fresh cache the no-index
+// fallback in findSimilarVectors/findSimilarVectorsBatch must rank from the
+// cache — zero table I/O. Mutant (pre-fix): the fallback always runs
+// table.query() — a throwing query makes the call return [] instead of the
+// cached ranking.
+test("store: findSimilarVectors ranks from the warm cache without touching the table (CACHE_REUSE_DEDUP)", async () => {
+    const store = new MemoryStore("/tmp/omp-unused", { enabled: true, staleAfterMs: 60_000 });
+    store.indexState.vector = false;
+    const records = [
+        { id: "vec-a", vector: [1, 0], recallCount: 0 },
+        { id: "vec-b", vector: [0, 1], recallCount: 0 },
+    ];
+    const norms = new Map([["vec-a", 1], ["vec-b", 1]]);
+    store.scopeVersions.set("global", 0);
+    store.scopeCache.set("global", { records, norms, tokenized: [], idf: new Map(), loadedAt: Date.now(), lastAccessTimestamp: Date.now(), version: 0 });
+    store.requireTable = () => ({ query: () => { throw new Error("table I/O must not happen when the cache is warm"); } });
+
+    const similar = await store.findSimilarVectors([1, 0], "global", 1);
+    assert.equal(similar.length, 1, "top-1 must be ranked from the cache");
+    assert.equal(similar[0].id, "vec-a", "most similar cached row must rank first");
+    assert.ok(similar[0].score > 0.99, "identical vectors score ~1");
+
+    const batch = await store.findSimilarVectorsBatch([[1, 0], [0, 1]], "global", 1);
+    assert.equal(batch.length, 2, "batch must return one ranking per query vector");
+    assert.equal(batch[0][0].id, "vec-a", "first batch query ranks vec-a first");
+    assert.equal(batch[1][0].id, "vec-b", "second batch query ranks vec-b first");
+});
+
+// INDEX_RECHECK_INTERVAL_MS (perf review): ensureIndexes used to run exactly
+// once at init, so a store crossing MIN_ROWS_FOR_INDEX mid-process stayed on
+// the brute-force fallback until restart. maybeRecheckVectorIndex must be
+// throttled (5-min interval), skipped while an index exists or a compaction
+// is in flight, and otherwise re-run ensureIndexes. Mutant: removing the
+// throttle makes back-to-back calls both fire; removing the method (pre-fix)
+// fails outright.
+test("store: maybeRecheckVectorIndex is throttled and respects index/compaction state (INDEX_RECHECK_INTERVAL_MS)", async () => {
+    const store = new MemoryStore("/tmp/omp-unused", {});
+    store.indexState.vector = false;
+    store.optimizing = false;
+    store.lastIndexCheckAt = 0;
+    let ensureCalls = 0;
+    store.ensureIndexes = async () => { ensureCalls += 1; };
+    await store.maybeRecheckVectorIndex();
+    assert.equal(ensureCalls, 1, "first recheck must run ensureIndexes");
+    await store.maybeRecheckVectorIndex();
+    assert.equal(ensureCalls, 1, "immediate second call must be throttled by the interval");
+    store.lastIndexCheckAt = Date.now() - MemoryStore.INDEX_RECHECK_INTERVAL_MS - 1;
+    await store.maybeRecheckVectorIndex();
+    assert.equal(ensureCalls, 2, "recheck after the interval must run again");
+
+    store.indexState.vector = true;
+    store.lastIndexCheckAt = 0;
+    await store.maybeRecheckVectorIndex();
+    assert.equal(ensureCalls, 2, "no recheck while the vector index already exists");
+
+    store.indexState.vector = false;
+    store.optimizing = true;
+    store.lastIndexCheckAt = 0;
+    await store.maybeRecheckVectorIndex();
+    assert.equal(ensureCalls, 2, "no recheck while a compaction is in flight");
+});
+
+// INDEX_RECHECK_INTERVAL_MS (perf review): maybeOptimizeAll runs after every
+// write path — it must kick the (independently throttled) index recheck so a
+// store that grows past MIN_ROWS_FOR_INDEX mid-process gets its ANN index
+// without a restart. Mutant (pre-fix): maybeOptimizeAll never calls it.
+test("store: maybeOptimizeAll kicks the periodic vector index recheck (INDEX_RECHECK_INTERVAL_MS)", async () => {
+    const store = new MemoryStore("/tmp/omp-unused", {});
+    let recheckCalls = 0;
+    store.maybeRecheckVectorIndex = async () => { recheckCalls += 1; };
+    store._maybeOptimizeAll = async () => { };
+    await store.maybeOptimizeAll(false);
+    assert.equal(recheckCalls, 1, "maybeOptimizeAll must fire the index recheck");
+});

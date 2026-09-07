@@ -291,12 +291,15 @@ export function createMemoryTools(state) {
                 });
                 if (finalResults.length === 0)
                     return "No relevant memory found.";
+                // FIRE_AND_FORGET_USAGE (perf review): this used to await
+                // updateMemoryUsage sequentially per result, blocking the
+                // tool's return on `limit` round trips. Nothing downstream
+                // reads the result, and the auto-recall path (index.js) has
+                // always fired these without awaiting — match that here so
+                // manual memory_search isn't slower than auto-recall for the
+                // same usage-tracking side effect.
                 for (const result of finalResults) {
-                    try {
-                        await state.store.updateMemoryUsage(result.record.id, activeScope, scopes);
-                    }
-                    catch {
-                    }
+                    state.store.updateMemoryUsage(result.record.id, activeScope, scopes).catch(() => { });
                 }
                 return finalResults
                     .map((item, idx) => {
