@@ -147,10 +147,14 @@ test("integration: fuzzy channel (fuse.js) surfaces typo-tolerant matches", asyn
         assert.equal(gibberish.length, 0, "gibberish must not surface unrelated records (threshold)");
 
         // Regression: fuzzyWeight=0 keeps existing behavior identical.
+        // Tolerance is 1e-6, not exact equality: the two searches call
+        // computeRecencyMultiplier → Date.now() ms apart, and recency decay
+        // moves the score ~1.7e-9 per elapsed ms — a 1e-9 tolerance was a
+        // ~50% flake whenever the two clock reads straddled a ms boundary.
         const baseline = await store.search(searchParams("lancedb vector search", deterministicEmbed("lancedb vector search")));
         const noFuzzy = await store.search(searchParams("lancedb vector search", deterministicEmbed("lancedb vector search"), { fuzzyWeight: 0 }));
         assert.equal(noFuzzy[0].record.id, "fid-1", "fuzzy-off search ranks fid-1 first");
-        assert.ok(Math.abs(baseline[0].score - noFuzzy[0].score) < 1e-9, "fuzzyWeight=0 must not change scores");
+        assert.ok(Math.abs(baseline[0].score - noFuzzy[0].score) < 1e-6, "fuzzyWeight=0 must not change scores (beyond clock drift)");
 
         // bm25-only fallback keeps fuzzy active (embedder down scenario).
         const fallbackFuzzy = await store.search(searchParams("lancedb vectr srch", [], { vectorWeight: 0, bm25Weight: 1, fuzzyWeight: 0.15, fuzzyThreshold: 0.5 }));
@@ -243,6 +247,133 @@ test("integration: events table round-trip and TTL status", async () => {
     }
 });
 
+test("integration: poisoned feedback event cannot break readEventsByScopes", async () => {
+    const store = await newStore("mem-evtg-");
+    try {
+        await store.putEvent({
+            id: "evt-ok",
+            type: "feedback",
+            feedbackType: "useful",
+            scope: "global",
+            sessionID: "sess-1",
+            timestamp: Date.now(),
+            memoryId: "id-1",
+            helpful: true,
+            reason: "was right",
+            labels: ["recall"],
+            metadataJson: "{}",
+        });
+        // EVENT_JSON_PARSE_GUARD: a legacy/lossy write left non-JSON text in
+        // the STRING columns labelsJson/context. readEventsByScopes must
+        // survive and degrade the row instead of throwing for the table.
+        await store.requireEventTable().add([{
+            id: "evt-bad",
+            type: "feedback",
+            scope: "global",
+            sessionID: "sess-1",
+            timestamp: Date.now(),
+            memoryId: "id-2",
+            text: "",
+            outcome: "",
+            skipReason: "",
+            resultCount: 0,
+            injected: false,
+            source: "",
+            feedbackType: "useful",
+            helpful: 1,
+            reason: "legacy",
+            labelsJson: "not-json",
+            metadataJson: "{}",
+            sourceSessionId: "",
+            confidenceDelta: null,
+            relatedMemoryId: "",
+            context: "also-not-json",
+        }]);
+
+        const events = await store.readEventsByScopes(["global"]);
+        assert.equal(events.length, 2, "both events must be returned");
+        const ok = events.find((e) => e.id === "evt-ok");
+        const bad = events.find((e) => e.id === "evt-bad");
+        assert.deepEqual(ok?.labels, ["recall"], "healthy labels round-trip");
+        assert.equal(ok?.helpful, true, "healthy helpful round-trips");
+        assert.deepEqual(bad?.labels, [], "unparseable labelsJson degrades to []");
+        assert.equal(bad?.context, undefined, "unparseable context degrades to undefined");
+
+        const summary = await store.summarizeEvents("global", false);
+        assert.equal(summary.feedback.useful.positive, 2, "summarizeEvents survives the poisoned row");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: concurrent episode appends all survive (EPISODE_WRITE_LOCK)", async () => {
+    const store = await newStore("mem-eplock-");
+    const taskId = "lock-task";
+    try {
+        await store.createTaskEpisode({
+            id: "ep-lock",
+            sessionId: "sess-lock",
+            scope: "global",
+            taskId,
+            state: "running",
+            startTime: Date.now(),
+            commandsJson: "[]",
+            validationOutcomesJson: "[]",
+            successPatternsJson: "[]",
+            retryAttemptsJson: "[]",
+            recoveryStrategiesJson: "[]",
+            metadataJson: "{}",
+        });
+        // EPISODE_WRITE_LOCK: overlapping tool.execute.after invocations must
+        // not lose appends — previously the unlocked read-modify-write dropped
+        // every append that raced (19/20 lost under 20 concurrent calls).
+        await Promise.all(Array.from({ length: 10 }, (_, i) =>
+            store.addCommandToEpisode(taskId, "global", `cmd-${i}`)));
+        await Promise.all(Array.from({ length: 10 }, (_, i) =>
+            store.addRetryAttempt(taskId, "global", { outcome: "failed", errorMessage: `err-${i}` })));
+        await Promise.all(Array.from({ length: 10 }, (_, i) =>
+            store.addSuccessPatterns(taskId, "global", [{ commands: [`pat-${i}`], tools: [], confidence: 0.5, extractedAt: Date.now() }])));
+
+        const ep = await store.getTaskEpisode(taskId, "global");
+        const commands = JSON.parse(ep.commandsJson || "[]");
+        const retries = JSON.parse(ep.retryAttemptsJson || "[]");
+        const patterns = JSON.parse(ep.successPatternsJson || "[]");
+        assert.equal(commands.length, 10, `all 10 concurrent command appends must survive, got ${commands.length}`);
+        assert.equal(retries.length, 10, `all 10 concurrent retry appends must survive, got ${retries.length}`);
+        assert.equal(patterns.length, 10, `all 10 concurrent pattern appends must survive, got ${patterns.length}`);
+        assert.deepEqual(retries.map((r) => r.attemptNumber), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "attemptNumbers assigned sequentially under the lock");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: concurrent updateMemoryUsage calls all count (MEMORY_USAGE_LOCK)", async () => {
+    const store = await newStore("mem-usagelock-");
+    try {
+        await store.put(makeRecord("mem-hot", "a globally recalled memory", {
+            scope: "global",
+            metadataJson: JSON.stringify({ source: "test", isPotentialDuplicate: false }),
+        }));
+        // index.js fires one updateMemoryUsage per recall result, fire-and-forget
+        // (.catch(() => {})), so concurrent calls race on the same row's
+        // read-modify-write. Previously 9/10 were lost (last-write-wins).
+        await Promise.all(Array.from({ length: 10 }, (_, i) =>
+            store.updateMemoryUsage("mem-hot", `project:000${i}`, ["global"]).catch(() => { })));
+
+        const row = (await store.readByScopes(["global"])).find((r) => r.id === "mem-hot");
+        assert.equal(row.recallCount, 10, `all 10 concurrent updates must count, got ${row.recallCount}`);
+        assert.equal(row.projectCount, 10, `all 10 distinct project scopes must register, got ${row.projectCount}`);
+        const meta = JSON.parse(row.metadataJson);
+        assert.equal((meta.recalledProjects ?? []).length, 10, "all recalledProjects entries must survive the race");
+        assert.equal(meta.source, "test", "existing metadata must be preserved (METADATA_MERGE_FIX)");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: episodic task lifecycle", async () => {
     const store = await newStore("mem-episodic-");
     const taskId = "task-42";
@@ -267,6 +398,89 @@ test("integration: episodic task lifecycle", async () => {
         assert.equal(episodes.length, 1, "failed episode should be queryable");
         assert.ok(episodes[0].commandsJson.includes("npm test"), "command should be appended");
         assert.equal(episodes[0].failureType, "resource");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: suggestRecoveryStrategies parses commandsJson as JSON string", async () => {
+    const store = await newStore("mem-recovery-");
+    try {
+        for (let i = 1; i <= 3; i += 1) {
+            const taskId = `build-api-${i}`;
+            await store.createTaskEpisode({
+                id: `fail-${i}`,
+                sessionId: `sess-${i}`,
+                scope: "global",
+                taskId,
+                state: "running",
+                startTime: Date.now(),
+                commandsJson: "[]",
+                validationOutcomesJson: "[]",
+                successPatternsJson: "[]",
+                retryAttemptsJson: "[]",
+                recoveryStrategiesJson: "[]",
+                metadataJson: "{}",
+            });
+            await store.addCommandToEpisode(taskId, "global", "npm run build:broken");
+            await store.updateTaskState(taskId, "failed", "global", "runtime", "error TS2307: module not found");
+        }
+        await store.createTaskEpisode({
+            id: "ep-ok",
+            sessionId: "sess-ok",
+            scope: "global",
+            taskId: "build-api",
+            state: "running",
+            startTime: Date.now(),
+            commandsJson: "[]",
+            validationOutcomesJson: "[]",
+            successPatternsJson: "[]",
+            retryAttemptsJson: "[]",
+            recoveryStrategiesJson: "[]",
+            metadataJson: "{}",
+        });
+        await store.addCommandToEpisode("build-api", "global", "npm run build");
+        await store.updateTaskState("build-api", "success", "global");
+
+        const strategies = await store.suggestRecoveryStrategies("global", "build-api-1");
+        const primary = strategies.find((s) => s.reason === "Similar task succeeded with this approach");
+        assert.ok(primary, "expected a strategy derived from the similar success episode");
+        assert.ok(
+            primary.strategy.startsWith("Try: npm run build"),
+            `strategy should name the real first command, got ${JSON.stringify(primary.strategy)}`,
+        );
+        assert.ok(!primary.strategy.includes("["), "strategy must not leak raw JSON syntax");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: tags round-trips through put() and a poisoned tags row cannot break reads", async () => {
+    const store = await newStore("mem-tags-");
+    try {
+        // TAGS_SERIALIZE: array in → JSON string stored → array out on read.
+        await store.put(makeRecord("tags-ok", "tags round trip through the chokepoint", {
+            tags: ["sqlite", "backup"],
+        }));
+        const ok = (await store.readByScopes(["global"])).find((r) => r.id === "tags-ok");
+        assert.deepEqual(ok?.tags, ["sqlite", "backup"], `tags should round-trip as an array, got ${JSON.stringify(ok?.tags)}`);
+
+        // Legacy/lossy write path: a non-JSON string lands in the tags column
+        // (the old array→Array.prototype.toString coercion). TAGS_PARSE_GUARD:
+        // readByScopes must survive and degrade the row's tags to undefined.
+        await store.requireTable().add([{
+            ...makeRecord("tags-bad", "poisoned legacy tags row"),
+            tags: "sqlite,backup",
+            status: "active",
+            id: "tags-bad",
+        }]);
+        const rows = await store.readByScopes(["global"]);
+        const bad = rows.find((r) => r.id === "tags-bad");
+        assert.ok(bad, "poisoned row must survive readByScopes instead of throwing");
+        assert.equal(bad.tags, undefined, "unparseable tags degrade to undefined");
+        assert.ok(rows.some((r) => r.id === "tags-ok"), "healthy row still readable alongside the poisoned one");
     }
     finally {
         store.close();

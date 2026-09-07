@@ -551,7 +551,13 @@ export class MemoryStore {
             teamId: record.teamId ?? undefined,
             sourceSessionId: record.sourceSessionId ?? undefined,
             confidence: record.confidence ?? undefined,
-            tags: record.tags ?? undefined,
+            // TAGS_SERIALIZE: tags is a STRING column (normalizeRow JSON.parses
+            // it on read). Same hazard as citationChain below: a raw array hits
+            // Array.prototype.toString ("a,b") and then fails to parse on every
+            // subsequent read. Normalize at the chokepoint so every writer agrees.
+            tags: Array.isArray(record.tags)
+                ? JSON.stringify(record.tags)
+                : record.tags ?? undefined,
             status: record.status ?? "active",
             parentId: record.parentId ?? undefined,
             // CITATION_CHAIN_SERIALIZE (1.3.5): citationChain is a STRING
@@ -1228,59 +1234,70 @@ export class MemoryStore {
         return false;
     }
     async updateMemoryUsage(id, projectScope, scopes) {
-        const rows = await this.readByScopes(scopes);
-        const match = rows.find((row) => this.matchesId(row.id, id));
-        if (!match)
-            return;
-        const now = Date.now();
-        const newRecallCount = match.recallCount + 1;
-        let newProjectCount = match.projectCount;
-        let metadataJson = match.metadataJson;
-        if (match.scope === "global" && projectScope) {
-            const projects = extractRecalledProjects(metadataJson);
-            if (!projects.has(projectScope)) {
-                projects.add(projectScope);
-                // METADATA_MERGE_FIX (1.3.5): this previously REPLACED
-                // metadataJson with `{ recalledProjects: [...] }`, silently
-                // dropping source / isPotentialDuplicate / graphEntities /
-                // pinned on the first recall of every global memory. In the
-                // default scoping:"global" mode that hit every memory, which
-                // broke pruneScope (duplicate-flag based) and retention
-                // (pinned protections). Merge into the existing blob instead.
-                const baseMeta = parseMetadata(metadataJson);
-                if (projects.size > 100) {
-                    const arr = Array.from(projects);
-                    arr.splice(0, arr.length - 100);
-                    baseMeta.recalledProjects = arr;
+        // MEMORY_USAGE_LOCK: index.js fires one updateMemoryUsage per recall
+        // result, fire-and-forget (`.catch(() => {})`), so every result of one
+        // recall — and overlapping recalls — race on the same row's
+        // read-modify-write. Verified baseline: 9/10 concurrent updates lost
+        // (recallCount 1/10, one recalledProjects entry instead of 10). The
+        // lock is keyed on the caller-supplied id (always the full row id in
+        // practice, from search results); prefix-id callers racing on the same
+        // row via different prefixes would still slip past, but that is not a
+        // real call pattern.
+        return this.withKeyLock(`updateMemoryUsage\u0000${id}`, async () => {
+            const rows = await this.readByScopes(scopes);
+            const match = rows.find((row) => this.matchesId(row.id, id));
+            if (!match)
+                return;
+            const now = Date.now();
+            const newRecallCount = match.recallCount + 1;
+            let newProjectCount = match.projectCount;
+            let metadataJson = match.metadataJson;
+            if (match.scope === "global" && projectScope) {
+                const projects = extractRecalledProjects(metadataJson);
+                if (!projects.has(projectScope)) {
+                    projects.add(projectScope);
+                    // METADATA_MERGE_FIX (1.3.5): this previously REPLACED
+                    // metadataJson with `{ recalledProjects: [...] }`, silently
+                    // dropping source / isPotentialDuplicate / graphEntities /
+                    // pinned on the first recall of every global memory. In the
+                    // default scoping:"global" mode that hit every memory, which
+                    // broke pruneScope (duplicate-flag based) and retention
+                    // (pinned protections). Merge into the existing blob instead.
+                    const baseMeta = parseMetadata(metadataJson);
+                    if (projects.size > 100) {
+                        const arr = Array.from(projects);
+                        arr.splice(0, arr.length - 100);
+                        baseMeta.recalledProjects = arr;
+                    }
+                    else {
+                        baseMeta.recalledProjects = Array.from(projects);
+                    }
+                    metadataJson = JSON.stringify(baseMeta);
+                    newProjectCount = projects.size;
                 }
-                else {
-                    baseMeta.recalledProjects = Array.from(projects);
-                }
-                metadataJson = JSON.stringify(baseMeta);
-                newProjectCount = projects.size;
             }
-        }
-        // ATOMIC_UPDATE_MEMORY_USAGE: previously this used table.delete() followed
-        // by table.add() to simulate an update. Those are two separate non-atomic
-        // ops against LanceDB's versioned/fragment storage, with no compaction
-        // (table.optimize()) ever called afterward. Because updateMemoryUsage runs
-        // on every recall (i.e. every chat turn), concurrent/rapid calls could
-        // leave stale+new physical rows for the same id both scannable at once —
-        // confirmed in practice: 4 memory ids each had 2 physical row copies after
-        // normal recall traffic, none of which memory_consolidate could clean up
-        // (that only merges near-duplicate CONTENT across different ids, not
-        // literal same-id row duplication). table.update() is a single atomic op
-        // (predicate + column values), so use that instead of delete+add.
-        await this.requireTable().update({
-            where: `id = '${escapeSql(match.id)}'`,
-            values: {
-                lastRecalled: now,
-                recallCount: newRecallCount,
-                projectCount: newProjectCount ?? null,
-                metadataJson: metadataJson ?? null,
-            },
+            // ATOMIC_UPDATE_MEMORY_USAGE: previously this used table.delete() followed
+            // by table.add() to simulate an update. Those are two separate non-atomic
+            // ops against LanceDB's versioned/fragment storage, with no compaction
+            // (table.optimize()) ever called afterward. Because updateMemoryUsage runs
+            // on every recall (i.e. every chat turn), concurrent/rapid calls could
+            // leave stale+new physical rows for the same id both scannable at once —
+            // confirmed in practice: 4 memory ids each had 2 physical row copies after
+            // normal recall traffic, none of which memory_consolidate could clean up
+            // (that only merges near-duplicate CONTENT across different ids, not
+            // literal same-id row duplication). table.update() is a single atomic op
+            // (predicate + column values), so use that instead of delete+add.
+            await this.requireTable().update({
+                where: `id = '${escapeSql(match.id)}'`,
+                values: {
+                    lastRecalled: now,
+                    recallCount: newRecallCount,
+                    projectCount: newProjectCount ?? null,
+                    metadataJson: metadataJson ?? null,
+                },
+            });
+            this.invalidateScope(match.scope);
         });
-        this.invalidateScope(match.scope);
     }
     async getCitation(id, scopes) {
         const rows = await this.readByScopes(scopes);
@@ -2014,22 +2031,52 @@ export class MemoryStore {
      * Centralizes the read-parse-push-write pattern across all add*Episode
      * methods. ATOMIC_UPDATE (1.1.7): write is a single table.update (one
      * commit) instead of read → delete → add (two commits).
+     * EPISODE_WRITE_LOCK: the read-modify-write is not atomic across awaits —
+     * two overlapping hook invocations (e.g. parallel bash tool calls in one
+     * turn both firing tool.execute.after) both read the same baseline and the
+     * second write erases the first's append (verified: 19/20 lost updates
+     * under concurrent calls). Serialized per (scope, taskId) with a
+     * promise-chain mutex; in-process locking suffices because every write for
+     * one episode row flows through this single MemoryStore instance.
+     * KEYED_WRITE_LOCK (generic form, shared with updateMemoryUsage): caller
+     * supplies the lock key; the chain tail is retained so late arrivals queue
+     * behind in-flight jobs and self-clean once they are the last entry.
      */
+    keyedWriteLocks = new Map();
+    async withKeyLock(key, fn) {
+        const prev = this.keyedWriteLocks.get(key) ?? Promise.resolve();
+        const job = prev.then(fn);
+        const tail = job.catch(() => { });
+        this.keyedWriteLocks.set(key, tail);
+        try {
+            return await job;
+        }
+        finally {
+            if (this.keyedWriteLocks.get(key) === tail) {
+                this.keyedWriteLocks.delete(key);
+            }
+        }
+    }
+    async withEpisodeLock(taskId, scope, fn) {
+        return this.withKeyLock(`episode\u0000${scope}\u0000${taskId}`, fn);
+    }
     async appendToEpisodeField(taskId, scope, fieldName, parser, serializer, newItem, itemEnricher) {
-        await this.ensureEpisodicTaskTable(384);
-        const table = this.requireEpisodicTaskTable();
-        const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
-        if (rows.length === 0)
-            return false;
-        const existing = validateEpisodicRecord(rows[0]);
-        const items = parser(existing[fieldName] || "[]");
-        const enrichedItem = itemEnricher ? itemEnricher(newItem) : newItem;
-        items.push(enrichedItem);
-        await table.update({
-            where: `id = '${escapeSql(existing.id)}'`,
-            values: { [fieldName]: serializer(items) },
+        return this.withEpisodeLock(taskId, scope, async () => {
+            await this.ensureEpisodicTaskTable(384);
+            const table = this.requireEpisodicTaskTable();
+            const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
+            if (rows.length === 0)
+                return false;
+            const existing = validateEpisodicRecord(rows[0]);
+            const items = parser(existing[fieldName] || "[]");
+            const enrichedItem = itemEnricher ? itemEnricher(newItem) : newItem;
+            items.push(enrichedItem);
+            await table.update({
+                where: `id = '${escapeSql(existing.id)}'`,
+                values: { [fieldName]: serializer(items) },
+            });
+            return true;
         });
-        return true;
     }
     async addCommandToEpisode(taskId, scope, command) {
         return this.appendToEpisodeField(taskId, scope, "commandsJson", (raw) => (raw ? JSON.parse(raw) : []), (items) => JSON.stringify(items), command);
@@ -2038,19 +2085,22 @@ export class MemoryStore {
         return this.appendToEpisodeField(taskId, scope, "validationOutcomesJson", (raw) => (raw ? JSON.parse(raw) : []), (items) => JSON.stringify(items), outcome);
     }
     async addSuccessPatterns(taskId, scope, patterns) {
-        await this.ensureEpisodicTaskTable(384);
-        const table = this.requireEpisodicTaskTable();
-        const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
-        if (rows.length === 0)
-            return false;
-        const existing = rows[0];
-        const existingPatterns = existing.successPatternsJson ? JSON.parse(existing.successPatternsJson) : [];
-        const allPatterns = [...existingPatterns, ...patterns];
-        await table.update({
-            where: `id = '${escapeSql(existing.id)}'`,
-            values: { successPatternsJson: JSON.stringify(allPatterns) },
+        // EPISODE_WRITE_LOCK: same read-modify-write race as appendToEpisodeField.
+        return this.withEpisodeLock(taskId, scope, async () => {
+            await this.ensureEpisodicTaskTable(384);
+            const table = this.requireEpisodicTaskTable();
+            const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
+            if (rows.length === 0)
+                return false;
+            const existing = rows[0];
+            const existingPatterns = existing.successPatternsJson ? JSON.parse(existing.successPatternsJson) : [];
+            const allPatterns = [...existingPatterns, ...patterns];
+            await table.update({
+                where: `id = '${escapeSql(existing.id)}'`,
+                values: { successPatternsJson: JSON.stringify(allPatterns) },
+            });
+            return true;
         });
-        return true;
     }
     async findSimilarTasks(scope, taskDescription, minSimilarity = 0.85, queryVector) {
         await this.ensureEpisodicTaskTable(384);
@@ -2127,23 +2177,26 @@ export class MemoryStore {
         // Compute the 1-based attempt number from the existing array so the
         // retry-budget median is over real values. Also the only live writer
         // (tool.execute.after validation failures) now wired in index.js.
-        await this.ensureEpisodicTaskTable(384);
-        const table = this.requireEpisodicTaskTable();
-        const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
-        if (rows.length === 0)
-            return false;
-        const existing = rows[0];
-        const items = JSON.parse(existing.retryAttemptsJson || "[]");
-        items.push({
-            ...attempt,
-            attemptNumber: items.length + 1,
-            timestamp: Date.now(),
+        // EPISODE_WRITE_LOCK: same read-modify-write race as appendToEpisodeField.
+        return this.withEpisodeLock(taskId, scope, async () => {
+            await this.ensureEpisodicTaskTable(384);
+            const table = this.requireEpisodicTaskTable();
+            const rows = await table.query().where(`taskId = '${escapeSql(taskId)}' AND scope = '${escapeSql(scope)}'`).toArray();
+            if (rows.length === 0)
+                return false;
+            const existing = rows[0];
+            const items = JSON.parse(existing.retryAttemptsJson || "[]");
+            items.push({
+                ...attempt,
+                attemptNumber: items.length + 1,
+                timestamp: Date.now(),
+            });
+            await table.update({
+                where: `id = '${escapeSql(existing.id)}'`,
+                values: { retryAttemptsJson: JSON.stringify(items) },
+            });
+            return true;
         });
-        await table.update({
-            where: `id = '${escapeSql(existing.id)}'`,
-            values: { retryAttemptsJson: JSON.stringify(items) },
-        });
-        return true;
     }
     // EPISODE_RECALL_USED (1.3.5): stamps metadata.recallUsed on the session's
     // task episode so calculateMemoryLift can separate tasks that used recall
@@ -2223,7 +2276,7 @@ export class MemoryStore {
                 return failedTaskIds.some(fId => eId.includes(fId) || fId.includes(eId));
             });
             if (similarSuccess) {
-                const commands = similarSuccess.commandsJson;
+                const commands = JSON.parse(similarSuccess.commandsJson || "[]");
                 if (commands.length > 0) {
                     suggestions.push({
                         strategy: `Try: ${commands[0]}`,
@@ -2907,11 +2960,22 @@ function normalizeRow(row) {
         return null;
     }
     const tagsRaw = row.tags;
-    const parsedTags = typeof tagsRaw === "string" && tagsRaw.length > 0
-        ? JSON.parse(tagsRaw)
-        : Array.isArray(tagsRaw)
-            ? tagsRaw
-            : undefined;
+    // TAGS_PARSE_GUARD: tags is a STRING column, but a legacy/lossy write can
+    // leave a non-JSON string here ("a,b" via Array.prototype.toString).
+    // JSON.parse must never throw out of normalizeRow — that would take down
+    // every readByScopes-based read for the whole table. Fall back to undefined
+    // (same pattern as the citationChain parse below).
+    const parsedTags = (() => {
+        if (typeof tagsRaw === "string" && tagsRaw.length > 0) {
+            try {
+                return JSON.parse(tagsRaw);
+            }
+            catch {
+                return undefined;
+            }
+        }
+        return Array.isArray(tagsRaw) ? tagsRaw : undefined;
+    })();
     return {
         id: row.id,
         text: row.text,
@@ -2989,19 +3053,42 @@ function normalizeEventRow(row) {
         };
     }
     if (row.type === "feedback") {
-        const labelsJson = typeof row.labelsJson === "string" ? row.labelsJson : "[]";
-        const labels = JSON.parse(labelsJson);
         const helpfulValue = Number(row.helpful ?? -1);
+        // EVENT_JSON_PARSE_GUARD: labelsJson/context are STRING columns, but a
+        // legacy or lossy write can leave non-JSON text in them. JSON.parse
+        // must never throw out of normalizeEventRow — one bad feedback row
+        // would otherwise break readEventsByScopes and every event-derived
+        // tool (memory_effectiveness, memory_dashboard, listEvents). Same
+        // degrade-silently pattern as normalizeRow's TAGS_PARSE_GUARD.
+        const labels = (() => {
+            if (typeof row.labelsJson === "string" && row.labelsJson.length > 0) {
+                try {
+                    const parsed = JSON.parse(row.labelsJson);
+                    return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+                }
+                catch {
+                    return [];
+                }
+            }
+            return [];
+        })();
         const contextRaw = row.context;
         const parsedContext = typeof contextRaw === "string" && contextRaw.length > 0
-            ? JSON.parse(contextRaw)
+            ? (() => {
+                try {
+                    return JSON.parse(contextRaw);
+                }
+                catch {
+                    return undefined;
+                }
+            })()
             : undefined;
         return {
             ...base,
             type: "feedback",
             feedbackType: row.feedbackType === "missing" || row.feedbackType === "wrong" ? row.feedbackType : "useful",
             helpful: helpfulValue < 0 ? undefined : helpfulValue === 1,
-            labels: Array.isArray(labels) ? labels.filter((item) => typeof item === "string") : [],
+            labels,
             reason: typeof row.reason === "string" && row.reason.length > 0 ? row.reason : undefined,
             sourceSessionId: typeof row.sourceSessionId === "string" && row.sourceSessionId.length > 0 ? row.sourceSessionId : undefined,
             confidenceDelta: typeof row.confidenceDelta === "number" ? row.confidenceDelta : undefined,
