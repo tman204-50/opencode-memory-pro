@@ -40,6 +40,8 @@ export declare class MemoryStore {
         limit: number;
         vectorWeight: number;
         bm25Weight: number;
+        fuzzyWeight?: number;
+        fuzzyThreshold?: number;
         minScore: number;
         rrfK?: number;
         recencyBoost?: boolean;

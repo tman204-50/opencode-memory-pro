@@ -18,9 +18,14 @@ export function resolveMemoryConfig(config, worktree) {
     const dbPath = expandHomePath(firstString(process.env.OPENCODE_MEMORY_PRO_DB_PATH, raw.dbPath) ?? DEFAULT_DB_PATH);
     const vectorWeight = clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_VECTOR_WEIGHT ?? retrievalRaw.vectorWeight, 0.7), 0, 1);
     const bm25Weight = clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_BM25_WEIGHT ?? retrievalRaw.bm25Weight, 0.3), 0, 1);
-    const weightSum = vectorWeight + bm25Weight;
+    // FUZZY_CHANNEL (1.4.2): fuse.js fuzzy-match channel participates in the
+    // RRF merge alongside vector + BM25. Weight 0 disables it entirely.
+    const fuzzyWeight = clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_FUZZY_WEIGHT ?? retrievalRaw.fuzzyWeight, 0.15), 0, 1);
+    const fuzzyThreshold = clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_FUZZY_THRESHOLD ?? retrievalRaw.fuzzyThreshold, 0.5), 0, 1);
+    const weightSum = vectorWeight + bm25Weight + fuzzyWeight;
     const normalizedVectorWeight = weightSum > 0 ? vectorWeight / weightSum : 0.7;
     const normalizedBm25Weight = weightSum > 0 ? bm25Weight / weightSum : 0.3;
+    const normalizedFuzzyWeight = weightSum > 0 ? fuzzyWeight / weightSum : 0;
     const rrfK = Math.max(1, Math.floor(toNumber(process.env.OPENCODE_MEMORY_PRO_RRF_K ?? retrievalRaw.rrfK, 60)));
     const recencyBoost = toBoolean(process.env.OPENCODE_MEMORY_PRO_RECENCY_BOOST ?? retrievalRaw.recencyBoost, true);
     const recencyHalfLifeHours = Math.max(1, toNumber(process.env.OPENCODE_MEMORY_PRO_RECENCY_HALF_LIFE_HOURS ?? retrievalRaw.recencyHalfLifeHours, 72));
@@ -74,6 +79,8 @@ export function resolveMemoryConfig(config, worktree) {
             mode,
             vectorWeight: normalizedVectorWeight,
             bm25Weight: normalizedBm25Weight,
+            fuzzyWeight: normalizedFuzzyWeight,
+            fuzzyThreshold,
             minScore: clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_MIN_SCORE ?? retrievalRaw.minScore, 0.2), 0, 1),
             rrfK,
             recencyBoost,

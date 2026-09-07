@@ -126,6 +126,57 @@ test("integration: MemoryStore full lifecycle on real LanceDB", async () => {
     }
 });
 
+test("integration: fuzzy channel (fuse.js) surfaces typo-tolerant matches", async () => {
+    const store = await newStore("mem-fuzzy-");
+    const ids = ["fid-1", "fid-2"];
+    const texts = [
+        "the memory plugin stores long-term memories in lancedb with vector search",
+        "the build pipeline compiles go services and runs postgres for storage",
+    ];
+    try {
+        for (let i = 0; i < ids.length; i += 1) {
+            await store.put(makeRecord(ids[i], texts[i], { timestamp: Date.now() - (ids.length - i) * 60_000 }));
+        }
+
+        // Fuzzy-only isolation: typo must still surface the target.
+        const fuzzyOnly = await store.search(searchParams("lancedb vectr srch", [], { vectorWeight: 0, bm25Weight: 0, fuzzyWeight: 1, fuzzyThreshold: 0.5 }));
+        assert.ok(fuzzyOnly.some((r) => r.record.id === "fid-1"), "fuzzy-only typo search should surface fid-1");
+
+        // Gibberish with tight threshold yields nothing from the fuzzy channel.
+        const gibberish = await store.search(searchParams("zzqxwvbn kkk", [], { vectorWeight: 0, bm25Weight: 0, fuzzyWeight: 1, fuzzyThreshold: 0.5 }));
+        assert.equal(gibberish.length, 0, "gibberish must not surface unrelated records (threshold)");
+
+        // Regression: fuzzyWeight=0 keeps existing behavior identical.
+        const baseline = await store.search(searchParams("lancedb vector search", deterministicEmbed("lancedb vector search")));
+        const noFuzzy = await store.search(searchParams("lancedb vector search", deterministicEmbed("lancedb vector search"), { fuzzyWeight: 0 }));
+        assert.equal(noFuzzy[0].record.id, "fid-1", "fuzzy-off search ranks fid-1 first");
+        assert.ok(Math.abs(baseline[0].score - noFuzzy[0].score) < 1e-9, "fuzzyWeight=0 must not change scores");
+
+        // bm25-only fallback keeps fuzzy active (embedder down scenario).
+        const fallbackFuzzy = await store.search(searchParams("lancedb vectr srch", [], { vectorWeight: 0, bm25Weight: 1, fuzzyWeight: 0.15, fuzzyThreshold: 0.5 }));
+        assert.ok(fallbackFuzzy.some((r) => r.record.id === "fid-1"), "fallback bm25+fuzzy should surface typo'd fid-1");
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: fuzzy index rebuilds after cache invalidation", async () => {
+    const store = await newStore("mem-fuzzy-cache-");
+    try {
+        await store.put(makeRecord("fz-1", "the quick brown fox jumps over the lazy dog", { timestamp: Date.now() }));
+        const before = await store.search(searchParams("quik brwn fx", [], { vectorWeight: 0, bm25Weight: 0, fuzzyWeight: 1 }));
+        assert.ok(before.some((r) => r.record.id === "fz-1"), "existing record findable via fuzzy");
+
+        await store.put(makeRecord("fz-2", "the serendipitous migration of the otters", { timestamp: Date.now() }));
+        const after = await store.search(searchParams("serdipitous migrashun", [], { vectorWeight: 0, bm25Weight: 0, fuzzyWeight: 1 }));
+        assert.ok(after.some((r) => r.record.id === "fz-2"), "newly added record must be findable after cache invalidation");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: deleteByIdForce removes rows hidden by the status filter", async () => {
     const store = await newStore("mem-forget-force-");
     try {

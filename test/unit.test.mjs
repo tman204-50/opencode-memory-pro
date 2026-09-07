@@ -478,3 +478,14 @@ test("config: shipped example file is valid, resolves cleanly, and leaks no secr
     assert.ok(!/sk-or-v1|sk-[A-Za-z0-9]{16,}|api[_-]?key"\s*:\s*"[^"<]/.test(dumped), "example must not embed real secret material");
     assert.ok((raw._comment ?? "").length > 0, "example should carry inline guidance");
 });
+
+test("config: fuzzy channel defaults on (0.15) and renormalizes three channels", () => {
+    const cfg = resolveMemoryConfig({}, "/tmp");
+    const sum = cfg.retrieval.vectorWeight + cfg.retrieval.bm25Weight + cfg.retrieval.fuzzyWeight;
+    assert.ok(Math.abs(sum - 1) < 1e-9, `weights must sum to 1, got ${sum}`);
+    assert.ok(cfg.retrieval.fuzzyWeight > 0, "fuzzy channel should be on by default");
+    assert.equal(cfg.retrieval.fuzzyThreshold, 0.5);
+    const off = resolveMemoryConfig({ memory: { retrieval: { fuzzyWeight: 0 } } }, "/tmp");
+    assert.equal(off.retrieval.fuzzyWeight, 0, "fuzzyWeight 0 must fully disable the channel");
+    assert.ok(Math.abs((off.retrieval.vectorWeight + off.retrieval.bm25Weight) - 1) < 1e-9, "vector+bm25 renormalize when fuzzy is off");
+});

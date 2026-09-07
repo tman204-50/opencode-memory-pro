@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import Fuse from "fuse.js";
 import { validateEpisodicRecord, validateEpisodicRecordArray } from "./types.js";
 import { tokenize } from "./utils.js";
 import { log, logFileOnly } from "./logger.js";
@@ -588,13 +589,21 @@ export class MemoryStore {
         const queryNorm = vecNorm(params.queryVector);
         const useVectorChannel = params.queryVector.length > 0 && params.vectorWeight > 0;
         const useBm25Channel = queryTokens.length > 0 && params.bm25Weight > 0;
-        const { vectorWeight, bm25Weight } = normalizeChannelWeights(useVectorChannel ? params.vectorWeight : 0, useBm25Channel ? params.bm25Weight : 0);
+        // FUZZY_CHANNEL (1.4.2): fuse.js typo-tolerant channel. On by default
+        // (weight 0.15) unless the caller passes fuzzyWeight 0.
+        const fuzzyWeight = Math.max(0, Number(params.fuzzyWeight) || 0);
+        const useFuzzyChannel = params.query.trim().length > 0 && fuzzyWeight > 0;
+        const fuzzyThreshold = params.fuzzyThreshold !== undefined ? Math.max(0, Math.min(1, params.fuzzyThreshold)) : 0.5;
+        const { vectorWeight, bm25Weight, fuzzyWeight: normalizedFuzzyWeight } = normalizeChannelWeights(useVectorChannel ? params.vectorWeight : 0, useBm25Channel ? params.bm25Weight : 0, useFuzzyChannel ? fuzzyWeight : 0);
         const rrfK = Math.max(1, Math.floor(params.rrfK ?? 60));
         const recencyBoostEnabled = params.recencyBoost ?? true;
         const recencyHalfLifeHours = Math.max(1, params.recencyHalfLifeHours ?? 72);
         const importanceWeight = clampImportanceWeight(params.importanceWeight ?? 0.4);
         const feedbackWeight = Math.max(0, Math.min(1, params.feedbackWeight ?? 0));
         const globalDiscountFactor = params.globalDiscountFactor ?? 1.0;
+        const fuzzyResults = useFuzzyChannel ? this.getFuzzyIndex(cached, params.scopes, fuzzyThreshold).search(params.query.trim(), { limit: Math.max(50, params.limit * 4) }) : [];
+        const fuzzyRanks = useFuzzyChannel ? buildRankMap(fuzzyResults.map((r) => ({ record: r.item, fuzzyScore: 1 - (r.score ?? 1) })), (item) => item.fuzzyScore) : null;
+        const fuzzyScoreMap = new Map(fuzzyResults.map((r) => [r.item.id, 1 - (r.score ?? 1)]));
         const candidates = cached.records
             .filter((record) => params.queryVector.length === 0 || record.vector.length === params.queryVector.length)
             .map((record, index) => {
@@ -602,7 +611,7 @@ export class MemoryStore {
             const vectorScore = useVectorChannel ? fastCosine(params.queryVector, record.vector, queryNorm, recordNorm) : 0;
             const bm25Score = useBm25Channel ? bm25LikeScore(queryTokens, cached.tokenized[index], cached.idf) : 0;
             const isGlobal = record.scope === "global";
-            return { record, vectorScore, bm25Score, isGlobal };
+            return { record, vectorScore, bm25Score, fuzzyScore: fuzzyScoreMap.get(record.id) ?? 0, isGlobal };
         });
         if (candidates.length === 0)
             return [];
@@ -624,6 +633,14 @@ export class MemoryStore {
                 if (rank !== undefined)
                     rrfScore += bm25Weight / (rrfK + rank);
             }
+            // FUZZY_CHANNEL (1.4.2): only records that appear in the fuzzy
+            // top-N contribute a rank; the rest get nothing (same semantics
+            // as the other channels).
+            if (fuzzyRanks) {
+                const rank = fuzzyRanks.get(item.record.id);
+                if (rank !== undefined)
+                    rrfScore += normalizedFuzzyWeight / (rrfK + rank);
+            }
             rrfScore *= rrfK + 1;
             const recencyFactor = recencyBoostEnabled
                 ? computeRecencyMultiplier(item.record.timestamp, recencyHalfLifeHours)
@@ -640,6 +657,7 @@ export class MemoryStore {
                 score,
                 vectorScore: item.vectorScore,
                 bm25Score: item.bm25Score,
+                fuzzyScore: item.fuzzyScore,
             };
         })
             .filter((item) => item.score >= params.minScore)
@@ -1802,7 +1820,34 @@ export class MemoryStore {
         const idf = scopes.length === 1 && this.scopeCache.has(scopes[0])
             ? this.scopeCache.get(scopes[0]).idf
             : computeIdf(allTokenized);
-        return { records: allRecords, tokenized: allTokenized, idf, norms: allNorms, lastAccessTimestamp: Date.now() };
+        const cached = { records: allRecords, tokenized: allTokenized, idf, norms: allNorms, lastAccessTimestamp: Date.now() };
+        // FUZZY_CHANNEL (1.4.2): reuse the per-scope entry index when the
+        // request is single-scope (the common path); multi-scope requests
+        // build a merged index on each call. Threshold changes rebuild.
+        if (scopes.length === 1 && this.scopeCache.has(scopes[0])) {
+            const entry = this.scopeCache.get(scopes[0]);
+            if (entry?.fuse) {
+                cached.fuse = entry.fuse;
+            }
+        }
+        return cached;
+    }
+    // FUZZY_CHANNEL (1.4.2): lazily build (and cache) the fuse.js index over
+    // the records a search is about to score. Built once per scope-cache
+    // entry and reused across searches; rebuilt when the threshold changes or
+    // the cache entry is invalidated (the entry itself is replaced on
+    // invalidation, so this never serves stale text).
+    getFuzzyIndex(cached, scopes, threshold) {
+        if (cached.fuse && cached.fuse.threshold === threshold) {
+            return cached.fuse;
+        }
+        const fuse = buildFuseIndex(cached.records, threshold);
+        fuse.threshold = threshold;
+        cached.fuse = fuse;
+        if (scopes.length === 1 && this.scopeCache.has(scopes[0])) {
+            this.scopeCache.get(scopes[0]).fuse = fuse;
+        }
+        return fuse;
     }
     enforceMaxScopes() {
         while (this.scopeCache.size > this.cacheConfig.maxScopes) {
@@ -2952,14 +2997,27 @@ function buildRankMap(items, scoreOf) {
     }
     return ranks;
 }
-function normalizeChannelWeights(vectorWeight, bm25Weight) {
-    const sum = vectorWeight + bm25Weight;
+// FUZZY_CHANNEL (1.4.2): fuse.js index over memory text. ignoreLocation
+// keeps substring matches relevant, ignoreDiacritics tolerates accents, and
+// threshold (default 0.5) drops results whose match score is too weak.
+function buildFuseIndex(records, threshold = 0.5) {
+    return new Fuse(records, {
+        keys: ["text"],
+        includeScore: true,
+        ignoreLocation: true,
+        ignoreDiacritics: true,
+        threshold,
+    });
+}
+function normalizeChannelWeights(vectorWeight, bm25Weight, fuzzyWeight = 0) {
+    const sum = vectorWeight + bm25Weight + fuzzyWeight;
     if (sum <= 0) {
-        return { vectorWeight: 0.5, bm25Weight: 0.5 };
+        return { vectorWeight: 0.5, bm25Weight: 0.5, fuzzyWeight: 0 };
     }
     return {
         vectorWeight: vectorWeight / sum,
         bm25Weight: bm25Weight / sum,
+        fuzzyWeight: fuzzyWeight / sum,
     };
 }
 function computeRecencyMultiplier(timestamp, halfLifeHours) {

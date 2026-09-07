@@ -89,6 +89,10 @@ export function createMemoryTools(state) {
                 const isFallback = embedderFailed || queryVector.length === 0;
                 const effectiveVectorWeight = isFallback ? 0 : (state.config.retrieval.mode === "vector" ? 1 : state.config.retrieval.vectorWeight);
                 const effectiveBm25Weight = isFallback ? 1 : (state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.bm25Weight);
+                // FUZZY_CHANNEL (1.4.2): fuzzy stays on in the bm25-only
+                // fallback (that's when typo tolerance helps most); it is
+                // disabled only in explicit vector-only mode.
+                const effectiveFuzzyWeight = state.config.retrieval.mode === "vector" ? 0 : state.config.retrieval.fuzzyWeight;
                 if (isFallback) {
                     log("info", "Using BM25-only search (embedder unavailable)");
                 }
@@ -99,6 +103,8 @@ export function createMemoryTools(state) {
                     limit: args.limit ?? 5,
                     vectorWeight: effectiveVectorWeight,
                     bm25Weight: effectiveBm25Weight,
+                    fuzzyWeight: effectiveFuzzyWeight,
+                    fuzzyThreshold: state.config.retrieval.fuzzyThreshold,
                     minScore: state.config.retrieval.minScore,
                     rrfK: state.config.retrieval.rrfK,
                     recencyBoost: state.config.retrieval.recencyBoost,
@@ -306,6 +312,11 @@ export function createMemoryTools(state) {
                     recentCount: entries.length,
                     incompatibleVectors,
                     index: health,
+                    fuzzy: {
+                        enabled: (state.config.retrieval.fuzzyWeight ?? 0) > 0,
+                        weight: state.config.retrieval.fuzzyWeight ?? 0,
+                        threshold: state.config.retrieval.fuzzyThreshold ?? 0.5,
+                    },
                     embeddingModel: state.config.embedding.model,
                     searchMode,
                     embedderHealth,
@@ -787,6 +798,7 @@ ${explanations.join("\n")}`;
                         limit: args.limit ?? 20,
                         vectorWeight: 0.7,
                         bm25Weight: 0.3,
+                        fuzzyWeight: 0,
                         minScore: 0.2,
                         globalDiscountFactor: 1.0,
                     }).then((results) => results.map((r) => r.record));

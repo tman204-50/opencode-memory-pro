@@ -175,9 +175,11 @@ index and capture still works — the plugin is offline-tolerant by design.
 
 | Key | Default | Description |
 |---|---|---|
-| `retrieval.mode` | `"hybrid"` | `"hybrid"` (vector+BM25 RRF) or `"vector"`. |
-| `retrieval.vectorWeight` | `0.7` | Vector/BM25 ratio before normalization. |
+| `retrieval.mode` | `"hybrid"` | `"hybrid"` (vector+BM25+fuzzy RRF) or `"vector"`. |
+| `retrieval.vectorWeight` | `0.7` | Vector/BM25/fuzzy ratio before normalization. |
 | `retrieval.bm25Weight` | `0.3` | (Weights are normalized to sum 1.) |
+| `retrieval.fuzzyWeight` | `0.15` | fuse.js typo-tolerant fuzzy channel weight; `0` disables it. |
+| `retrieval.fuzzyThreshold` | `0.5` | fuse.js match threshold (lower = stricter). |
 | `retrieval.minScore` | `0.2` | Minimum score for a result to qualify. |
 | `retrieval.rrfK` | `60` | RRF constant. |
 | `retrieval.recencyBoost` | `true` | Boost recently recalled/created memories. |
@@ -186,8 +188,33 @@ index and capture still works — the plugin is offline-tolerant by design.
 | `retrieval.feedbackWeight` | `0.3` | Weight of feedback history in scoring (0–1). |
 
 Env: `OPENCODE_MEMORY_PRO_RETRIEVAL_MODE`, `..._VECTOR_WEIGHT`,
-`..._BM25_WEIGHT`, `..._MIN_SCORE`, `..._RRF_K`, `..._RECENCY_BOOST`,
+`..._BM25_WEIGHT`, `..._FUZZY_WEIGHT`, `..._FUZZY_THRESHOLD`, `..._MIN_SCORE`,
+`..._RRF_K`, `..._RECENCY_BOOST`,
 `..._RECENCY_HALF_LIFE_HOURS`, `..._IMPORTANCE_WEIGHT`, `..._FEEDBACK_WEIGHT`.
+
+## Changelog
+
+### v1.4.2 (2026-09-06)
+
+New **fuzzy search channel** — fuse.js joins the RRF merge as a third
+retrieval channel alongside vector and BM25, giving typo-tolerant matching
+out of the box:
+
+- **Typo tolerance**: `memory_search "lancedb vectr srch"` now surfaces the
+  right memory even when vector and BM25 both miss — useful for queries with
+  misspellings, partial words, or accented text (`ignoreDiacritics`).
+- **Zero-config**: `retrieval.fuzzyWeight` defaults to `0.15` (renormalized
+  with vector/BM25); set it to `0` to restore pre-1.4.2 scores exactly.
+- **Channel semantics**: records that don't appear in the fuzzy top-N
+  contribute no RRF rank, same as the other channels; `fuzzyThreshold`
+  (default `0.5`) drops weak matches.
+- **Fallback-aware**: the fuzzy channel stays active in the BM25-only
+  fallback (embedder unavailable) — that's exactly when typo tolerance helps
+  most — and is disabled only in explicit `retrieval.mode = "vector"`.
+- **Index lifecycle**: fuse.js index is built lazily over the scope cache,
+  reused across single-scope searches, and rebuilt automatically on cache
+  invalidation or threshold change.
+- `memory_stats` now reports the fuzzy channel (`enabled`/`weight`/`threshold`).
 
 ### Injection
 

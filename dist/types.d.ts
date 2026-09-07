@@ -54,6 +54,8 @@ export interface RetrievalConfig {
     mode: RetrievalMode;
     vectorWeight: number;
     bm25Weight: number;
+    fuzzyWeight: number;
+    fuzzyThreshold: number;
     minScore: number;
     rrfK: number;
     recencyBoost: boolean;
@@ -197,6 +199,7 @@ export interface SearchResult {
     score: number;
     vectorScore: number;
     bm25Score: number;
+    fuzzyScore: number;
 }
 export interface CaptureCandidate {
     text: string;
