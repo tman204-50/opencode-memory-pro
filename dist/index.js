@@ -4,7 +4,7 @@ import { extractCaptureCandidate } from "./extract.js";
 import { extractPreferenceSignals, aggregatePreferences, resolveConflicts, buildPreferenceInjection } from "./preference.js";
 import { buildScopeFilter, deriveProjectScope, setScopingConfigSource } from "./scope.js";
 import { MemoryStore } from "./store.js";
-import { generateId, classifyFailure } from "./utils.js";
+import { generateId, classifyFailure, parseJsonObject } from "./utils.js";
 import { initLogger, configureLogger, log } from "./logger.js";
 import { calculateInjectionLimit, createSummarizationConfig, summarizeContent, truncateText } from "./summarize.js";
 import { requestLLMCapture, isOwnSession } from "./llm.js";
@@ -12,8 +12,34 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.5.2";
+const PLUGIN_VERSION = "1.5.3";
 const SCHEMA_VERSION = 1;
+// CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
+// on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
+// session whose flush keeps failing must not accumulate text forever), and
+// the map keeps only the most recent MAX_SESSIONS — a session.deleted flush
+// that runs while init is still deferred intentionally retains its entry for
+// retry (CAPTURE_RETRY_ON_DEFERRED), so without the cap abandoned sessions
+// would leak entries for the whole process lifetime. Exported as a test seam
+// (same pattern as flushAutoCapture/handleSessionIdle).
+const CAPTURE_BUFFER_MAX_FRAGMENTS = 200;
+const CAPTURE_BUFFER_MAX_SESSIONS = 200;
+export function appendCaptureFragment(state, sessionID, text) {
+    let list = state.captureBuffer.get(sessionID);
+    if (list === undefined) {
+        if (state.captureBuffer.size >= CAPTURE_BUFFER_MAX_SESSIONS) {
+            const oldest = state.captureBuffer.keys().next().value;
+            if (oldest !== undefined)
+                state.captureBuffer.delete(oldest);
+        }
+        list = [];
+    }
+    list.push(text);
+    if (list.length > CAPTURE_BUFFER_MAX_FRAGMENTS) {
+        list = list.slice(-CAPTURE_BUFFER_MAX_FRAGMENTS);
+    }
+    state.captureBuffer.set(sessionID, list);
+}
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
 // and on session.deleted (force=true, bypasses cooldown — final cleanup).
@@ -256,9 +282,7 @@ const plugin = async (input) => {
         "experimental.text.complete": async (eventInput, eventOutput) => {
             if (isOwnSession(eventInput.sessionID))
                 return;
-            const list = state.captureBuffer.get(eventInput.sessionID) ?? [];
-            list.push(eventOutput.text);
-            state.captureBuffer.set(eventInput.sessionID, list);
+            appendCaptureFragment(state, eventInput.sessionID, eventOutput.text);
         },
         // Wires the episodic learning store (addCommandToEpisode/
         // addValidationOutcome) to real tool executions. Previously these
@@ -316,14 +340,19 @@ const plugin = async (input) => {
             await state.ensureInitialized();
             if (!state.initialized)
                 return;
-            const query = await getLastUserText(eventInput.sessionID, input.client);
+            // MESSAGES_FETCH_ONCE (1.5.3): getLastUserText and the task-type
+            // detection inside runRecallPipeline each called
+            // client.session.messages — two identical SDK round-trips per
+            // recall turn. Fetch once here and hand the messages down.
+            const messages = await fetchSessionMessages(eventInput.sessionID, input.client);
+            const query = lastUserTextFromMessages(messages);
             if (!query)
                 return;
             // TIMING_SPANS (1.4.7): the recall pipeline is extracted into a named
             // function (test seam, mirrors handleSessionIdle) so the timing span
             // covers the whole turn: scope resolution, messages fetch, embed,
             // hybrid search, graph boost/expansion, and injection assembly.
-            await runRecallPipeline(eventInput, eventOutput, state, input, query);
+            await runRecallPipeline(eventInput, eventOutput, state, input, query, messages);
         },
         tool: {
             ...createMemoryTools(state),
@@ -450,7 +479,7 @@ export async function initializeStore(state) {
 }
 // TIMING_SPANS (1.4.7): full recall turn, measured end to end. The stop() in
 // the finally also fires on early throws, so degraded paths still report time.
-async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
+async function runRecallPipeline(eventInput, eventOutput, state, input, query, prefetchedMessages) {
     const stop = startSpan("recall.pipeline");
     try {
                 // Resolve the session's actual directory rather than the static
@@ -463,16 +492,23 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
                 // actual directory.
                 const activeScope = await resolveSessionScope(eventInput.sessionID, input.client, deriveProjectScope(input.worktree));
                 const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
+                // MESSAGES_FETCH_ONCE (1.5.3): the system.transform hook fetches
+                // once and passes the array down; standalone callers (tests) can
+                // omit it and the fetch falls back here.
                 let messages = [];
-                try {
-                    const rawMessages = await input.client.session.messages({ path: { id: eventInput.sessionID } });
-                    const unwrapped = rawMessages.data;
-                    if (Array.isArray(unwrapped)) {
-                        messages = unwrapped;
+                if (prefetchedMessages === undefined) {
+                    try {
+                        const unwrapped = unwrapData(await input.client.session.messages({ path: { id: eventInput.sessionID } }));
+                        if (Array.isArray(unwrapped)) {
+                            messages = unwrapped;
+                        }
+                    }
+                    catch {
+                        messages = [];
                     }
                 }
-                catch {
-                    messages = [];
+                else {
+                    messages = prefetchedMessages;
                 }
                 const taskType = detectTaskType(messages);
                 const profile = state.config.injection.taskTypeProfiles[taskType] ?? state.config.injection.taskTypeProfiles.general;
@@ -696,8 +732,8 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
                     const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.85);
                     if (similarTasks.length > 0) {
                         const taskContext = similarTasks.slice(0, 2).map((ep) => {
-                            const commands = JSON.parse(ep.commandsJson || "[]");
-                            const outcomes = JSON.parse(ep.validationOutcomesJson || "[]");
+                            const commands = parseJsonObject(ep.commandsJson, []);
+                            const outcomes = parseJsonObject(ep.validationOutcomesJson, []);
                             const passed = outcomes.filter((o) => o.status === "pass").length;
                             const total = outcomes.length;
                             return `Similar task: ${ep.taskId} (${ep.state}) - Commands: ${commands.slice(0, 3).join(" → ")} - Validations: ${passed}/${total} passed`;
@@ -715,26 +751,30 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
     }
 }
 
-async function getLastUserText(sessionID, client) {
+// MESSAGES_FETCH_ONCE (1.5.3): split the old getLastUserText into a fetch
+// (fetchSessionMessages) and a pure extraction (lastUserTextFromMessages) so
+// the system.transform hook can fetch once and reuse the same array for both
+// the query text and runRecallPipeline's task-type detection.
+async function fetchSessionMessages(sessionID, client) {
     try {
-        const response = await client.session.messages({ path: { id: sessionID } });
-        const payload = unwrapData(response);
-        if (!Array.isArray(payload))
-            return "";
-        for (let i = payload.length - 1; i >= 0; i -= 1) {
-            const item = payload[i];
-            if (item.info?.role !== "user" || !Array.isArray(item.parts))
-                continue;
-            const textParts = item.parts.filter((part) => part.type === "text" && typeof part.text === "string");
-            const text = textParts.map((part) => part.text).join("\n").trim();
-            if (text.length > 0)
-                return text;
-        }
-        return "";
+        const payload = unwrapData(await client.session.messages({ path: { id: sessionID } }));
+        return Array.isArray(payload) ? payload : [];
     }
     catch {
-        return "";
+        return [];
     }
+}
+function lastUserTextFromMessages(payload) {
+    for (let i = payload.length - 1; i >= 0; i -= 1) {
+        const item = payload[i];
+        if (item.info?.role !== "user" || !Array.isArray(item.parts))
+            continue;
+        const textParts = item.parts.filter((part) => part.type === "text" && typeof part.text === "string");
+        const text = textParts.map((part) => part.text).join("\n").trim();
+        if (text.length > 0)
+            return text;
+    }
+    return "";
 }
 async function flushAutoCapture(sessionID, state, client) {
     // TIMING_SPANS (1.4.7): capture flush (LLM or heuristics + store writes)
@@ -1167,7 +1207,7 @@ async function persistSuccessPatterns(taskId, scope, state) {
     if (patterns.length === 0)
         return;
     const episode = await state.store.getTaskEpisode(taskId, scope);
-    const existingSignatures = new Set((episode ? JSON.parse(episode.successPatternsJson || "[]") : [])
+    const existingSignatures = new Set((episode ? parseJsonObject(episode.successPatternsJson, []) : [])
         .map((p) => p.commands.join("|")));
     const newPatterns = patterns
         .map((p) => p.pattern)
@@ -1189,4 +1229,4 @@ function hasEmbeddingConfigChanged(current, next) {
 export default plugin;
 // CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
 // opencode plugin loading consumes the default export and ignores these.
-export { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline };
+export { fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline };

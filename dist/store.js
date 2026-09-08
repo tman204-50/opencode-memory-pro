@@ -2,7 +2,7 @@ import { mkdir, open, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import Fuse from "fuse.js";
 import { validateEpisodicRecord, validateEpisodicRecordArray } from "./types.js";
-import { tokenize } from "./utils.js";
+import { tokenize, parseJsonObject } from "./utils.js";
 import { log, logFileOnly } from "./logger.js";
 import { startSpan } from "./timing.js";
 const TABLE_NAME = "memories";
@@ -763,7 +763,7 @@ export class MemoryStore {
         const importanceWeight = clampImportanceWeight(params.importanceWeight ?? 0.4);
         const feedbackWeight = Math.max(0, Math.min(1, params.feedbackWeight ?? 0));
         const globalDiscountFactor = params.globalDiscountFactor ?? 1.0;
-        const fuzzyResults = useFuzzyChannel ? this.getFuzzyIndex(cached, params.scopes, fuzzyThreshold).search(params.query.trim(), { limit: Math.max(50, params.limit * 4) }) : [];
+        const fuzzyResults = useFuzzyChannel ? this.getFuzzyIndex(cached, params.scopes, fuzzyThreshold).search(params.query.trim(), { limit: Math.max(50, (Number(params.limit) || 50) * 4) }) : [];
         const fuzzyRanks = useFuzzyChannel ? buildRankMap(fuzzyResults.map((r) => ({ record: r.item, fuzzyScore: 1 - (r.score ?? 1) })), (item) => item.fuzzyScore) : null;
         const fuzzyScoreMap = new Map(fuzzyResults.map((r) => [r.item.id, 1 - (r.score ?? 1)]));
         // BM25_INDEX_ALIGN (1.4.5): cached.tokenized is aligned with the
@@ -776,7 +776,7 @@ export class MemoryStore {
             .filter(({ record }) => params.queryVector.length === 0 || record.vector.length === params.queryVector.length)
             .map(({ record, index }) => {
             const recordNorm = cached.norms.get(record.id) ?? vecNorm(record.vector);
-            const vectorScore = useVectorChannel ? fastCosine(params.queryVector, record.vector, queryNorm, recordNorm) : 0;
+            const vectorScore = useVectorChannel ? storeFastCosine(params.queryVector, record.vector, queryNorm, recordNorm) : 0;
             const bm25Score = useBm25Channel ? bm25LikeScore(queryTokens, cached.tokenized[index], cached.idf) : 0;
             const isGlobal = record.scope === "global";
             return { record, vectorScore, bm25Score, fuzzyScore: fuzzyScoreMap.get(record.id) ?? 0, isGlobal };
@@ -959,9 +959,9 @@ export class MemoryStore {
         }
     }
     async _pruneScope(scope, maxEntries) {
-        const rows = await this.list(scope, 100000);
-        if (rows.length === 100000) {
-            log("warn", `[store] pruneScope scanned up to the 100000-row cap for scope=${scope}; entries older than the newest 100k are not candidates for pruning`);
+        const rows = await this.list(scope, SCAN_LIMIT);
+        if (rows.length === SCAN_LIMIT) {
+            log("warn", `[store] pruneScope scanned up to the ${SCAN_LIMIT}-row cap for scope=${scope}; entries older than the newest ${SCAN_LIMIT} rows are not candidates for pruning`);
         }
         if (rows.length <= maxEntries)
             return 0;
@@ -1042,6 +1042,10 @@ export class MemoryStore {
         // stays below the consolidate threshold get the flag cleared; rows
         // that DO have a near-duplicate keep it.
         const metaById = new Map(rowsWithNorms.map(({ row }) => [row.id, parseMetadata(row.metadataJson)]));
+        // COSMETICS (1.5.3): consolidate used rowsWithNorms.find() per ANN
+        // candidate (O(n) per candidate, O(n²) per chunk); the id → row map
+        // below makes candidate lookups O(1).
+        const rowById = new Map(rowsWithNorms.map((entry) => [entry.row.id, entry]));
         const flaggedIds = new Set([...metaById].filter(([, meta]) => meta.isPotentialDuplicate === true).map(([id]) => id));
         const bestSimByFlagged = new Map();
         const mergedIds = new Set();
@@ -1081,7 +1085,7 @@ export class MemoryStore {
                                 continue;
                             if (mergedIds.has(candidate.id))
                                 continue;
-                            const b = rowsWithNorms.find((r) => r.row.id === candidate.id);
+                            const b = rowById.get(candidate.id);
                             if (!b)
                                 continue;
                             if (mergedIds.has(b.row.id))
@@ -2058,7 +2062,7 @@ export class MemoryStore {
     // the caller's current scope.
     async listDistinctScopes() {
         const table = this.requireTable();
-        const rows = await table.query().select(["scope"]).limit(200000).toArray();
+        const rows = await table.query().select(["scope"]).limit(SCAN_LIMIT).toArray();
         return [...new Set(rows.map((row) => String(row.scope ?? "")).filter((scope) => scope.length > 0))];
     }
     invalidateScope(scope) {
@@ -2369,10 +2373,10 @@ export class MemoryStore {
         });
     }
     async addCommandToEpisode(taskId, scope, command) {
-        return this.appendToEpisodeField(taskId, scope, "commandsJson", (raw) => (raw ? JSON.parse(raw) : []), (items) => JSON.stringify(items), command);
+        return this.appendToEpisodeField(taskId, scope, "commandsJson", (raw) => parseJsonObject(raw, []), (items) => JSON.stringify(items), command);
     }
     async addValidationOutcome(taskId, scope, outcome) {
-        return this.appendToEpisodeField(taskId, scope, "validationOutcomesJson", (raw) => (raw ? JSON.parse(raw) : []), (items) => JSON.stringify(items), outcome);
+        return this.appendToEpisodeField(taskId, scope, "validationOutcomesJson", (raw) => parseJsonObject(raw, []), (items) => JSON.stringify(items), outcome);
     }
     async addSuccessPatterns(taskId, scope, patterns) {
         // EPISODE_WRITE_LOCK: same read-modify-write race as appendToEpisodeField.
@@ -2383,7 +2387,7 @@ export class MemoryStore {
             if (rows.length === 0)
                 return false;
             const existing = rows[0];
-            const existingPatterns = existing.successPatternsJson ? JSON.parse(existing.successPatternsJson) : [];
+            const existingPatterns = parseJsonObject(existing.successPatternsJson, []);
             const allPatterns = [...existingPatterns, ...patterns];
             await table.update({
                 where: `id = '${escapeSql(existing.id)}'`,
@@ -2407,10 +2411,10 @@ export class MemoryStore {
         // (index.js system-transform + similar_task_recall tool).
         const keywords = taskDescription.toLowerCase().split(/\s+/).filter((k) => k.length > 2);
         const scored = episodes.map((ep) => {
-            const metadata = (JSON.parse(ep.metadataJson || "{}"));
+            const metadata = parseJsonObject(ep.metadataJson, {});
             const description = (metadata.description || "").toLowerCase();
             const taskId = ep.taskId.toLowerCase();
-            const commands = JSON.parse(ep.commandsJson || "[]").join(" ").toLowerCase();
+            const commands = parseJsonObject(ep.commandsJson, []).join(" ").toLowerCase();
             const text = `${taskId} ${description} ${commands}`;
             let matchCount = 0;
             for (const kw of keywords) {
@@ -2433,14 +2437,14 @@ export class MemoryStore {
         const commandSequenceCount = new Map();
         const toolCount = new Map();
         for (const ep of episodes) {
-            const commands = JSON.parse(ep.commandsJson || "[]");
+            const commands = parseJsonObject(ep.commandsJson, []);
             if (commands.length > 0) {
                 const seq = commands.join(" | ");
                 commandSequenceCount.set(seq, (commandSequenceCount.get(seq) || 0) + 1);
             }
             // Extract tools from commands (simple heuristic)
             for (const cmd of commands) {
-                const toolMatch = cmd.match(/^(npm|yarn|pnpm|npx|yarn|cargo|go|pytest|jest|tsc|eslint|prettier)/);
+                const toolMatch = cmd.match(/^(npm|yarn|pnpm|npx|cargo|go|pytest|jest|tsc|eslint|prettier)/);
                 if (toolMatch) {
                     toolCount.set(toolMatch[1], (toolCount.get(toolMatch[1]) || 0) + 1);
                 }
@@ -2517,7 +2521,7 @@ export class MemoryStore {
         return true;
     }
     async addRecoveryStrategy(taskId, scope, strategy) {
-        return this.appendToEpisodeField(taskId, scope, "recoveryStrategiesJson", (raw) => JSON.parse(raw || "[]"), (items) => JSON.stringify(items), strategy, (item) => ({ ...item, attemptedAt: Date.now() }));
+        return this.appendToEpisodeField(taskId, scope, "recoveryStrategiesJson", (raw) => parseJsonObject(raw, []), (items) => JSON.stringify(items), strategy, (item) => ({ ...item, attemptedAt: Date.now() }));
     }
     async suggestRetryBudget(scope, minSamples = 3) {
         await this.ensureEpisodicTaskTable(384);
@@ -2557,6 +2561,9 @@ export class MemoryStore {
             return null;
         }
         const sorted = [...retryCounts].sort((a, b) => a - b);
+        // floor(n/2) is the consistent upper-middle for both parities
+        // (n=1→0, n=2→1, n=4→2, n=5→2) — the RETRY_BUDGET_PARSE test locks
+        // the even-n behavior.
         const median = sorted[Math.floor(sorted.length / 2)];
         const suggestedRetries = median + 1;
         const confidence = Math.min(0.5 + (retryCounts.length * 0.1), 1.0);
@@ -2585,7 +2592,7 @@ export class MemoryStore {
                 return failedTaskIds.some(fId => eId.includes(fId) || fId.includes(eId));
             });
             if (similarSuccess) {
-                const commands = JSON.parse(similarSuccess.commandsJson || "[]");
+                const commands = parseJsonObject(similarSuccess.commandsJson, []);
                 if (commands.length > 0) {
                     suggestions.push({
                         strategy: `Try: ${commands[0]}`,
@@ -3544,18 +3551,6 @@ function vecNorm(v) {
         sum += v[i] * v[i];
     }
     return Math.sqrt(sum);
-}
-function fastCosine(a, b, normA, normB) {
-    if (a.length === 0 || b.length === 0 || a.length !== b.length)
-        return 0;
-    const denom = normA * normB;
-    if (denom === 0)
-        return 0;
-    let dot = 0;
-    for (let i = 0; i < a.length; i += 1) {
-        dot += a[i] * b[i];
-    }
-    return dot / denom;
 }
 function bm25LikeScore(query, doc, idf) {
     if (query.length === 0 || doc.length === 0)

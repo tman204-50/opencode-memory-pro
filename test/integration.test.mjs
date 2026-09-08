@@ -1136,6 +1136,47 @@ test("integration: store crossing MIN_ROWS_FOR_INDEX builds the vector index on 
     }
 });
 
+// SAFE_EPISODIC_PARSE (1.5.3): the episodic read/write paths used raw
+// JSON.parse on stored JSON columns with no guard — one malformed row (a
+// legacy/lossy write) threw out of findSimilarTasks,
+// extractSuccessPatternsFromScope, addCommandToEpisode or addSuccessPatterns.
+// All four now parse via parseJsonObject and must degrade to []/{}, not throw.
+test("integration: malformed episodic JSON columns are parsed safely, never thrown (SAFE_EPISODIC_PARSE)", async () => {
+    const store = await newStore("mem-safe-parse-");
+    try {
+        await store.createTaskEpisode({
+            id: "ep-safe-1",
+            sessionId: "sess-safe-1",
+            scope: "global",
+            taskId: "t-safe-1",
+            state: "success",
+            startTime: Date.now(),
+            commandsJson: "[]",
+            validationOutcomesJson: "[]",
+            successPatternsJson: "[]",
+            retryAttemptsJson: "[]",
+            recoveryStrategiesJson: "[]",
+            metadataJson: "{}",
+        });
+        await store.requireEpisodicTaskTable().update({
+            where: `taskId = 't-safe-1' AND scope = 'global'`,
+            values: { commandsJson: "{not json", metadataJson: "{also not json", successPatternsJson: "{nope" },
+        });
+        const similar = await store.findSimilarTasks("global", "t-safe-1");
+        assert.ok(Array.isArray(similar), "findSimilarTasks must not throw on a malformed commandsJson/metadataJson");
+        const patterns = await store.extractSuccessPatternsFromScope("global");
+        assert.ok(Array.isArray(patterns), "extractSuccessPatternsFromScope must not throw on a malformed commandsJson");
+        assert.equal(patterns.length, 0, "no patterns from a corrupted commandsJson");
+        const appended = await store.addCommandToEpisode("t-safe-1", "global", "npm test");
+        assert.equal(appended, true, "addCommandToEpisode must append onto a malformed commandsJson (reparsed as [])");
+        const withPatterns = await store.addSuccessPatterns("t-safe-1", "global", [{ commands: ["npm test"], tools: ["npm"], confidence: 0.5, extractedAt: Date.now() }]);
+        assert.equal(withPatterns, true, "addSuccessPatterns must overwrite a malformed successPatternsJson");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: plugin E2E scenario (subprocess)", async () => {
     const result = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["test/scenario-e2e.mjs"], {

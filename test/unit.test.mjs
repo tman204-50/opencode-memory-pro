@@ -7,7 +7,8 @@ import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput } from "../dist/llm.js";
 import { summarizeContent } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, appendCaptureFragment, fetchSessionMessages, lastUserTextFromMessages } from "../dist/index.js";
+import { extractCaptureCandidate } from "../dist/extract.js";
 import { buildPreferenceInjection } from "../dist/preference.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
 
@@ -1384,4 +1385,94 @@ test("store: maybeOptimizeAll kicks the periodic vector index recheck (INDEX_REC
     store._maybeOptimizeAll = async () => { };
     await store.maybeOptimizeAll(false);
     assert.equal(recheckCalls, 1, "maybeOptimizeAll must fire the index recheck");
+});
+
+// CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer must be
+// bounded on both axes — per-session fragments (a session whose flush keeps
+// failing must not accumulate text forever) and retained sessions (a
+// session.deleted flush that runs while init is deferred retains its entry
+// for retry, so without a cap abandoned sessions leak for process lifetime).
+test("capture: appendCaptureFragment caps fragments per session at the last 200 (CAPTURE_BUFFER_BOUNDS)", () => {
+    const state = { captureBuffer: new Map() };
+    for (let i = 0; i < 250; i += 1) {
+        appendCaptureFragment(state, "sess-cap", `fragment-${i}`);
+    }
+    const fragments = state.captureBuffer.get("sess-cap");
+    assert.equal(fragments.length, 200, "fragment list must be capped at 200");
+    assert.equal(fragments[0], "fragment-50", "oldest fragments are dropped, not the newest");
+    assert.equal(fragments[199], "fragment-249", "newest fragment must survive");
+});
+
+test("capture: appendCaptureFragment evicts the oldest session beyond 200 retained (CAPTURE_BUFFER_BOUNDS)", () => {
+    const state = { captureBuffer: new Map() };
+    for (let i = 0; i < 205; i += 1) {
+        appendCaptureFragment(state, `sess-${i}`, `text-${i}`);
+    }
+    assert.equal(state.captureBuffer.size, 200, "buffer map must be capped at 200 sessions");
+    assert.ok(!state.captureBuffer.has("sess-0"), "oldest session must be evicted first");
+    assert.ok(state.captureBuffer.has("sess-204"), "newest session must survive");
+    assert.deepEqual(state.captureBuffer.get("sess-204"), ["text-204"], "evicted sessions must not corrupt survivors");
+});
+
+// MESSAGES_FETCH_ONCE (1.5.3): getLastUserText and runRecallPipeline's
+// task-type detection each called client.session.messages — two identical SDK
+// round-trips per recall turn. The helpers below are the split that lets the
+// transform hook fetch once and reuse the array.
+test("recall: fetchSessionMessages unwraps the SDK envelope and returns [] on failure (MESSAGES_FETCH_ONCE)", async () => {
+    let calls = 0;
+    const client = {
+        session: {
+            messages: async () => {
+                calls += 1;
+                return { data: [{ info: { role: "user" }, parts: [] }] };
+            },
+        },
+    };
+    const messages = await fetchSessionMessages("sess-1", client);
+    assert.equal(calls, 1, "exactly one SDK round-trip");
+    assert.equal(messages.length, 1);
+    const failing = { session: { messages: async () => { throw new Error("boom"); } } };
+    assert.deepEqual(await fetchSessionMessages("sess-2", failing), [], "fetch failure degrades to []");
+});
+
+test("recall: lastUserTextFromMessages returns the last non-empty user text (MESSAGES_FETCH_ONCE)", () => {
+    const messages = [
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "assistant text" }] },
+        { info: { role: "user" }, parts: [{ type: "text", text: "  " }, { type: "text", text: "first query" }] },
+        { info: { role: "user" }, parts: [{ type: "text", text: "second query" }] },
+    ];
+    assert.equal(lastUserTextFromMessages(messages), "second query");
+    assert.equal(lastUserTextFromMessages([]), "");
+    assert.equal(lastUserTextFromMessages([{ info: { role: "user" }, parts: [] }]), "");
+});
+
+// SIGNAL_TIGHTEN (1.5.3): the expanded POSITIVE_SIGNALS list leaned on generic
+// narration verbs ("created", "updated", "configured", "done", ...) that appear
+// in nearly every assistant turn, so auto-capture fired on routine descriptions
+// of work instead of durable conclusions. Outcome/completion claims must still
+// capture; action narration must not.
+test("extract: generic narration no longer triggers capture (SIGNAL_TIGHTEN)", () => {
+    for (const text of [
+        "I created the config file and updated the deployment script.",
+        "The build is done and ready to review.",
+        "I installed the package and configured the service.",
+        "Here's how you can enable the feature.",
+        "In summary, we migrated the database.",
+    ]) {
+        const result = extractCaptureCandidate(text, 20);
+        assert.equal(result.candidate, null, `narration must not capture: ${text}`);
+        assert.equal(result.skipReason, "no-positive-signal", `narration must hit the signal gate: ${text}`);
+    }
+});
+
+test("extract: outcome and completion claims still trigger capture (SIGNAL_TIGHTEN)", () => {
+    for (const text of [
+        "The flaky test is fixed and verified across three runs.",
+        "The build passed and the service is operational.",
+        "We resolved the port conflict; it works now.",
+        "The retry logic was corrected and validated end to end.",
+    ]) {
+        const result = extractCaptureCandidate(text, 20);
+        assert.ok(result.candidate, `outcome claim must capture: ${text}`);
+    }
 });
