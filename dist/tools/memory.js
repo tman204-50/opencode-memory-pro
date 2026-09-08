@@ -341,8 +341,11 @@ export function createMemoryTools(state) {
                     return "Rejected: memory_delete requires confirm=true.";
                 }
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
-                const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
-                const deleted = await state.store.deleteById(args.id, scopes);
+                // FORCE_DELETE_HIDDEN (1.3.8): was deleteById, whose readByScopes
+                // filter excludes disabled/merged rows — so memory_delete could
+                // never permanently delete a memory that was soft-deleted first.
+                // deleteByIdForce sees those hidden rows (see memory_forget).
+                const deleted = await state.store.deleteByIdForce(args.id);
                 return deleted ? `Deleted memory ${args.id}.` : `Memory ${args.id} not found in current scope.`;
             },
         }),

@@ -23,7 +23,7 @@
 // 1.0) and typed-edge preference in expandRecall raised 1.3x -> 1.5x.
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { GLOBAL_KEYWORDS } from "./extract.js";
+import { GLOBAL_KEYWORDS, GLOBAL_KEYWORD_REGEXES } from "./extract.js";
 import { log } from "./logger.js";
 const FILE_EXTENSION_RE = /\b[\w@./-]+\.(?:js|jsx|ts|tsx|mjs|cjs|json|jsonc|sh|bash|py|md|markdown|toml|yaml|yml|css|scss|html|go|rs|c|h|cpp|hpp|java|kt|sql|lock|mod|sum|env|conf|ini|cfg|service|db|sqlite|png|jpg|jpeg|svg|webp|gif|pdf|zip|tar|gz|log|txt|xml|proto|graphql|prisma|d\.ts|tsbuildinfo)\b/gi;
 const DOT_KEY_RE = /\b[a-zA-Z][\w-]*(?:\.[\w-]+){1,4}\b/g;
@@ -198,11 +198,13 @@ export function extractEntities(text) {
             continue;
         add(candidate, "identifier");
     }
-    for (const keyword of GLOBAL_KEYWORDS) {
-        const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const re = new RegExp(`\\b${escaped}\\b`, "i");
-        if (re.test(text)) {
-            add(keyword, "infra");
+    // REGEX_DEDUP (perf review): reuse extract.js's precompiled regexes
+    // instead of building a fresh RegExp per keyword on every call — this
+    // ran on every recall turn (boostResults + expandRecall each call
+    // extractEntities(query)) plus once per capture/digest text.
+    for (let i = 0; i < GLOBAL_KEYWORDS.length; i++) {
+        if (GLOBAL_KEYWORD_REGEXES[i].test(text)) {
+            add(GLOBAL_KEYWORDS[i], "infra");
         }
     }
     return Array.from(seen.values());
@@ -227,6 +229,9 @@ export class GraphStore {
     maxEntitiesPerMemory;
     maxEdgeProvenance;
     typedEdges = true;
+    // QUERY_ENTITY_MEMO (perf review): see getEntitiesForQuery.
+    lastQueryEntitiesKey = null;
+    lastQueryEntities = null;
     constructor(config, driver) {
         this.maxEntitiesPerMemory = config.maxEntitiesPerMemory ?? 20;
         this.maxEdgeProvenance = config.maxEdgeProvenance ?? 20;
@@ -506,10 +511,22 @@ export class GraphStore {
         }
         return out;
     }
+    // QUERY_ENTITY_MEMO (perf review): boostResults and expandRecall are both
+    // called once per recall turn with the SAME query string (index.js runs
+    // them back-to-back on one `query` variable), each previously re-running
+    // the full extraction pass independently. A size-1 memo on the last
+    // query is enough to dedupe that intra-turn repeat; it still recomputes
+    // on any different query, so behavior for callers is unchanged.
     getEntitiesForQuery(text) {
         if (!this.enabled)
             return [];
-        return extractEntities(text).slice(0, this.maxEntitiesPerMemory);
+        if (this.lastQueryEntitiesKey === text && this.lastQueryEntities) {
+            return this.lastQueryEntities;
+        }
+        const entities = extractEntities(text).slice(0, this.maxEntitiesPerMemory);
+        this.lastQueryEntitiesKey = text;
+        this.lastQueryEntities = entities;
+        return entities;
     }
     boostResults(query, results, lambda) {
         if (!this.enabled || !results || results.length === 0)
@@ -517,7 +534,7 @@ export class GraphStore {
         const boostLambda = lambda && Number.isFinite(lambda) ? lambda : 0;
         if (boostLambda <= 0)
             return results;
-        const queryEntities = extractEntities(query).slice(0, this.maxEntitiesPerMemory);
+        const queryEntities = this.getEntitiesForQuery(query);
         if (queryEntities.length === 0)
             return results;
         const idToEntityMap = this.getMemoryEntities(results.map((r) => r.record?.id));
@@ -554,7 +571,7 @@ export class GraphStore {
     expandRecall(query, opts = {}) {
         if (!this.enabled || !query)
             return [];
-        const queryEntities = extractEntities(query).slice(0, this.maxEntitiesPerMemory);
+        const queryEntities = this.getEntitiesForQuery(query);
         if (queryEntities.length === 0)
             return [];
         const seeds = new Set(queryEntities.map((e) => e.name));

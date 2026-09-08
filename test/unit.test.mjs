@@ -453,6 +453,45 @@ test("graph: GraphStore round-trip (index → boost → expand → remove)", asy
     store.db.close();
 });
 
+// QUERY_ENTITY_MEMO (perf review): getEntitiesForQuery memoizes the last
+// query's extracted entities (boostResults/expandRecall are both called
+// once per recall turn with the same query string in index.js, and
+// previously each re-ran the full extraction pass independently). Verify
+// the memo actually reuses the array for a repeated query (identity check)
+// and correctly recomputes (distinct array, distinct content) for a
+// different query — i.e. it's a real cache, not an always-hit stub.
+test("graph: getEntitiesForQuery memoizes the last query only (QUERY_ENTITY_MEMO)", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { GraphStore } = await import("../dist/graph.js");
+    const dir = mkdtempSync(join(tmpdir(), "graph-memo-"));
+    const store = new GraphStore({
+        dbPath: join(dir, "graph.db"),
+        maxEntitiesPerMemory: 20,
+        maxEdgeProvenance: 20,
+        typedEdges: true,
+    }, { ctor: DatabaseSync, name: "node:sqlite" });
+    try {
+        const first = store.getEntitiesForQuery("the plugin uses docker and postgres");
+        const second = store.getEntitiesForQuery("the plugin uses docker and postgres");
+        assert.equal(first, second, "repeated query must return the exact same cached array (memo hit)");
+        const third = store.getEntitiesForQuery("a completely different sentence about kubernetes");
+        assert.notEqual(third, first, "a different query must not reuse the previous query's cached array");
+        assert.ok(third.some((e) => e.name === "kubernetes"), "recomputed entities must reflect the new query's content");
+        // Re-querying the FIRST string again after the memo moved on to a
+        // different query must recompute (size-1 memo, not an unbounded
+        // cache) rather than returning a now-stale reference equal to `third`.
+        const fourth = store.getEntitiesForQuery("the plugin uses docker and postgres");
+        assert.notEqual(fourth, third, "the memo must not conflate two different queries");
+        assert.deepEqual(fourth, first, "content must match even though it's a freshly recomputed array");
+    }
+    finally {
+        store.db.close();
+    }
+});
+
 test("graph: DisabledGraphStore is a safe no-op", async () => {
     const { DisabledGraphStore } = await import("../dist/graph.js");
     const g = new DisabledGraphStore();

@@ -490,6 +490,33 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.2 (2026-09-07)
+
+Bug fix + three perf patches bundled into one release:
+
+- **TOOL_DELETE_FORCE — `memory_delete` can now hard-delete soft-deleted
+  memories**: it used `store.deleteById`, whose status-filtered read cannot
+  see `disabled` rows — so `memory_forget` (soft) followed by `memory_delete`
+  returned "not found in current scope" forever and the row stayed on disk.
+  Switched to `deleteByIdForce` (the same fix `memory_forget` got in 1.3.8),
+  which does an exact-id raw delete that sees hidden rows.
+- **FEEDBACK_STATS_CACHE — per-scope cache for the feedback aggregate**:
+  `getMemoryFeedbackStatsMap` rebuilt a fresh `memoryId`-bounded events-table
+  query sized to the entire candidate set (up to 1000 ids) on every search.
+  The per-scope aggregate is now cached and invalidated on each new feedback
+  event — zero behavior change, fewer/cheaper queries on every recall turn.
+- **FIRE_AND_FORGET_RECALL_EVENT — recall telemetry write no longer awaited**:
+  the `type: "recall"` event put (a LanceDB table commit) used to add its
+  latency to every chat turn's system-prompt construction; nothing downstream
+  reads it. Now fired without awaiting (with a warn log on failure), matching
+  the existing `updateMemoryUsage` pattern.
+- **REGEX_DEDUP / QUERY_ENTITY_MEMO — graph extraction hot-path dedup**:
+  `extractEntities` recompiled 57 keyword regexes on every call; the
+  precompiled set is now exported and shared with graph.js, and
+  `getEntitiesForQuery` memoizes the last query so the back-to-back
+  `boostResults` + `expandRecall` calls per recall turn run extraction once
+  instead of twice.
+
 ### v1.5.1 (2026-09-07)
 
 Performance review — four fixes cutting blocking subprocess spawns, full-table

@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.5.1";
+const PLUGIN_VERSION = "1.5.2";
 const SCHEMA_VERSION = 1;
 // Event-driven dedup: run consolidateDuplicates on session.idle (throttled to
 // this interval so chatty sessions aren't re-scanning the store every turn)
@@ -632,7 +632,15 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
                 };
                 const injectionLimit = calculateInjectionLimit(mergedResults, injectionConfig);
                 const limitedResults = mergedResults.slice(0, injectionLimit);
-                await state.store.putEvent({
+                // FIRE_AND_FORGET_RECALL_EVENT (perf review): this used to be
+                // awaited, adding a LanceDB table-commit's latency to every
+                // single chat turn's system-prompt construction for a
+                // telemetry write nothing downstream reads (eventOutput.system
+                // is populated from limitedResults regardless of whether this
+                // write succeeds). updateMemoryUsage a few lines below has
+                // always fired without awaiting for the same reason — match
+                // that here.
+                state.store.putEvent({
                     id: generateId(),
                     type: "recall",
                     source: "system-transform",
@@ -647,7 +655,7 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query) {
                         injectionMode: state.config.injection.mode,
                         injectionLimit: injectionLimit,
                     }),
-                });
+                }).catch((error) => log("warn", `[recall] putEvent failed: ${toErrorMessage(error)}`));
                 if (limitedResults.length === 0)
                     return;
                 for (const result of limitedResults) {

@@ -204,6 +204,46 @@ test("integration: deleteByIdForce removes rows hidden by the status filter", as
     }
 });
 
+// TOOL_DELETE_FORCE (1.5.2): memory_delete used store.deleteById, whose
+// status-filtered read cannot see disabled rows — so a memory that was
+// soft-deleted first could never be permanently deleted through the tool
+// (it returned "not found in current scope" forever). memory_forget got the
+// deleteByIdForce fix in 1.3.8; memory_delete was missed. This test drives
+// the real tool wiring so a revert to deleteById fails the suite.
+test("integration: memory_delete tool hard-deletes rows hidden by the status filter", async () => {
+    const store = await newStore("mem-tool-del-force-");
+    const { createMemoryTools } = await import("../dist/tools/memory.js");
+    const state = {
+        initialized: false,
+        config: { embedding: { provider: "test" } },
+        store,
+        ensureInitialized: async () => { state.initialized = true; },
+    };
+    const tools = createMemoryTools(state);
+    const context = { directory: "/tmp", sessionID: "test-session" };
+    try {
+        const id = "tool-del-1";
+        await store.put(makeRecord(id, "the memory_delete tool hard delete test row"));
+
+        assert.match(
+            await tools.memory_delete.execute({ id, confirm: false }, context),
+            /Rejected/,
+            "confirm guard still applies",
+        );
+
+        assert.equal(await store.softDeleteMemory(id, ["global"]), true);
+        assert.equal(await store.hasMemory(id, ["global"]), false, "soft-deleted row hidden from active reads");
+
+        const result = await tools.memory_delete.execute({ id, confirm: true }, context);
+        assert.match(result, /Deleted memory/, `tool should report deletion, got: ${result}`);
+        assert.equal(await store.hasMemory(id, ["global"]), false, "no active row remains");
+        assert.equal(await store.deleteByIdForce(id), false, "row is physically gone (force path finds nothing)");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: events table round-trip and TTL status", async () => {
     const store = await newStore("mem-events-");
     try {
@@ -690,6 +730,53 @@ test("integration: updateMemoryUsage patches the scope cache without invalidatin
         assert.ok(cachedRecord.lastRecalled > 0, "cached record must have lastRecalled stamped");
         const dbRow = (await store.readByScopes(["global"])).find((r) => r.id === "usage-1");
         assert.equal(dbRow.recallCount, 1, "DB row must still be updated (table.update preserved)");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// FEEDBACK_STATS_CACHE (perf review): getMemoryFeedbackStatsMap was
+// refactored to cache the events-table aggregate per scope (invalidated by
+// invalidateFeedbackStats, called from _putEvent) instead of re-querying
+// with a fresh memoryId-bounded filter on every search. Comparing the SAME
+// record's score across two searches that only differ in feedbackWeight
+// isolates the feedbackFactor multiplier exactly (rank/rrfScore/recency/
+// importance/scope factors are identical between the two calls), so this
+// verifies both the formula end-to-end through the new cached path and that
+// a new feedback event invalidates the cache immediately (no stale reads).
+test("integration: feedback weighting applies the correct multiplier and the stats cache invalidates on new events (FEEDBACK_STATS_CACHE)", async () => {
+    const store = await newStore("mem-feedback-");
+    try {
+        const text = "shared topic for feedback weighting test";
+        const vector = deterministicEmbed(text);
+        await store.put(makeRecord("mem-good", text));
+        // 2x useful+helpful -> helpfulRate=1, wrongPenalty=0 -> feedbackFactor = 1 + (1-0.5)*2 - 0 = 2
+        await store.putEvent({
+            id: "evt-fb-1", type: "feedback", feedbackType: "useful", scope: "global",
+            sessionID: "s", timestamp: Date.now(), memoryId: "mem-good", helpful: true, metadataJson: "{}",
+        });
+        await store.putEvent({
+            id: "evt-fb-2", type: "feedback", feedbackType: "useful", scope: "global",
+            sessionID: "s", timestamp: Date.now(), memoryId: "mem-good", helpful: true, metadataJson: "{}",
+        });
+        const baseParams = searchParams(text, vector, { feedbackWeight: 0, minScore: 0 });
+        const boostedParams = searchParams(text, vector, { feedbackWeight: 1, minScore: 0 });
+        const baseScore = (await store.search(baseParams)).find((r) => r.record.id === "mem-good").score;
+        const boostedScore = (await store.search(boostedParams)).find((r) => r.record.id === "mem-good").score;
+        assert.ok(Math.abs(boostedScore / baseScore - 2) < 1e-6, `expected exactly 2x boost, got base=${baseScore} boosted=${boostedScore} ratio=${boostedScore / baseScore}`);
+        // Add a "wrong" event for the same memory: helpfulRate stays 1 (still
+        // 2 helpful/0 unhelpful), but wrongPenalty=min(0.3,0.1)=0.1, so the
+        // new factor is 1 + (1-0.5)*2 - 0.1 = 1.9. The search above already
+        // populated the per-scope feedback cache; this write must bump the
+        // version so the very next search recomputes instead of reusing the
+        // stale 2.0x aggregate.
+        await store.putEvent({
+            id: "evt-fb-3", type: "feedback", feedbackType: "wrong", scope: "global",
+            sessionID: "s", timestamp: Date.now(), memoryId: "mem-good", metadataJson: "{}",
+        });
+        const boostedScore2 = (await store.search(boostedParams)).find((r) => r.record.id === "mem-good").score;
+        assert.ok(Math.abs(boostedScore2 / baseScore - 1.9) < 1e-6, `expected updated 1.9x factor after new feedback (cache must not serve stale stats), got base=${baseScore} boosted2=${boostedScore2} ratio=${boostedScore2 / baseScore}`);
     }
     finally {
         store.close();

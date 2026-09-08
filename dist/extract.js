@@ -185,7 +185,11 @@ export function isGlobalCandidate(content, threshold) {
 // substring includes() produced false positives — "cap[al]ital" contains
 // "api", "di[g]italocean" contains "git" — inflating global-worthiness
 // counts. Mirrors graph.js's keyword matching, which already used \b.
-const GLOBAL_KEYWORD_REGEXES = GLOBAL_KEYWORDS.map((keyword) => {
+// REGEX_DEDUP (perf review): exported so graph.js's extractEntities can
+// reuse these instead of recompiling the same 57 keyword regexes from
+// scratch on every call (it used to do `new RegExp(...)` inside its loop,
+// duplicating work this module already did once at load time).
+export const GLOBAL_KEYWORD_REGEXES = GLOBAL_KEYWORDS.map((keyword) => {
     const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`\\b${escaped}\\b`, "i");
 });

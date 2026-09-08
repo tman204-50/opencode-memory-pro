@@ -112,6 +112,13 @@ export class MemoryStore {
     // (one chat turn = several commits) no longer thrashes the cache — the
     // entry is only reloaded when a query actually observes a stale version.
     scopeVersions = new Map();
+    // FEEDBACK_STATS_CACHE (perf review): mirrors scopeVersions/scopeCache
+    // but for the events-table feedback aggregate consumed by _search's
+    // feedbackWeight channel (see getFeedbackStatsForScope). Bumped by
+    // invalidateFeedbackStats(), called from _putEvent for feedback-type
+    // events.
+    feedbackVersions = new Map();
+    feedbackStatsCache = new Map();
     cacheConfig;
     cacheStats = { hits: 0, misses: 0, evictions: 0 };
     graph = null;
@@ -711,6 +718,16 @@ export class MemoryStore {
                 context: feedbackEvent?.context ? JSON.stringify(feedbackEvent.context) : null,
             },
         ]);
+        // FEEDBACK_STATS_CACHE (perf review): a new feedback event changes
+        // the aggregate for its scope; bump the version so the next
+        // getFeedbackStatsForScope call for this scope recomputes instead of
+        // serving a now-stale cached aggregate.
+        if (feedbackEvent) {
+            this.invalidateFeedbackStats(event.scope);
+        }
+    }
+    invalidateFeedbackStats(scope) {
+        this.feedbackVersions.set(scope, (this.feedbackVersions.get(scope) ?? 0) + 1);
     }
     async search(params) {
         // TIMING_SPANS (1.4.7): hybrid search is the recall hot path. The span
@@ -2699,18 +2716,26 @@ export class MemoryStore {
      * Returns a map of memoryId -> feedback stats.
      * Only considers feedback within the last 30 days.
      */
-    async getMemoryFeedbackStatsMap(memoryIds, scopes) {
-        const feedbackStats = new Map();
-        if (memoryIds.length === 0 || scopes.length === 0)
-            return feedbackStats;
-        // Default feedback window: 30 days
+    // FEEDBACK_STATS_CACHE (perf review): getMemoryFeedbackStatsMap used to
+    // build a fresh `memoryId = 'x' OR memoryId = 'y' OR ...` clause sized to
+    // the ENTIRE candidate set (up to maxRecordsPerScope, default 1000) and
+    // re-query the events table for it on every _search call — and
+    // feedbackWeight defaults to 0.3 (on), so this ran on every recall turn
+    // and every manual memory_search, uncached, unlike the vector/BM25/fuzzy
+    // channels which reuse the scope cache. The scope+type+timestamp filter
+    // alone already bounds the row count to actual feedback event volume,
+    // independent of candidate count, so cache the per-scope raw aggregate
+    // (not the derived rate/factor, since multi-scope calls need to sum raw
+    // counts across scopes before deriving those) and filter to the
+    // requested memoryIds in memory afterward — zero behavior change, just
+    // fewer/cheaper queries.
+    async computeFeedbackStatsForScope(scope) {
+        const rawStats = new Map();
         const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
         const table = this.requireEventTable();
-        const whereExpr = scopes.map((scope) => `scope = '${escapeSql(scope)}'`).join(" OR ");
-        const memoryIdExpr = memoryIds.map((id) => `memoryId = '${escapeSql(id)}'`).join(" OR ");
         const rows = await table
             .query()
-            .where(`(${whereExpr}) AND (${memoryIdExpr}) AND type = 'feedback' AND timestamp >= ${thirtyDaysAgo}`)
+            .where(`scope = '${escapeSql(scope)}' AND type = 'feedback' AND timestamp >= ${thirtyDaysAgo}`)
             .select([
             "memoryId",
             "feedbackType",
@@ -2719,16 +2744,14 @@ export class MemoryStore {
             .orderBy(SCAN_ORDER)
             .limit(SCAN_LIMIT)
             .toArray();
-        // Aggregate feedback per memory
-        const feedbackMap = new Map();
         for (const row of rows) {
             const memoryId = row.memoryId;
             const feedbackType = row.feedbackType;
             const helpful = row.helpful;
-            if (!feedbackMap.has(memoryId)) {
-                feedbackMap.set(memoryId, { helpful: 0, unhelpful: 0, wrong: 0 });
+            if (!rawStats.has(memoryId)) {
+                rawStats.set(memoryId, { helpful: 0, unhelpful: 0, wrong: 0 });
             }
-            const stats = feedbackMap.get(memoryId);
+            const stats = rawStats.get(memoryId);
             if (feedbackType === "wrong") {
                 stats.wrong += 1;
             }
@@ -2741,8 +2764,65 @@ export class MemoryStore {
                 }
             }
         }
+        return rawStats;
+    }
+    async getFeedbackStatsForScope(scope) {
+        if (!this.cacheConfig.enabled) {
+            return await this.computeFeedbackStatsForScope(scope);
+        }
+        const currentVersion = this.feedbackVersions.get(scope) ?? 0;
+        const cached = this.feedbackStatsCache.get(scope);
+        const maxAgeMs = Number.isFinite(this.cacheConfig.staleAfterMs) ? this.cacheConfig.staleAfterMs : 0;
+        const staleByAge = maxAgeMs > 0 && cached ? Date.now() - cached.loadedAt > maxAgeMs : false;
+        if (cached && cached.version === currentVersion && !staleByAge) {
+            cached.lastAccessTimestamp = Date.now();
+            return cached.rawStats;
+        }
+        const rawStats = await this.computeFeedbackStatsForScope(scope);
+        this.feedbackStatsCache.set(scope, {
+            rawStats,
+            version: currentVersion,
+            loadedAt: Date.now(),
+            lastAccessTimestamp: Date.now(),
+        });
+        this.enforceMaxFeedbackScopes();
+        return rawStats;
+    }
+    enforceMaxFeedbackScopes() {
+        while (this.feedbackStatsCache.size > this.cacheConfig.maxScopes) {
+            let lruScope = null;
+            let lruTimestamp = Infinity;
+            for (const [scope, entry] of this.feedbackStatsCache) {
+                if (entry.lastAccessTimestamp < lruTimestamp) {
+                    lruTimestamp = entry.lastAccessTimestamp;
+                    lruScope = scope;
+                }
+            }
+            if (lruScope) {
+                this.feedbackStatsCache.delete(lruScope);
+            }
+        }
+    }
+    async getMemoryFeedbackStatsMap(memoryIds, scopes) {
+        const feedbackStats = new Map();
+        if (memoryIds.length === 0 || scopes.length === 0)
+            return feedbackStats;
+        const idSet = new Set(memoryIds);
+        const rawTotals = new Map();
+        for (const scope of scopes) {
+            const perScope = await this.getFeedbackStatsForScope(scope);
+            for (const [memoryId, stats] of perScope) {
+                if (!idSet.has(memoryId))
+                    continue;
+                const totals = rawTotals.get(memoryId) ?? { helpful: 0, unhelpful: 0, wrong: 0 };
+                totals.helpful += stats.helpful;
+                totals.unhelpful += stats.unhelpful;
+                totals.wrong += stats.wrong;
+                rawTotals.set(memoryId, totals);
+            }
+        }
         // Calculate feedback factor for each memory
-        for (const [memoryId, stats] of feedbackMap) {
+        for (const [memoryId, stats] of rawTotals) {
             const totalFeedback = stats.helpful + stats.unhelpful;
             const helpfulRate = totalFeedback > 0 ? stats.helpful / totalFeedback : 0.5; // Neutral if no feedback
             const wrongPenalty = Math.min(0.3, stats.wrong * 0.1);
