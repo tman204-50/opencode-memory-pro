@@ -1118,7 +1118,15 @@ export class MemoryStore {
                                 continue;
                             }
                             const bMeta = parseMetadata(b.row.metadataJson);
-                            if (bMeta.status === "merged" || bMeta.mergedFrom) {
+                            // SURVIVOR_MERGE_FIX (1.5.6): only status:"merged"
+                            // (the row that LOST a previous merge) blocks being
+                            // absorbed. mergedFrom marks the SURVIVOR (winner)
+                            // — stamping it on every absorbed duplicate made
+                            // first-generation survivors permanently immune and
+                            // left every ≥0.95 duplicate cluster (survivor +
+                            // survivor) unmergeable: observed 6031 candidate
+                            // pairs passing every other gate, 0 writes.
+                            if (bMeta.status === "merged") {
                                 localSkipped += 1;
                                 continue;
                             }
@@ -1198,7 +1206,7 @@ export class MemoryStore {
                     if (sim < threshold)
                         continue;
                     const aMeta = parseMetadata(a.row.metadataJson);
-                    if (aMeta.status === "merged" || aMeta.mergedFrom) {
+                    if (aMeta.status === "merged") {
                         localSkipped += 1;
                         continue;
                     }
@@ -1207,7 +1215,9 @@ export class MemoryStore {
                         continue;
                     }
                     const bMeta = parseMetadata(b.row.metadataJson);
-                    if (bMeta.status === "merged" || bMeta.mergedFrom) {
+                    // SURVIVOR_MERGE_FIX (1.5.6): see ANN path — mergedFrom is
+                    // the survivor marker and must not block being absorbed.
+                    if (bMeta.status === "merged") {
                         localSkipped += 1;
                         continue;
                     }

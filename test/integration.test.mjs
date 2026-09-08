@@ -553,6 +553,43 @@ test("integration: consolidation merges near-duplicate memories", async () => {
     }
 });
 
+// SURVIVOR_MERGE_FIX (1.5.6): a canonical copy that survived a previous merge
+// carries metadataJson.mergedFrom — the SURVIVOR mark, not a merged-away mark.
+// The b-side guard treated mergedFrom as "already merged", so survivors were
+// permanently immune: every ≥0.95 duplicate cluster where both sides had
+// mergedFrom was skipped forever (live: 6031 qualifying pairs, zero writes).
+// The fix only blocks status:"merged" (the row that actually lost a merge).
+test("integration: merge survivor absorbs new duplicate (SURVIVOR_MERGE_FIX)", async () => {
+    const store = await newStore("mem-survivor-");
+    const text = "the deployment workflow is edit code, run tests, repackage, and restart the plugin";
+    try {
+        // Two rows that have BOTH survived an earlier merge (metadataJson
+        // carries mergedFrom) with the same text — the exact live-store shape
+        // that deadlocked, whichever row ended up as candidate b.
+        await store.put(makeRecord("sur-a", text, {
+            timestamp: Date.now() - 60_000,
+            metadataJson: JSON.stringify({ mergedFrom: "older-absorber-1", source: "llm-capture" }),
+        }));
+        await store.put(makeRecord("sur-b", text, {
+            timestamp: Date.now(),
+            metadataJson: JSON.stringify({ mergedFrom: "older-absorber-2", source: "llm-capture" }),
+        }));
+
+        const result = await store.consolidateDuplicates("global", 0.9, 10);
+        assert.ok(result.mergedPairs >= 1, `survivor+survivor must merge, got ${JSON.stringify(result)}`);
+
+        const exported = await store.exportAllRecords(["global"]);
+        const older = exported.find((r) => r.id === "sur-a");
+        const newer = exported.find((r) => r.id === "sur-b");
+        assert.ok(older && newer, "both rows must still exist");
+        assert.equal(older.status, "merged", "older survivor must be absorbed");
+        assert.ok(newer.metadataJson.includes("mergedFrom"), "newer survivor keeps provenance");
+    }
+    finally {
+        store.close();
+    }
+});
+
 // CLEAR_SCOPE_COUNT_ALL (1.4.6): clearScope read visible rows only but deleted
 // ALL rows in the scope — the returned count undercounted whenever
 // merged/digested rows were present, and their graph nodes were never notified.

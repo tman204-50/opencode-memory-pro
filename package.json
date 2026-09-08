@@ -1,6 +1,6 @@
 {
   "name": "opencode-memory-pro",
-  "version": "1.5.5",
+  "version": "1.5.6",
   "description": "LanceDB-backed long-term memory provider for OpenCode \u2014 standalone fork of lancedb-opencode-pro with entity graph, lifecycle, and retention",
   "type": "module",
   "main": "dist/index.js",

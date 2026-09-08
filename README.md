@@ -507,6 +507,27 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.6 (2026-09-08)
+
+**SURVIVOR_MERGE_FIX — consolidation deadlock** — `consolidateDuplicates`
+stopped merging near-duplicates because the candidate guard on the merge
+target treated `metadataJson.mergedFrom` (the **survivor's** provenance
+stamp, written by every previous merge) as a merged-away marker alongside
+`status:"merged"`. Survivor rows were therefore permanently immune from being
+absorbed, and once a piece of content had been merged once, every future
+≥threshold duplicate pair involving it was skipped forever:
+
+- **Fix** — the merge-target guard now blocks only `status:"merged"` (the row
+  that actually lost a merge); `mergedFrom` no longer disqualifies a survivor
+  from absorbing new duplicates. Applied to the ANN path and both sides of the
+  brute-force fallback.
+- **Impact** — a live store that had 0 merges across recent runs despite 589
+  flagged duplicates merged 675 pairs on the first run after the fix
+  (1794 → 1119 active rows, 0 remaining ≥0.95 pairs).
+- Regression test constructs the deadlock shape (two same-text survivors both
+  carrying `mergedFrom`) and asserts they merge (mutant-verified: fails with
+  the old guard).
+
 ### v1.5.5 (2026-09-08)
 
 **Scope-cache retention scoring (proposal Issue 1)** — when a scope exceeds
