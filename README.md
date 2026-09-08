@@ -507,6 +507,16 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.7 (2026-09-08)
+
+**VERSION_STAMP_FIX — 1.5.6 released with a stale version stamp** — the
+1.5.6 release (SURVIVOR_MERGE_FIX, commit e134077) bumped `package.json` but
+missed `PLUGIN_VERSION` in `dist/index.js` and both `package-lock.json`
+entries, so the runtime self-reported `Plugin v1.5.5 initialized` while
+running 1.5.6 code. This release corrects the stamps (`PLUGIN_VERSION`,
+package-lock root + package entry) so the runtime log, npm metadata, and git
+tag all agree on 1.5.7.
+
 ### v1.5.6 (2026-09-08)
 
 **SURVIVOR_MERGE_FIX — consolidation deadlock** — `consolidateDuplicates`
