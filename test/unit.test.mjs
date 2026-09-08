@@ -7,7 +7,7 @@ import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput } from "../dist/llm.js";
 import { summarizeContent } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, appendCaptureFragment, fetchSessionMessages, lastUserTextFromMessages } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages } from "../dist/index.js";
 import { extractCaptureCandidate } from "../dist/extract.js";
 import { buildPreferenceInjection } from "../dist/preference.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
@@ -1392,10 +1392,10 @@ test("store: maybeOptimizeAll kicks the periodic vector index recheck (INDEX_REC
 // failing must not accumulate text forever) and retained sessions (a
 // session.deleted flush that runs while init is deferred retains its entry
 // for retry, so without a cap abandoned sessions leak for process lifetime).
-test("capture: appendCaptureFragment caps fragments per session at the last 200 (CAPTURE_BUFFER_BOUNDS)", () => {
+test("capture: recordCaptureFragment caps fragments per session at the last 200 (CAPTURE_BUFFER_BOUNDS)", () => {
     const state = { captureBuffer: new Map() };
     for (let i = 0; i < 250; i += 1) {
-        appendCaptureFragment(state, "sess-cap", `fragment-${i}`);
+        recordCaptureFragment(state, "sess-cap", `fragment-${i}`);
     }
     const fragments = state.captureBuffer.get("sess-cap");
     assert.equal(fragments.length, 200, "fragment list must be capped at 200");
@@ -1403,10 +1403,10 @@ test("capture: appendCaptureFragment caps fragments per session at the last 200 
     assert.equal(fragments[199], "fragment-249", "newest fragment must survive");
 });
 
-test("capture: appendCaptureFragment evicts the oldest session beyond 200 retained (CAPTURE_BUFFER_BOUNDS)", () => {
+test("capture: recordCaptureFragment evicts the oldest session beyond 200 retained (CAPTURE_BUFFER_BOUNDS)", () => {
     const state = { captureBuffer: new Map() };
     for (let i = 0; i < 205; i += 1) {
-        appendCaptureFragment(state, `sess-${i}`, `text-${i}`);
+        recordCaptureFragment(state, `sess-${i}`, `text-${i}`);
     }
     assert.equal(state.captureBuffer.size, 200, "buffer map must be capped at 200 sessions");
     assert.ok(!state.captureBuffer.has("sess-0"), "oldest session must be evicted first");
@@ -1474,5 +1474,66 @@ test("extract: outcome and completion claims still trigger capture (SIGNAL_TIGHT
     ]) {
         const result = extractCaptureCandidate(text, 20);
         assert.ok(result.candidate, `outcome claim must capture: ${text}`);
+    }
+});
+
+// V1_PLUGIN_EXPORT (1.5.4): opencode's plugin loader treats a module whose
+// default export is a function as a LEGACY plugin and then calls EVERY
+// function export as a plugin factory with (input, options). 1.5.3 added
+// `export function appendCaptureFragment` (module namespace exports sort
+// alphabetically, so it sorted before "default"), the loader invoked it
+// first, it threw (input.captureBuffer undefined), and the real plugin never
+// loaded ("failed to load plugin ... state.captureBuffer.get"). The default
+// export is now a V1 plugin object ({ id, server }), which the loader detects
+// and calls via server(input) only. These tests lock both the V1 shape and
+// the legacy-fallback ordering invariant (no function export may sort before
+// "default" — hence the recordCaptureFragment name, r > d).
+test("plugin: default export is a V1 plugin object with id + server (V1_PLUGIN_EXPORT)", async () => {
+    const mod = await import("../dist/index.js");
+    const value = mod.default;
+    assert.equal(typeof value, "object", "default export must be an object for V1 detection");
+    assert.equal(typeof value.id, "string", "V1 file plugins must export a string id");
+    assert.ok(value.id.length > 0, "plugin id must be non-empty");
+    assert.equal(typeof value.server, "function", "V1 plugin must export server()");
+});
+
+// Mirrors opencode's loader getServerPlugin: a function export is itself a
+// plugin factory; an object export may carry a server() factory.
+function getServerPlugin(value) {
+    if (typeof value === "function")
+        return value;
+    if (!value || typeof value !== "object" || !("server" in value))
+        return;
+    if (typeof value.server !== "function")
+        return;
+    return value.server;
+}
+
+test("plugin: first export resolves to the server factory (legacy fallback order)", async () => {
+    const mod = await import("../dist/index.js");
+    const values = Object.values(mod);
+    assert.equal(getServerPlugin(values[0]), mod.default.server,
+        "first export (alphabetical) must resolve to the server factory");
+});
+
+test("plugin: no export before the server factory throws when invoked as a legacy plugin", async () => {
+    const mod = await import("../dist/index.js");
+    const input = { client: {}, project: {}, worktree: "/tmp", directory: "/tmp" };
+    const options = {};
+    // The legacy loader calls exports in Object.values order and aborts on the
+    // first throw. Walk the same order; anything that throws BEFORE the server
+    // factory would break loading exactly like the 1.5.3 regression.
+    for (const value of Object.values(mod)) {
+        const server = getServerPlugin(value);
+        if (server === mod.default.server)
+            break;
+        if (typeof server !== "function")
+            continue;
+        try {
+            await server(input, options);
+        }
+        catch (error) {
+            assert.fail(`legacy factory export threw before server: ${error.message}`);
+        }
     }
 });

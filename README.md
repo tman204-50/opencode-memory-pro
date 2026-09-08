@@ -490,6 +490,26 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.4 (2026-09-07)
+
+**Hotfix — plugin no longer loads (1.5.3 regression)**:
+
+- **V1_PLUGIN_EXPORT — the default export is now a V1 plugin object
+  (`{ id, server }`) instead of the legacy factory function**: opencode's
+  plugin loader treats a module whose default export is a function as a legacy
+  plugin and then calls **every** function export as a plugin factory with
+  `(input, options)`. Module namespace exports sort alphabetically, so 1.5.3's
+  new `export function appendCaptureFragment` sorted before `default`; the
+  loader invoked it first, it threw on `input.captureBuffer` being undefined,
+  and loading aborted before the real plugin ever ran — the plugin silently
+  failed to initialize ("failed to load plugin ... state.captureBuffer.get")
+  with no error surfaced to the user. The V1 shape makes the loader call
+  `server(input)` only, and the helper was renamed to `recordCaptureFragment`
+  (r > d) plus moved to the bottom export list so even the legacy fallback
+  path would reach the server factory first. Regression tests lock the V1
+  shape, the export-order invariant, and that no export before the server
+  throws when invoked legacy-style.
+
 ### v1.5.2 (2026-09-07)
 
 Bug fix + three perf patches bundled into one release:

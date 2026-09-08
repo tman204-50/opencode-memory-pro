@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.5.3";
+const PLUGIN_VERSION = "1.5.4";
 const SCHEMA_VERSION = 1;
 // CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
 // on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
@@ -24,7 +24,18 @@ const SCHEMA_VERSION = 1;
 // (same pattern as flushAutoCapture/handleSessionIdle).
 const CAPTURE_BUFFER_MAX_FRAGMENTS = 200;
 const CAPTURE_BUFFER_MAX_SESSIONS = 200;
-export function appendCaptureFragment(state, sessionID, text) {
+// V1_PLUGIN_EXPORT (1.5.4): recordCaptureFragment is NOT an `export function`.
+// Module namespace exports sort alphabetically, and opencode's legacy plugin
+// loader iterates every function export, calling each as a plugin factory with
+// (input, options) — the first one to throw aborts loading before the real
+// plugin runs. 1.5.3's `export function appendCaptureFragment` sorted before
+// "default", so the loader invoked it with input.captureBuffer undefined and
+// the plugin never loaded ("undefined is not an object (evaluating
+// 'state.captureBuffer.get')"). The default export is now a V1 plugin object
+// ({ id, server }) so the loader calls server(input) only, and every test-seam
+// export name sorts after "default" (recordCaptureFragment: r > d) so even the
+// legacy fallback path would reach the server factory first.
+function recordCaptureFragment(state, sessionID, text) {
     let list = state.captureBuffer.get(sessionID);
     if (list === undefined) {
         if (state.captureBuffer.size >= CAPTURE_BUFFER_MAX_SESSIONS) {
@@ -282,7 +293,7 @@ const plugin = async (input) => {
         "experimental.text.complete": async (eventInput, eventOutput) => {
             if (isOwnSession(eventInput.sessionID))
                 return;
-            appendCaptureFragment(state, eventInput.sessionID, eventOutput.text);
+            recordCaptureFragment(state, eventInput.sessionID, eventOutput.text);
         },
         // Wires the episodic learning store (addCommandToEpisode/
         // addValidationOutcome) to real tool executions. Previously these
@@ -1226,7 +1237,18 @@ function hasEmbeddingConfigChanged(current, next) {
         || (current.apiKey ?? "") !== (next.apiKey ?? "")
         || (current.timeoutMs ?? 0) !== (next.timeoutMs ?? 0));
 }
-export default plugin;
-// CAPTURE_RETRY_ON_DEFERRED (1.4.5): named exports for regression tests only —
-// opencode plugin loading consumes the default export and ignores these.
-export { fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline };
+// V1_PLUGIN_EXPORT (1.5.4): the default export is a V1 plugin object, not the
+// legacy factory function. opencode's loader detects V1 plugins via
+// readV1Plugin (default export is an object with `id` + `server`) and then
+// calls ONLY server(input) — the named test-seam exports below are never
+// invoked as plugin factories. (Legacy format: the loader iterates Object
+// values and calls every function export as a plugin; any `export function`
+// declared before the default export aborts loading — see 1.5.3 regression.)
+export default {
+    id: "opencode-memory-pro",
+    server: plugin,
+};
+// Named exports for regression tests only — opencode plugin loading consumes
+// the default export and ignores these (kept below `export default` so the
+// legacy loader fallback would still reach the server factory first).
+export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline };

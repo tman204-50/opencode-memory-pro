@@ -88,7 +88,9 @@ const client = {
     },
 };
 
-const hooks = await plugin({ client, worktree });
+// V1_PLUGIN_EXPORT (1.5.4): the default export is now a V1 plugin object
+// ({ id, server }); the loader calls server(input) for V1 plugins.
+const hooks = await plugin.server({ client, worktree });
 
 function fail(message) {
     throw new Error(`E2E FAILED: ${message}`);
