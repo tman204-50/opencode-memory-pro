@@ -821,7 +821,35 @@ test("integration: feedback weighting applies the correct multiplier and the sta
     }
 });
 
-// RETENTION_SCORING (1.5.5): scope-cache truncation used to keep the N
+// FEEDBACK_SCAN_BOUND (1.5.8-post): computeFeedbackStatsForScope used the
+// global SCAN_LIMIT (5M default) on every feedback-cache miss/stale window,
+// so a recall turn could stall scanning effectiveness_events.lance for
+// seconds. The per-instance bound must cap how many feedback rows are
+// aggregated (newest-first). Seeding 3 events with the bound=2 and a stale
+// cache forces a recompute; the oldest (the "wrong") must be dropped, so the
+// factor is the 2x helpful-only rate, not 1.9x.
+test("integration: feedback stats scan honors the per-instance bound (FEEDBACK_SCAN_BOUND)", async () => {
+    process.env.OPENCODE_MEMORY_PRO_FEEDBACK_STATS_SCAN_LIMIT = "2";
+    const store = await newStore("mem-fb-bound-");
+    delete process.env.OPENCODE_MEMORY_PRO_FEEDBACK_STATS_SCAN_LIMIT;
+    try {
+        const text = "bounded feedback scan probe";
+        const vector = deterministicEmbed(text);
+        await store.put(makeRecord("mem-fb-b", text));
+        const base = Date.now() - 60 * 1000;
+        await store.putEvent({ id: "evt-fb-b1", type: "feedback", feedbackType: "wrong", scope: "global", sessionID: "s", timestamp: base, memoryId: "mem-fb-b", metadataJson: "{}" });
+        await store.putEvent({ id: "evt-fb-b2", type: "feedback", feedbackType: "useful", scope: "global", sessionID: "s", timestamp: base + 1, memoryId: "mem-fb-b", helpful: true, metadataJson: "{}" });
+        await store.putEvent({ id: "evt-fb-b3", type: "feedback", feedbackType: "useful", scope: "global", sessionID: "s", timestamp: base + 2, memoryId: "mem-fb-b", helpful: true, metadataJson: "{}" });
+        const boostedParams = searchParams(text, vector, { feedbackWeight: 1, minScore: 0 });
+        const boostedScore = (await store.search(boostedParams)).find((r) => r.record.id === "mem-fb-b").score;
+        const baseParams = searchParams(text, vector, { feedbackWeight: 0, minScore: 0 });
+        const baseScore = (await store.search(baseParams)).find((r) => r.record.id === "mem-fb-b").score;
+        assert.ok(Math.abs(boostedScore / baseScore - 2) < 1e-6, `bound=2 must drop the oldest (wrong) event; expected 2x, got ${boostedScore / baseScore}`);
+    }
+    finally {
+        store.close();
+    }
+});
 // NEWEST records, so an old-but-valuable memory (important, verified,
 // positively fed back) was silently dropped from search the moment enough
 // newer records landed. With retention weights configured, the survivors are

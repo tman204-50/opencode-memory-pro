@@ -173,6 +173,14 @@ export class MemoryStore {
             maxRecordsPerScope: MAX_RECORDS_PER_SCOPE,
             ...cacheConfig,
         };
+        // FEEDBACK_SCAN_BOUND (1.5.8-post): computeFeedbackStatsForScope used
+        // the global SCAN_LIMIT (5M default) with a timestamp-desc sort, so a
+        // feedback-cache miss/stale window (default 10 min) could spend seconds
+        // scanning effectiveness_events.lance on a recall turn. The aggregate
+        // only needs the last 30 days, one row per memoryId — 50k is far
+        // beyond any real feedback volume. Per-instance (constructor-time)
+        // so tests can shrink it.
+        this.feedbackStatsScanLimit = envInt("OPENCODE_MEMORY_PRO_FEEDBACK_STATS_SCAN_LIMIT", 50_000, 1, 5_000_000);
     }
     /**
      * Cross-process compaction lock. Returns true when this process owns the
@@ -2852,7 +2860,7 @@ export class MemoryStore {
             "helpful",
         ])
             .orderBy(SCAN_ORDER)
-            .limit(SCAN_LIMIT)
+            .limit(this.feedbackStatsScanLimit)
             .toArray();
         for (const row of rows) {
             const memoryId = row.memoryId;

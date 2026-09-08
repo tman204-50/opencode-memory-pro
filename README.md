@@ -507,6 +507,20 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.9 (2026-09-08)
+
+**FEEDBACK_SCAN_BOUND — bounded feedback-stats scan** — `computeFeedbackStatsForScope`
+used the global SCAN_LIMIT (5M default) with a timestamp-desc sort on every
+feedback-cache miss/stale window (default 10 min), turning a recall turn into a
+multi-second scan of `effectiveness_events.lance` — made worse when a second
+opencode instance (e.g. an idle `opencode-serve` daemon) shared the same
+LanceDB directory (write contention; spikes correlated with truncation warnings).
+Now a per-instance `feedbackStatsScanLimit` (constructor-time env int, default
+50k, min 1 for testability) bounds the `.limit()` in
+`computeFeedbackStatsForScope` — env `OPENCODE_MEMORY_PRO_FEEDBACK_STATS_SCAN_LIMIT`. recall/store.search returned to
+baseline (~0.6s) after the fix; regression test `integration: feedback stats scan
+honors the per-instance bound (FEEDBACK_SCAN_BOUND)`.
+
 ### v1.5.8 (2026-09-08)
 
 **Hygiene + contention bundle** — three areas:
