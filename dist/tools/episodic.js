@@ -1,8 +1,24 @@
 import { tool } from "@opencode-ai/plugin";
-import { deriveProjectScope, resolveScope } from "../scope.js";
+import { resolveScope } from "../scope.js";
 import { generateId, parseJsonObject } from "../utils.js";
-function unavailableMessage(provider) {
-    return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
+import { log } from "../logger.js";
+function unavailableMessage() {
+    // EPISODIC_NO_EMBEDDER (1.5.8): episodic tools never embed — findSimilarTasks
+    // is keyword-only and the rest are plain table queries — so the message must
+    // not blame the embedding provider.
+    return `Memory store unavailable (not initialized). Will retry automatically.`;
+}
+function fmtConfidence(value) {
+    return Number.isFinite(value) ? value.toFixed(2) : "n/a";
+}
+async function safeStoreCall(store, op, fn) {
+    try {
+        return await fn();
+    }
+    catch (error) {
+        log("warn", `[episodic:${op}] ${error instanceof Error ? error.message : String(error)}`);
+        return `Memory store error in ${op}; try again (see plugin log).`;
+    }
 }
 export function createEpisodicTools(state) {
     return {
@@ -16,7 +32,7 @@ export function createEpisodicTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const episode = {
                     id: generateId(),
@@ -33,7 +49,9 @@ export function createEpisodicTools(state) {
                     recoveryStrategiesJson: "[]",
                     metadataJson: JSON.stringify({ description: args.description }),
                 };
-                await state.store.createTaskEpisode(episode);
+                const ok = await safeStoreCall(state.store, "createTaskEpisode", () => state.store.createTaskEpisode(episode));
+                if (typeof ok === "string")
+                    return ok;
                 return `Created task episode ${episode.id} for task ${args.taskId} in scope ${activeScope}`;
             },
         }),
@@ -47,14 +65,16 @@ export function createEpisodicTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 const stateFilter = args.state;
-                const episodes = await state.store.queryTaskEpisodes(activeScope, stateFilter);
+                const episodes = await safeStoreCall(state.store, "queryTaskEpisodes", () => state.store.queryTaskEpisodes(activeScope, stateFilter));
+                if (typeof episodes === "string")
+                    return episodes;
                 if (episodes.length === 0) {
                     return `No task episodes found in scope ${activeScope}`;
                 }
-                const limited = episodes.slice(0, args.limit ?? 10);
+                const limited = episodes.slice(0, args.limit);
                 return limited.map((ep) => {
                     const meta = parseJsonObject(ep.metadataJson, {});
                     return `[${ep.id}] ${ep.taskId} - ${ep.state} (${new Date(ep.startTime).toISOString().split("T")[0]}) ${meta.description ? `- ${meta.description}` : ""}`;
@@ -62,24 +82,26 @@ export function createEpisodicTools(state) {
             },
         }),
         similar_task_recall: tool({
-            description: "Find similar past tasks using semantic search",
+            description: "Find similar past tasks by keyword overlap over their task id, description, and commands (no embeddings used). A task matches when at least the threshold fraction of the query's words appear.",
             args: {
                 query: tool.schema.string().min(1),
-                threshold: tool.schema.number().min(0).max(1).default(0.85),
+                threshold: tool.schema.number().min(0).max(1).default(0.5),
                 limit: tool.schema.number().int().min(1).max(10).default(3),
                 scope: tool.schema.string().optional(),
             },
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
                 // findSimilarTasks matches by keyword only — no embedding needed.
-                const similar = await state.store.findSimilarTasks(activeScope, args.query, args.threshold ?? 0.85);
+                const similar = await safeStoreCall(state.store, "findSimilarTasks", () => state.store.findSimilarTasks(activeScope, args.query, args.threshold));
+                if (typeof similar === "string")
+                    return similar;
                 if (similar.length === 0) {
                     return `No similar tasks found for "${args.query}"`;
                 }
-                const limited = similar.slice(0, args.limit ?? 3);
+                const limited = similar.slice(0, args.limit);
                 return limited.map((ep) => {
                     const commands = parseJsonObject(ep.commandsJson, []);
                     const outcomes = parseJsonObject(ep.validationOutcomesJson, []);
@@ -100,15 +122,17 @@ export function createEpisodicTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
-                const result = await state.store.suggestRetryBudget(activeScope, args.minSamples ?? 3);
+                const result = await safeStoreCall(state.store, "suggestRetryBudget", () => state.store.suggestRetryBudget(activeScope, args.minSamples));
+                if (typeof result === "string")
+                    return result;
                 if (!result) {
                     return `Insufficient data for retry budget suggestion (need at least ${args.minSamples} failed tasks)`;
                 }
                 return JSON.stringify({
                     suggestedRetries: result.suggestedRetries,
-                    confidence: result.confidence.toFixed(2),
+                    confidence: fmtConfidence(result.confidence),
                     basedOnCount: result.basedOnCount,
                     shouldStop: result.shouldStop,
                     stopReason: result.stopReason,
@@ -124,14 +148,16 @@ export function createEpisodicTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
-                const strategies = await state.store.suggestRecoveryStrategies(activeScope, args.taskId);
+                const strategies = await safeStoreCall(state.store, "suggestRecoveryStrategies", () => state.store.suggestRecoveryStrategies(activeScope, args.taskId));
+                if (typeof strategies === "string")
+                    return strategies;
                 if (strategies.length === 0) {
                     return `No recovery strategies found for task ${args.taskId}`;
                 }
                 return strategies.map((s) => {
-                    return `- ${s.strategy}: ${s.reason} (confidence: ${s.confidence.toFixed(2)}${s.basedOnTask ? `, based on: ${s.basedOnTask}` : ""})`;
+                    return `- ${s.strategy}: ${s.reason} (confidence: ${fmtConfidence(s.confidence)}${s.basedOnTask ? `, based on: ${s.basedOnTask}` : ""})`;
                 }).join("\n");
             },
         }),

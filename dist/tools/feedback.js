@@ -1,8 +1,18 @@
 import { tool } from "@opencode-ai/plugin";
-import { deriveProjectScope, buildScopeFilter, resolveScope } from "../scope.js";
+import { buildScopeFilter, resolveScope } from "../scope.js";
 import { generateId } from "../utils.js";
-function unavailableMessage(provider) {
-    return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
+import { log } from "../logger.js";
+function unavailableMessage() {
+    return `Memory store unavailable (not initialized). Will retry automatically.`;
+}
+async function safeStoreCall(store, op, fn) {
+    try {
+        return await fn();
+    }
+    catch (error) {
+        log("warn", `[feedback:${op}] ${error instanceof Error ? error.message : String(error)}`);
+        return `Memory store error in ${op}; try again (see plugin log).`;
+    }
 }
 export function createFeedbackTools(state) {
     return {
@@ -16,9 +26,9 @@ export function createFeedbackTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const scope = resolveScope(args.scope, context.directory || context.worktree);
-                await state.store.putEvent({
+                const ok = await safeStoreCall(state.store, "putEvent", () => state.store.putEvent({
                     id: generateId(),
                     type: "feedback",
                     feedbackType: "missing",
@@ -26,9 +36,11 @@ export function createFeedbackTools(state) {
                     sessionID: context.sessionID,
                     timestamp: Date.now(),
                     text: args.text,
-                    labels: args.labels ?? [],
+                    labels: args.labels,
                     metadataJson: JSON.stringify({ source: "memory_feedback_missing" }),
-                });
+                }));
+                if (typeof ok === "string")
+                    return ok;
                 return "Recorded missing-memory feedback.";
             },
         }),
@@ -42,14 +54,16 @@ export function createFeedbackTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(scope, state.config.includeGlobalScope);
-                const exists = await state.store.hasMemory(args.id, scopes);
+                const exists = await safeStoreCall(state.store, "hasMemory", () => state.store.hasMemory(args.id, scopes));
+                if (typeof exists === "string")
+                    return exists;
                 if (!exists) {
-                    return `Memory ${args.id} not found in current scope.`;
+                    return `Memory ${args.id} not found in scope ${scope}.`;
                 }
-                await state.store.putEvent({
+                const ok = await safeStoreCall(state.store, "putEvent", () => state.store.putEvent({
                     id: generateId(),
                     type: "feedback",
                     feedbackType: "wrong",
@@ -59,7 +73,9 @@ export function createFeedbackTools(state) {
                     memoryId: args.id,
                     reason: args.reason,
                     metadataJson: JSON.stringify({ source: "memory_feedback_wrong" }),
-                });
+                }));
+                if (typeof ok === "string")
+                    return ok;
                 return `Recorded wrong-memory feedback for ${args.id}.`;
             },
         }),
@@ -73,14 +89,16 @@ export function createFeedbackTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const scopes = buildScopeFilter(scope, state.config.includeGlobalScope);
-                const exists = await state.store.hasMemory(args.id, scopes);
+                const exists = await safeStoreCall(state.store, "hasMemory", () => state.store.hasMemory(args.id, scopes));
+                if (typeof exists === "string")
+                    return exists;
                 if (!exists) {
-                    return `Memory ${args.id} not found in current scope.`;
+                    return `Memory ${args.id} not found in scope ${scope}.`;
                 }
-                await state.store.putEvent({
+                const ok = await safeStoreCall(state.store, "putEvent", () => state.store.putEvent({
                     id: generateId(),
                     type: "feedback",
                     feedbackType: "useful",
@@ -90,7 +108,9 @@ export function createFeedbackTools(state) {
                     memoryId: args.id,
                     helpful: args.helpful,
                     metadataJson: JSON.stringify({ source: "memory_feedback_useful" }),
-                });
+                }));
+                if (typeof ok === "string")
+                    return ok;
                 return `Recorded recall usefulness feedback for ${args.id}.`;
             },
         }),
@@ -102,9 +122,11 @@ export function createFeedbackTools(state) {
             execute: async (args, context) => {
                 await state.ensureInitialized();
                 if (!state.initialized)
-                    return unavailableMessage(state.config.embedding.provider);
+                    return unavailableMessage();
                 const scope = resolveScope(args.scope, context.directory || context.worktree);
-                const summary = await state.store.summarizeEvents(scope, state.config.includeGlobalScope);
+                const summary = await safeStoreCall(state.store, "summarizeEvents", () => state.store.summarizeEvents(scope, state.config.includeGlobalScope));
+                if (typeof summary === "string")
+                    return summary;
                 return JSON.stringify(summary, null, 2);
             },
         }),

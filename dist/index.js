@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.5.7";
+const PLUGIN_VERSION = "1.5.8";
 const SCHEMA_VERSION = 1;
 // CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
 // on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
@@ -756,7 +756,7 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query, p
                 // dead code), so no embedding is needed here — the previous
                 // re-embed of the query was computed every recall turn and unused.
                 try {
-                    const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.85);
+                    const similarTasks = await state.store.findSimilarTasks(activeScope, query, 0.5);
                     if (similarTasks.length > 0) {
                         const taskContext = similarTasks.slice(0, 2).map((ep) => {
                             const commands = parseJsonObject(ep.commandsJson, []);

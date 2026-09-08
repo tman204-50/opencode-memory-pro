@@ -507,6 +507,32 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
+### v1.5.8 (2026-09-08)
+
+**Hygiene + contention bundle** — three areas:
+
+- **EPISODIC/TOOL HYGIENE** — `tools/episodic.js` + `tools/feedback.js`: safe store
+  calls (wrapped, logged, friendly retry message instead of raw throws),
+  accurate "not initialized" message instead of blaming the embedding provider
+  (episodic/feedback tools never embed), dead `??` zod fallbacks removed,
+  confidence guarded against non-finite values, unused imports dropped.
+  `similar_task_recall` is keyword-overlap (not "semantic search") — description
+  corrected and default threshold lowered 0.85 → 0.5 (store default + auto-recall
+  path aligned) so it actually returns results.
+- **ISSUE3_YIELD — consolidate event-loop starvation** — consolidation is
+  CPU-bound and runs on `session.idle` in-process; it used to monopolize the
+  event loop for the whole run and starve concurrent recalls (observed
+  `recall.pipeline` 9.4s / `store.search` 9.1s vs ~0.6s clean). Now yields to
+  the event loop every sub-batch when >40ms has elapsed since the last yield,
+  in both the ANN and O(N²) fallback paths. Also removed ~4 redundant
+  `metadataJson` JSON.parse per candidate pair (reuses the pre-built `metaById`).
+- **CONSOLIDATE_WRITE_BATCHING** — all consolidation row updates (merge loser,
+  merge survivor, cleared duplicate flags) are staged and flushed once per row
+  at the end, so a row touched by both a merge and a flag-clear commits exactly
+  once. LanceDB applies one values object per predicate, so distinct rows still
+  commit 1:1 — this is the single chokepoint where a future LanceDB per-row
+  bulk update can slot in for the real 100× write win.
+
 ### v1.5.7 (2026-09-08)
 
 **VERSION_STAMP_FIX — 1.5.6 released with a stale version stamp** — the

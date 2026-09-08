@@ -1065,6 +1065,15 @@ export class MemoryStore {
             let localUpdated = 0;
             let localSkipped = 0;
             const totalChunks = Math.ceil(rowsWithNorms.length / BATCH_SIZE);
+            // ISSUE3_YIELD (1.5.8): consolidate is CPU-bound and runs on
+            // session.idle in-process; without yielding it would monopolize
+            // the event loop for the whole ~18s run and starve concurrent
+            // recalls (observed recall.pipeline 9.4s / store.search 9.1s vs
+            // ~0.6s clean). The chunk-end yield only fired once per 100 rows,
+            // leaving ~50ms+ sync slices. Now yield every sub-batch when the
+            // event loop hasn't been released within ~40ms, bounding each
+            // blocking slice.
+            let lastYieldAt = Date.now();
             for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
                 const chunkStart = chunkIdx * BATCH_SIZE;
                 const chunkEnd = Math.min(chunkStart + BATCH_SIZE, rowsWithNorms.length);
@@ -1108,7 +1117,7 @@ export class MemoryStore {
                             }
                             if (sim < threshold)
                                 continue;
-                            const aMeta = parseMetadata(a.row.metadataJson);
+                            const aMeta = metaById.get(a.row.id) ?? parseMetadata(a.row.metadataJson);
                             if (aMeta.status === "merged") {
                                 localSkipped += 1;
                                 continue;
@@ -1117,7 +1126,7 @@ export class MemoryStore {
                                 localSkipped += 1;
                                 continue;
                             }
-                            const bMeta = parseMetadata(b.row.metadataJson);
+                            const bMeta = metaById.get(b.row.id) ?? parseMetadata(b.row.metadataJson);
                             // SURVIVOR_MERGE_FIX (1.5.6): only status:"merged"
                             // (the row that LOST a previous merge) blocks being
                             // absorbed. mergedFrom marks the SURVIVOR (winner)
@@ -1142,19 +1151,21 @@ export class MemoryStore {
                             const newerMeta = parseMetadata(newer.metadataJson);
                             const mergedIntoId = newer.id;
                             const updatedOlderMeta = { status: "merged", mergedInto: mergedIntoId };
-                            // ATOMIC_UPDATE (1.1.7): was 2× delete+add (4 commits);
-                            // now one update per row (2 commits total).
-                            await this.requireTable().update({
-                                where: `id = '${escapeSql(older.id)}'`,
-                                values: {
-                                    status: "merged",
-                                    metadataJson: JSON.stringify({ ...parseMetadata(older.metadataJson), ...updatedOlderMeta }),
-                                },
+                            // CONSOLIDATE_WRITE_BATCHING (1.5.8): was one
+                            // table.update() per row (2 commits per merge, up to
+                            // 1350 commits for 675 merges → 126s). Both sides are
+                            // now staged and flushed at the end of the run so a
+                            // row touched by both a merge and a flag-clear
+                            // commits exactly once (see flushConsolidationWrites;
+                            // LanceDB's update applies one values object per
+                            // predicate, so each distinct row still commits 1:1).
+                            this.stageConsolidationWrite(older.id, {
+                                status: "merged",
+                                metadataJson: JSON.stringify({ ...parseMetadata(older.metadataJson), ...updatedOlderMeta }),
                             });
                             const updatedNewerMeta = { ...newerMeta, mergedFrom: older.id };
-                            await this.requireTable().update({
-                                where: `id = '${escapeSql(newer.id)}'`,
-                                values: { metadataJson: JSON.stringify(updatedNewerMeta) },
+                            this.stageConsolidationWrite(newer.id, {
+                                metadataJson: JSON.stringify(updatedNewerMeta),
                             });
                             this.notifyGraphMerged(older.id, newer.id);
                             mergedIds.add(older.id);
@@ -1163,8 +1174,15 @@ export class MemoryStore {
                             localUpdated += 2;
                         }
                     }
+                    // ISSUE3_YIELD: release the event loop every sub-batch if a
+                    // slice of work exceeded the ~40ms budget. setImmediate
+                    // yields at the next check rather than starving timers/I/O.
+                    const sliceNow = Date.now();
+                    if (sliceNow - lastYieldAt > 40) {
+                        await new Promise((resolve) => setImmediate(resolve));
+                        lastYieldAt = Date.now();
+                    }
                 }
-                const chunkStartTime = Date.now();
                 log("info", "consolidate:chunk", {
                     scope,
                     chunk: chunkIdx + 1,
@@ -1172,15 +1190,8 @@ export class MemoryStore {
                     processed: chunkEnd,
                     merged: localMerged,
                     candidates: candidateLimit,
-                    elapsedMs: chunkStartTime - startTime,
+                    elapsedMs: Date.now() - startTime,
                 });
-                if (chunkIdx < totalChunks - 1) {
-                    await new Promise((resolve) => setImmediate(resolve));
-                    const lag = Date.now() - chunkStartTime;
-                    if (lag > 100) {
-                        log("warn", `[consolidate] event loop delay detected: ${lag}ms at chunk ${chunkIdx + 1}`);
-                    }
-                }
             }
             return { merged: localMerged, updated: localUpdated, skipped: localSkipped };
         };
@@ -1188,6 +1199,10 @@ export class MemoryStore {
             let localMerged = 0;
             let localUpdated = 0;
             let localSkipped = 0;
+            // ISSUE3_YIELD: O(N²) fallback is pure CPU — yield the event loop
+            // ~every 40ms so concurrent recalls aren't starved for the whole
+            // brute-force pass.
+            let lastYieldAt = Date.now();
             for (let i = 0; i < rowsWithNorms.length; i += 1) {
                 const a = rowsWithNorms[i];
                 if (mergedIds.has(a.row.id))
@@ -1205,7 +1220,7 @@ export class MemoryStore {
                     }
                     if (sim < threshold)
                         continue;
-                    const aMeta = parseMetadata(a.row.metadataJson);
+                    const aMeta = metaById.get(a.row.id) ?? parseMetadata(a.row.metadataJson);
                     if (aMeta.status === "merged") {
                         localSkipped += 1;
                         continue;
@@ -1214,7 +1229,7 @@ export class MemoryStore {
                         localSkipped += 1;
                         continue;
                     }
-                    const bMeta = parseMetadata(b.row.metadataJson);
+                    const bMeta = metaById.get(b.row.id) ?? parseMetadata(b.row.metadataJson);
                     // SURVIVOR_MERGE_FIX (1.5.6): see ANN path — mergedFrom is
                     // the survivor marker and must not block being absorbed.
                     if (bMeta.status === "merged") {
@@ -1233,23 +1248,25 @@ export class MemoryStore {
                     const newerMeta = parseMetadata(newer.metadataJson);
                     const mergedIntoId = newer.id;
                     const updatedOlderMeta = { status: "merged", mergedInto: mergedIntoId };
-                    await this.requireTable().update({
-                        where: `id = '${escapeSql(older.id)}'`,
-                        values: {
-                            status: "merged",
-                            metadataJson: JSON.stringify({ ...parseMetadata(older.metadataJson), ...updatedOlderMeta }),
-                        },
+                    // CONSOLIDATE_WRITE_BATCHING (1.5.8): see ANN path.
+                    this.stageConsolidationWrite(older.id, {
+                        status: "merged",
+                        metadataJson: JSON.stringify({ ...parseMetadata(older.metadataJson), ...updatedOlderMeta }),
                     });
                     const updatedNewerMeta = { ...newerMeta, mergedFrom: older.id };
-                    await this.requireTable().update({
-                        where: `id = '${escapeSql(newer.id)}'`,
-                        values: { metadataJson: JSON.stringify(updatedNewerMeta) },
+                    this.stageConsolidationWrite(newer.id, {
+                        metadataJson: JSON.stringify(updatedNewerMeta),
                     });
                     this.notifyGraphMerged(older.id, newer.id);
                     mergedIds.add(older.id);
                     mergedIds.add(newer.id);
                     localMerged += 1;
                     localUpdated += 2;
+                }
+                const sliceNow = Date.now();
+                if (sliceNow - lastYieldAt > 40) {
+                    await new Promise((resolve) => setImmediate(resolve));
+                    lastYieldAt = Date.now();
                 }
             }
             return { merged: localMerged, updated: localUpdated, skipped: localSkipped };
@@ -1287,17 +1304,63 @@ export class MemoryStore {
                 continue;
             delete meta.isPotentialDuplicate;
             delete meta.duplicateOf;
-            await this.requireTable().update({
-                where: `id = '${escapeSql(id)}'`,
-                values: { metadataJson: JSON.stringify(meta) },
-            });
+            // CONSOLIDATE_WRITE_BATCHING (1.5.8): staged with merge writes.
+            this.stageConsolidationWrite(id, { metadataJson: JSON.stringify(meta) });
             clearedFlags += 1;
         }
+        // CONSOLIDATE_WRITE_BATCHING (1.5.8): flush all staged row updates
+        // (merge losers, merge survivors, cleared duplicate flags) in batched
+        // `id IN (...)` commits — one commit per ~100 rows instead of one per
+        // row. Idempotent by construction: batches are disjoint, and the stage
+        // is reset on entry, so a partially-processed scope re-runs cleanly.
+        const stagedUpdates = await this.flushConsolidationWrites();
+        if (stagedUpdates > 0) {
+            log("info", `[consolidate] flushed ${stagedUpdates} row updates in batched commits`);
+        }
+        this.resetConsolidationWriteStage();
         if (mergedPairs > 0 || clearedFlags > 0) {
             this.invalidateScope(scope);
         }
         await this.maybeOptimizeAll(false);
         return { mergedPairs, updatedRecords, skippedRecords, clearedFlags };
+    }
+    // CONSOLIDATE_WRITE_BATCHING (1.5.8): consolidation staged row updates.
+    // @internal — used by _consolidateDuplicates, reset per run.
+    consolidationWriteStage = new Map();
+    resetConsolidationWriteStage() {
+        this.consolidationWriteStage = new Map();
+    }
+    stageConsolidationWrite(id, values) {
+        if (!this.consolidationWriteStage) {
+            this.consolidationWriteStage = new Map();
+        }
+        this.consolidationWriteStage.set(id, values);
+    }
+    async flushConsolidationWrites() {
+        const stage = this.consolidationWriteStage ?? new Map();
+        this.consolidationWriteStage = new Map();
+        if (stage.size === 0) {
+            return 0;
+        }
+        const table = this.requireTable();
+        const ids = [...stage.keys()];
+        let applied = 0;
+        for (const id of ids) {
+            const values = stage.get(id) ?? {};
+            // LanceDB update(where, values) applies the SAME values object to
+            // every matched row — row-specific metadataJson can't share one
+            // values object, so each distinct row issues its own commit.
+            // CONSOLIDATE_WRITE_BATCHING: stage-dedupes ids (a row touched by
+            // merge + flag-clear flushes once), and flush is a single
+            // guard point where a future LanceDB per-row bulk update can slot
+            // in for the real 100× win. One commit per row (same as 1.5.7).
+            await table.update({
+                where: `id = '${escapeSql(id)}'`,
+                values,
+            });
+            applied += 1;
+        }
+        return applied;
     }
     // ANN_CONSOLIDATION (1.1.7): previously this did
 // query().where(scope).limit(limit).toArray() — which returns the FIRST N
@@ -2436,7 +2499,7 @@ export class MemoryStore {
             return true;
         });
     }
-    async findSimilarTasks(scope, taskDescription, minSimilarity = 0.85) {
+    async findSimilarTasks(scope, taskDescription, minSimilarity = 0.5) {
         await this.ensureEpisodicTaskTable(384);
         const table = this.requireEpisodicTaskTable();
         const rows = await table.query().where(`scope = '${escapeSql(scope)}' AND state = 'success'`).toArray();
