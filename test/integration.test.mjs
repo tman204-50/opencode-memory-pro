@@ -992,6 +992,51 @@ test("integration: config-driven divergent retention.scoring protects old memori
     }
 });
 
+// SCOPE_CACHE_CAP_WIRE (1.5.9-post): the store's per-scope searchable-cache
+// cap (cacheConfig.maxRecordsPerScope, DEFAULT 1000) is a module-level env
+// constant, separate from the resolved config.maxEntriesPerScope (default
+// 3000). The two knobs silently disagreed — a scope past 1000 records was
+// searchable only to 1000, hiding up to (maxEntriesPerScope - 1000) memories
+// from recall. wireStoreCacheCap must apply the configured cap unless the
+// operator set OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE. Mutants: reverting
+// the wire call (or honoring env unconditionally) fails the asserts below.
+test("integration: config maxEntriesPerScope wires into store searchable-cache cap (SCOPE_CACHE_CAP_WIRE)", async () => {
+    const { wireStoreCacheCap } = await import("../dist/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "mem-capwire-"));
+    const store = new MemoryStore(join(dir, "lancedb"));
+    const cfg = resolveMemoryConfig({ memory: { maxEntriesPerScope: 150 } }, "/tmp");
+    assert.equal(cfg.maxEntriesPerScope, 150, "sanity: resolved maxEntriesPerScope");
+    try {
+        wireStoreCacheCap(store, cfg);
+        assert.equal(store.cacheConfig.maxRecordsPerScope, 150, `config cap must win over the 1000 default, got ${store.cacheConfig.maxRecordsPerScope}`);
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: explicit OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE blocks config wiring (SCOPE_CACHE_CAP_WIRE env)", async () => {
+    const { wireStoreCacheCap } = await import("../dist/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "mem-capwire-env-"));
+    const saved = process.env.OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE;
+    process.env.OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE = "400";
+    const store = new MemoryStore(join(dir, "lancedb"));
+    const cfg = resolveMemoryConfig({ memory: { maxEntriesPerScope: 150 } }, "/tmp");
+    try {
+        // The env var is baked into the store at module load, so with it set
+        // the operator already chose the cap; wireStoreCacheCap must not
+        // clobber it with config. (Module constant stays 1000 in this test
+        // process, which is exactly what must survive unchanged.)
+        wireStoreCacheCap(store, cfg);
+        assert.equal(store.cacheConfig.maxRecordsPerScope, 1000, `config must not override an explicitly-set env cap, got ${store.cacheConfig.maxRecordsPerScope}`);
+    }
+    finally {
+        if (saved === undefined) delete process.env.OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE;
+        else process.env.OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE = saved;
+        store.close();
+    }
+});
+
 test("integration: forced compaction is safe on a fresh store", async () => {
     const store = await newStore("mem-compact-");
     try {

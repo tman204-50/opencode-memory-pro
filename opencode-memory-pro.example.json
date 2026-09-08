@@ -21,7 +21,7 @@
     "bm25Weight": 0.3,
     "fuzzyWeight": 0.15,
     "fuzzyThreshold": 0.5,
-    "minScore": 0.2,
+    "minScore": 0.3,
     "rrfK": 60,
     "recencyBoost": true,
     "recencyHalfLifeHours": 72,
@@ -116,14 +116,14 @@
     "candidateLimit": 50
   },
   "graph": {
-    "_comment": "Offline entity graph: co-occurrence + typed relations (uses/depends_on/...), powers [graph+X%] recall boosts and BFS expansion. No LLM needed.",
+    "_comment": "Offline entity graph: co-occurrence + typed relations (uses/depends_on/...), powers [graph+X%] recall boosts and BFS expansion. No LLM needed. expansionEnabled defaults to false (1.6.0): measured on the live store, BFS expansion injected tangential memories into top-5 and hurt MRR; keep it off unless you specifically want multi-hop discovery.",
     "enabled": true,
     "dbPath": "~/.opencode/memory/graph.db",
     "boostLambda": 0.3,
     "maxEntitiesPerMemory": 20,
     "maxEdgeProvenance": 20,
     "typedEdges": true,
-    "expansionEnabled": true,
+    "expansionEnabled": false,
     "maxHops": 2,
     "expansionLimit": 5,
     "expansionLambda": 0.3

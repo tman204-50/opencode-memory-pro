@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.5.9";
+const PLUGIN_VERSION = "1.6.0";
 const SCHEMA_VERSION = 1;
 // CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
 // on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
@@ -388,6 +388,15 @@ async function createRuntimeState(input) {
     const resolved = resolveMemoryConfig(undefined, input.worktree);
     const embedder = createEmbedder(resolved.embedding);
     const store = new MemoryStore(resolved.dbPath);
+    // SCOPE_CACHE_CAP_WIRE (1.5.9-post): the store's per-scope searchable-cache
+    // cap (cacheConfig.maxRecordsPerScope, DEFAULT 1000) is a module-level env
+    // constant from MAX_RECORDS_PER_SCOPE, separate from the resolved
+    // config.maxEntriesPerScope (default 3000). The two knobs silently
+    // disagreed — a scope with 1315 records was searchable only to 1000 —
+    // hiding up to (maxEntriesPerScope - 1000) memories from recall. Wire the
+    // configured cap through unless the operator explicitly set
+    // OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE (env keeps precedence).
+    wireStoreCacheCap(store, resolved);
     // GRACEFUL_SHUTDOWN: lance runs auto_cleanup_hook in a background tokio
     // task after each commit; exiting without closing the connection cancels
     // it and logs a noisy "task was cancelled" ERROR. Connection close is
@@ -1246,6 +1255,19 @@ async function persistSuccessPatterns(taskId, scope, state) {
 function unavailableMessage(provider) {
     return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
 }
+// SCOPE_CACHE_CAP_WIRE (1.5.9-post): test seam + runtime wiring. Makes the
+// store's searchable-cache cap follow config.maxEntriesPerScope (default
+// 3000) instead of the module-level MAX_RECORDS_PER_SCOPE default (1000),
+// unless the operator explicitly set OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE
+// (env keeps precedence). Defensive so the legacy-loader walk can call it
+// with a plugin input and safely no-op.
+function wireStoreCacheCap(store, resolved) {
+    if (!store?.cacheConfig || !resolved?.maxEntriesPerScope)
+        return;
+    if (process.env.OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE)
+        return;
+    store.cacheConfig.maxRecordsPerScope = resolved.maxEntriesPerScope;
+}
 function hasEmbeddingConfigChanged(current, next) {
     return (current.provider !== next.provider
         || current.model !== next.model
@@ -1267,4 +1289,4 @@ export default {
 // Named exports for regression tests only — opencode plugin loading consumes
 // the default export and ignores these (kept below `export default` so the
 // legacy loader fallback would still reach the server factory first).
-export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline, wireRetentionScoring };
+export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline, wireRetentionScoring, wireStoreCacheCap };

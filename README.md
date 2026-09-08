@@ -180,7 +180,7 @@ index and capture still works — the plugin is offline-tolerant by design.
 | `retrieval.bm25Weight` | `0.3` | (Weights are normalized to sum 1.) |
 | `retrieval.fuzzyWeight` | `0.15` | fuse.js typo-tolerant fuzzy channel weight; `0` disables it. |
 | `retrieval.fuzzyThreshold` | `0.5` | fuse.js match threshold (lower = stricter). |
-| `retrieval.minScore` | `0.2` | Minimum score for a result to qualify. |
+| `retrieval.minScore` | `0.3` | Minimum score for a result to qualify. |
 | `retrieval.rrfK` | `60` | RRF constant. |
 | `retrieval.recencyBoost` | `true` | Boost recently recalled/created memories. |
 | `retrieval.recencyHalfLifeHours` | `72` | Half-life of the recency boost. |
@@ -252,7 +252,7 @@ skipped. The batch size of the ANN consolidation queries is tunable via
 | `graph.maxEntitiesPerMemory` | `20` | Max entities extracted per memory/query. |
 | `graph.maxEdgeProvenance` | `20` | Max memories backing an edge (bounds stored weight). |
 | `graph.typedEdges` | `true` | Emit typed relation edges (`uses`, `depends_on`, ...). |
-| `graph.expansionEnabled` | `true` | BFS graph-expansion recall. |
+| `graph.expansionEnabled` | `false` | BFS graph-expansion recall (off by default since 1.6.0; see changelog). |
 | `graph.maxHops` | `2` | BFS depth (1–4). |
 | `graph.expansionLimit` | `5` | Max expanded candidates. |
 | `graph.expansionLambda` | `0.3` | Expansion score weight (0–1). |
@@ -506,6 +506,29 @@ npm run verify      # tests + pack dry-run
 CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
+
+### v1.6.0 (2026-09-08)
+
+**Precision-tuned defaults + searchable-cache cap wiring.**
+
+- `graph.expansionEnabled` default `true → false`, `retrieval.minScore` default
+  `0.2 → 0.3`. Tuned on the live store with `scripts/precision-tune.mjs` (8
+  ground-truth queries, MRR@5/Recall@5/Precision@5/noise): BFS graph expansion
+  injected tangentially-related memories into top-5 (`expansionNoiseTop5` 12 → 0)
+  and suppressed MRR@5 (`0.556 → 0.917` once off). Entity co-occurrence boost
+  (`graph.boostLambda`, still `0.3`) measures better than expansion alone.
+- **SCOPE_CACHE_CAP_WIRE** — the store's per-scope searchable-cache cap
+  (`cacheConfig.maxRecordsPerScope`, module default 1000) now follows
+  `config.maxEntriesPerScope` (default 3000) via a new `wireStoreCacheCap`
+  seam, unless the operator explicitly set
+  `OPENCODE_MEMORY_PRO_MAX_RECORDS_PER_SCOPE` (env keeps precedence). A scope
+  past 1000 records previously hid up to `maxEntriesPerScope - 1000` memories
+  from search (live store: 1315 records → ~315 invisible); raising to 3000
+  measured +25% Recall@5, +19% Precision@5, +9% MRR@5 on the tuning suite.
+- New `scripts/precision-tune.mjs` tuning harness (ground-truth queries, metric
+  aggregation, config grid sweep, `--candidate` + `OPENCODE_MEMORY_PRO_CAP`
+  overrides) — score any candidate against live or temp stores.
+- Tests: 122/122 (incl. two `SCOPE_CACHE_CAP_WIRE` regression tests).
 
 ### v1.5.9 (2026-09-08)
 

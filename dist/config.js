@@ -81,7 +81,7 @@ export function resolveMemoryConfig(config, worktree) {
             bm25Weight: normalizedBm25Weight,
             fuzzyWeight: normalizedFuzzyWeight,
             fuzzyThreshold,
-            minScore: clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_MIN_SCORE ?? retrievalRaw.minScore, 0.2), 0, 1),
+            minScore: clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_MIN_SCORE ?? retrievalRaw.minScore, 0.3), 0, 1),
             rrfK,
             recencyBoost,
             recencyHalfLifeHours,
@@ -187,7 +187,12 @@ function resolveGraphConfig(raw, env) {
     // on top of the co-occurrence graph. On by default; env override available.
     const typedEdges = toBoolean(env.OPENCODE_MEMORY_PRO_GRAPH_TYPED_EDGES ?? graphRaw.typedEdges, true);
     // GRAPH_STORE_PHASE2B: graph-expansion recall (BFS from query entities).
-    const expansionEnabled = toBoolean(env.OPENCODE_MEMORY_PRO_GRAPH_EXPANSION_ENABLED ?? graphRaw.expansionEnabled, true);
+    // PRECISION_TUNING (1.6.0): expansion recall is OFF by default — measured
+    // on the live store (scripts/precision-tune.mjs) it injected tangentially
+    // related memories into top-5 (expansionNoiseTop5=12 → 0) and suppressed
+    // MRR@5 (0.556 → 0.917 with boost-only). Entity co-occurrence boost
+    // (boostLambda) stays on; expansion is opt-in via config/env.
+    const expansionEnabled = toBoolean(env.OPENCODE_MEMORY_PRO_GRAPH_EXPANSION_ENABLED ?? graphRaw.expansionEnabled, false);
     const maxHops = Math.min(4, Math.max(1, Math.floor(toNumber(env.OPENCODE_MEMORY_PRO_GRAPH_MAX_HOPS ?? graphRaw.maxHops, 2))));
     const expansionLimit = Math.max(1, Math.floor(toNumber(env.OPENCODE_MEMORY_PRO_GRAPH_EXPANSION_LIMIT ?? graphRaw.expansionLimit, 5)));
     const expansionLambda = clamp(toNumber(env.OPENCODE_MEMORY_PRO_GRAPH_EXPANSION_LAMBDA ?? graphRaw.expansionLambda, 0.3), 0, 1);
