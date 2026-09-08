@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCandidates } from "../dist/store.js";
+import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCandidates, computeRetentionScore } from "../dist/store.js";
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput } from "../dist/llm.js";
 import { summarizeContent } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, wireRetentionScoring } from "../dist/index.js";
 import { extractCaptureCandidate } from "../dist/extract.js";
 import { buildPreferenceInjection } from "../dist/preference.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
@@ -23,6 +23,41 @@ test("identity: config defaults to opencode-memory-pro", () => {
     assert.equal(cfg.graph.dbPath, `${process.env.HOME}/.opencode/memory/graph.db`);
     assert.equal(cfg.retention.memory.enabled, true);
     assert.equal(cfg.summarize.enabled, true);
+});
+
+test("config: retention.scoring defaults to retrieval weights and can diverge", () => {
+    const defaults = resolveMemoryConfig({}, "/tmp");
+    assert.equal(defaults.retention.scoring.recencyHalfLifeHours, defaults.retrieval.recencyHalfLifeHours, "half-life must default to retrieval");
+    assert.equal(defaults.retention.scoring.importanceWeight, defaults.retrieval.importanceWeight, "importanceWeight must default to retrieval");
+    assert.equal(defaults.retention.scoring.feedbackWeight, defaults.retrieval.feedbackWeight, "feedbackWeight must default to retrieval");
+
+    const divergent = resolveMemoryConfig({
+        memory: {
+            retention: { scoring: { importanceWeight: 1.5, feedbackWeight: 0 } },
+        },
+    }, "/tmp");
+    assert.equal(divergent.retention.scoring.importanceWeight, 1.5, "retention.scoring.importanceWeight must override");
+    assert.equal(divergent.retention.scoring.feedbackWeight, 0, "retention.scoring.feedbackWeight must override");
+    assert.equal(divergent.retention.scoring.recencyHalfLifeHours, divergent.retrieval.recencyHalfLifeHours, "unset scoring key must still default to retrieval");
+    assert.equal(divergent.retrieval.importanceWeight, 0.4, "live search ranking must NOT change when retention.scoring diverges");
+});
+
+test("config: retention.scoring env overrides take precedence", () => {
+    const old = process.env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_IMPORTANCE_WEIGHT;
+    process.env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_IMPORTANCE_WEIGHT = "2";
+    try {
+        const cfg = resolveMemoryConfig({ memory: { retention: { scoring: { importanceWeight: 0.8 } } } }, "/tmp");
+        assert.equal(cfg.retention.scoring.importanceWeight, 2, "env must win over sidecar/raw");
+        assert.equal(cfg.retrieval.importanceWeight, 0.4, "retrieval ranking must stay unchanged");
+    }
+    finally {
+        if (old === undefined) {
+            delete process.env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_IMPORTANCE_WEIGHT;
+        }
+        else {
+            process.env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_IMPORTANCE_WEIGHT = old;
+        }
+    }
 });
 
 test("config: capture defaults to heuristics with the agreed summarization model", () => {
@@ -406,18 +441,20 @@ test("graph: extractTypedRelations emits directional relations", () => {
 test("config: mergeMemoryConfig deep-merges retention/summarize/logging fragments", () => {
     const merged = mergeMemoryConfig(
         {
-            retention: { effectivenessEventsDays: 45, memory: { enabled: true, minAgeDays: 120 } },
+            retention: { effectivenessEventsDays: 45, memory: { enabled: true, minAgeDays: 120 }, scoring: { importanceWeight: 0.4, feedbackWeight: 0.3 } },
             summarize: { targetChars: 777 },
             logging: { level: "error" },
         },
         {
-            retention: { memory: { enabled: false } },
+            retention: { memory: { enabled: false }, scoring: { importanceWeight: 1.5 } },
             summarize: { minGroupSize: 9 },
         },
     );
     assert.equal(merged.retention.effectivenessEventsDays, 45, "fragment must not drop legacy retention scalar");
     assert.equal(merged.retention.memory.enabled, false, "fragment override wins");
     assert.equal(merged.retention.memory.minAgeDays, 120, "fragment must not drop legacy retention.memory sub-key");
+    assert.equal(merged.retention.scoring.importanceWeight, 1.5, "fragment override wins for scoring");
+    assert.equal(merged.retention.scoring.feedbackWeight, 0.3, "fragment must not drop unset scoring keys");
     assert.equal(merged.summarize.targetChars, 777, "fragment must not drop legacy summarize scalar");
     assert.equal(merged.summarize.minGroupSize, 9, "fragment override wins");
     assert.equal(merged.logging.level, "error", "fragment must not drop legacy logging");
@@ -1536,4 +1573,103 @@ test("plugin: no export before the server factory throws when invoked as a legac
             assert.fail(`legacy factory export threw before server: ${error.message}`);
         }
     }
+});
+
+// RETENTION_SCORING (1.5.5): composite retention score for scope-cache
+// truncation. Mutants: dropping the wrong-status -1, the verified bonus, the
+// importance term, or the feedback term each make a dedicated assert fail.
+const retentionWeights = { recencyHalfLifeHours: 72, importanceWeight: 0.4, feedbackWeight: 0.3 };
+
+function retentionRecord(overrides = {}) {
+    return {
+        id: "r",
+        text: "some memory",
+        importance: 0.5,
+        timestamp: Date.now(),
+        citationStatus: undefined,
+        ...overrides,
+    };
+}
+
+test("store: computeRetentionScore evicts wrong citations first, unconditionally", () => {
+    const wrong = computeRetentionScore(retentionRecord({
+        importance: 1,
+        timestamp: Date.now(),
+        citationStatus: "wrong",
+    }), undefined, retentionWeights);
+    const important = computeRetentionScore(retentionRecord({
+        importance: 1,
+        timestamp: Date.now(),
+        citationStatus: "verified",
+    }), undefined, retentionWeights);
+    assert.equal(wrong, -1, "wrong citation must score -1 regardless of other fields");
+    assert.ok(wrong < important, "wrong must sort below any normal record");
+});
+
+test("store: computeRetentionScore boosts verified citations", () => {
+    const base = retentionRecord();
+    const verified = computeRetentionScore({ ...base, citationStatus: "verified" }, undefined, retentionWeights);
+    const pending = computeRetentionScore({ ...base, citationStatus: "pending" }, undefined, retentionWeights);
+    assert.ok(verified > pending, "verified must outrank pending");
+});
+
+test("store: computeRetentionScore scales with importance", () => {
+    const high = computeRetentionScore(retentionRecord({ importance: 1 }), undefined, retentionWeights);
+    const low = computeRetentionScore(retentionRecord({ importance: 0 }), undefined, retentionWeights);
+    assert.ok(high > low, "more important memory must score higher");
+});
+
+test("store: computeRetentionScore applies feedback factor only when weighted", () => {
+    const record = retentionRecord();
+    const boostedFeedback = { feedbackFactor: 2 };
+    const withFeedback = computeRetentionScore(record, boostedFeedback, retentionWeights);
+    const without = computeRetentionScore(record, undefined, retentionWeights);
+    assert.ok(withFeedback > without, "positive feedback must raise the retention score");
+    const zeroWeight = { ...retentionWeights, feedbackWeight: 0 };
+    assert.equal(
+        computeRetentionScore(record, boostedFeedback, zeroWeight),
+        computeRetentionScore(record, undefined, zeroWeight),
+        "feedback must be ignored when feedbackWeight is 0",
+    );
+});
+
+test("store: computeRetentionScore decays recency but keeps a soft floor", () => {
+    const now = Date.now();
+    const fresh = computeRetentionScore(retentionRecord({ timestamp: now }), undefined, retentionWeights);
+    const ancient = computeRetentionScore(retentionRecord({ timestamp: now - 365 * 24 * 60 * 60 * 1000 }), undefined, retentionWeights);
+    assert.ok(fresh > ancient, "fresher memory must score higher");
+    assert.ok(ancient >= 0.5, "recency floor must keep ancient memories at 0.5, not zero");
+});
+
+test("store: computeRetentionScore is deterministic and treats missing fields as neutral", () => {
+    const a = computeRetentionScore(retentionRecord({ importance: undefined, timestamp: undefined }), undefined, retentionWeights);
+    const b = computeRetentionScore(retentionRecord({ importance: 0.5, timestamp: Date.now() }), undefined, retentionWeights);
+    assert.equal(computeRetentionScore(retentionRecord(), undefined, retentionWeights), computeRetentionScore(retentionRecord(), undefined, retentionWeights));
+    assert.ok(Number.isFinite(a) && b >= a, "missing importance/timestamp must degrade gracefully");
+});
+
+// RETENTION_SCORING (1.5.5): the index.js wiring test seam. The cache must
+// receive retention.scoring.* (which defaults from, but can diverge from,
+// retrieval.*). Mutant: changing wireRetentionScoring to pass resolved.retrieval
+// makes retentionScoringConfig.importanceWeight equal 0.4 and this test fails.
+test("store: wireRetentionScoring feeds retention.scoring, not retrieval, into the scope cache (RETENTION_SCORING wiring)", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const store = new MemoryStore(join(mkdtempSync(join(tmpdir(), "wire-ret-")), "lancedb"));
+    const cfg = resolveMemoryConfig({
+        memory: {
+            retrieval: { importanceWeight: 0.4 },
+            retention: { scoring: { importanceWeight: 1.5 } },
+        },
+    }, "/tmp");
+    wireRetentionScoring(store, cfg);
+    assert.equal(store.retentionScoringConfig, cfg.retention.scoring, "store must hold the resolved retention.scoring object");
+    assert.equal(store.retentionScoringConfig.importanceWeight, 1.5, "divergent retention scoring weight must reach the store");
+    assert.equal(cfg.retrieval.importanceWeight, 0.4, "retrieval ranking weight must stay untouched");
+    // Defensive no-ops: legacy-loader check invokes every export as a plugin
+    // with a bare input; a malformed/configless call must never throw.
+    wireRetentionScoring({}, {});
+    wireRetentionScoring(undefined, cfg);
+    wireRetentionScoring(store, {});
 });

@@ -548,6 +548,15 @@ export class MemoryStore {
     setRetentionConfig(config) {
         this.retentionConfig = config;
     }
+    // RETENTION_SCORING (1.5.5): weights for retention-scored scope-cache
+    // truncation (WHICH records survive when a scope exceeds
+    // maxRecordsPerScope). Reuses the retrieval.* weights from search ranking
+    // so "what ranks well ≈ what survives truncation". Set by index.js from
+    // resolved.retrieval; null keeps the legacy recency-only truncation.
+    retentionScoringConfig;
+    setRetentionScoringConfig(config) {
+        this.retentionScoringConfig = config || null;
+    }
     // GRAPH_STORE_PHASE1: attach the offline entity graph for provenance
     // cleanup on memory removal/merge. Safe no-op if never attached.
     attachGraph(graph) {
@@ -2115,12 +2124,33 @@ export class MemoryStore {
                 const records = await this.readByScopes([scope]);
                 let sortedRecords = records;
                 if (records.length > this.cacheConfig.maxRecordsPerScope) {
-                    // SCOPE_CACHE_TRUNCATE (1.3.5): truncation used to be
-                    // silent, which made older memories permanently invisible
-                    // to search. Log it once per cache rebuild so the operator
-                    // knows to raise cacheConfig.maxRecordsPerScope.
-                    log("warn", `[store] scope cache truncated: ${scope} has ${records.length} records but maxRecordsPerScope=${this.cacheConfig.maxRecordsPerScope}; older memories are not searchable until the limit is raised`);
-                    sortedRecords = [...records].sort((a, b) => b.timestamp - a.timestamp).slice(0, this.cacheConfig.maxRecordsPerScope);
+                    // RETENTION_SCORING (1.5.5): truncation used to keep only
+                    // the N NEWEST records, so a valuable old memory
+                    // (important, verified, positively fed back) was silently
+                    // dropped from search the moment enough newer records
+                    // landed — identical treatment to throwaway fragments.
+                    // With retention weights configured (index.js sets them
+                    // from retrieval.*), the survivors are the top-N by a
+                    // composite retention score (recency × importance ×
+                    // feedback × citation bonus) with timestamp as the
+                    // deterministic tiebreak; "wrong" citations score -1 and
+                    // are evicted first. Unconfigured stores keep the legacy
+                    // recency-only behavior.
+                    log("warn", `[store] scope cache truncated: ${scope} has ${records.length} records but maxRecordsPerScope=${this.cacheConfig.maxRecordsPerScope}; only the top ${this.cacheConfig.maxRecordsPerScope} by retention score are searchable until the limit is raised`);
+                    if (this.retentionScoringConfig) {
+                        const weights = this.retentionScoringConfig;
+                        const feedbackMap = (weights.feedbackWeight ?? 0) > 0
+                            ? await this.getMemoryFeedbackStatsMap(records.map((r) => r.id), [scope])
+                            : new Map();
+                        sortedRecords = records
+                            .map((record) => ({ record, retention: computeRetentionScore(record, feedbackMap.get(record.id), weights) }))
+                            .sort((a, b) => b.retention - a.retention || b.record.timestamp - a.record.timestamp)
+                            .slice(0, this.cacheConfig.maxRecordsPerScope)
+                            .map((s) => s.record);
+                    }
+                    else {
+                        sortedRecords = [...records].sort((a, b) => b.timestamp - a.timestamp).slice(0, this.cacheConfig.maxRecordsPerScope);
+                    }
                 }
                 const tokenized = sortedRecords.map((record) => tokenize(record.text));
                 const idf = computeIdf(tokenized);
@@ -3529,6 +3559,30 @@ function clampImportanceWeight(value) {
     if (!Number.isFinite(value))
         return 0.4;
     return Math.max(0, Math.min(2, value));
+}
+// RETENTION_SCORING (1.5.5): composite, query-independent retention score for
+// scope-cache truncation. Reuses the exact ranking primitives (recency
+// multiplier with its 0.5 soft floor, importance factor, feedback factor) so
+// a memory that ranks well also survives cache truncation. citationStatus
+// "wrong" is a confirmed-bad signal (explicit user/system feedback) and is
+// evicted first, unconditionally; "verified" earns a modest survival bonus.
+// feedbackStats is the getMemoryFeedbackStatsMap entry (undefined = neutral).
+export function computeRetentionScore(record, feedbackStats, weights = {}) {
+    if (record.citationStatus === "wrong") {
+        return -1;
+    }
+    const halfLifeHours = Number.isFinite(weights.recencyHalfLifeHours) ? Math.max(1, weights.recencyHalfLifeHours) : 72;
+    const importanceWeight = clampImportanceWeight(weights.importanceWeight);
+    const feedbackWeight = Math.max(0, Math.min(1, weights.feedbackWeight ?? 0));
+    // Unknown timestamps are treated as fresh (never evicted for age alone);
+    // computeRecencyMultiplier with NaN would poison the sort order.
+    const recency = computeRecencyMultiplier(Number.isFinite(record.timestamp) ? record.timestamp : Date.now(), halfLifeHours);
+    const importance = 1 + importanceWeight * clampImportance(record.importance);
+    const feedback = feedbackWeight > 0 && feedbackStats
+        ? 1 + feedbackWeight * (feedbackStats.feedbackFactor - 1)
+        : 1;
+    const citationBonus = record.citationStatus === "verified" ? 1.2 : 1;
+    return recency * importance * feedback * citationBonus;
 }
 function computeIdf(docs) {
     const df = new Map();

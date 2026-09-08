@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.5.4";
+const PLUGIN_VERSION = "1.5.5";
 const SCHEMA_VERSION = 1;
 // CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
 // on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
@@ -373,6 +373,17 @@ const plugin = async (input) => {
     };
     return hooks;
 };
+// RETENTION_SCORING (1.5.5): wires the resolved retention scoring weights
+// (defaults from retrieval.*, overridable via retention.scoring.*) into the
+// store's scope-cache truncation. Test seam (exported at the bottom, sorts
+// after `default`); defensive so the legacy-loader check can invoke it with a
+// plugin input and safely no-op.
+function wireRetentionScoring(store, resolved) {
+    if (!store || !resolved || !resolved.retention?.scoring) {
+        return;
+    }
+    store.setRetentionScoringConfig(resolved.retention.scoring);
+}
 async function createRuntimeState(input) {
     const resolved = resolveMemoryConfig(undefined, input.worktree);
     const embedder = createEmbedder(resolved.embedding);
@@ -392,6 +403,11 @@ async function createRuntimeState(input) {
     if (resolved.retention) {
         store.setRetentionConfig(resolved.retention);
     }
+    // RETENTION_SCORING (1.5.5): feed the retention scoring weights (defaults
+    // to retrieval.*, overridable via retention.scoring.*) into the store's
+    // scope-cache truncation so cache eviction keeps what should survive —
+    // without changing live search ranking.
+    wireRetentionScoring(store, resolved);
     const graph = resolved.graph?.enabled ? await createGraphStore(resolved.graph) : null;
     if (graph) {
         try {
@@ -1251,4 +1267,4 @@ export default {
 // Named exports for regression tests only — opencode plugin loading consumes
 // the default export and ignores these (kept below `export default` so the
 // legacy loader fallback would still reach the server factory first).
-export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline };
+export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline, wireRetentionScoring };

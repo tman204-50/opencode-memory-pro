@@ -346,6 +346,23 @@ Env: `OPENCODE_MEMORY_PRO_RETENTION_EVENTS_DAYS`,
 `..._RETENTION_MEMORY_TARGET_CHARS`, `..._RETENTION_MEMORY_MIN_IMPORTANCE`,
 `..._RETENTION_MEMORY_DIGEST_MAX_AGE_DAYS`.
 
+`retention.scoring` — scope-cache truncation weights (which records survive
+when a scope exceeds `maxRecordsPerScope`, default 1000):
+
+| Key | Default | Description |
+|---|---|---|
+| `retention.scoring.recencyHalfLifeHours` | retrieval value (`72`) | Recency decay half-life for the retention score. |
+| `retention.scoring.importanceWeight` | retrieval value (`0.4`) | Importance multiplier for the retention score. |
+| `retention.scoring.feedbackWeight` | retrieval value (`0.3`) | Feedback multiplier for the retention score. |
+
+Each key defaults from the matching `retrieval.*` weight when unset, but can
+diverge — raising `retention.scoring.importanceWeight` (up to `2`) protects
+old important/verified/positively-fedback memories from being evicted by
+newer throwaway captures **without** changing live search ranking.
+
+Env: `OPENCODE_MEMORY_PRO_RETENTION_SCORING_RECENCY_HALF_LIFE_HOURS`,
+`..._RETENTION_SCORING_IMPORTANCE_WEIGHT`, `..._RETENTION_SCORING_FEEDBACK_WEIGHT`.
+
 ### Scoping
 
 | Key | Default | Description |
@@ -489,6 +506,31 @@ npm run verify      # tests + pack dry-run
 CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
+
+### v1.5.5 (2026-09-08)
+
+**Scope-cache retention scoring (proposal Issue 1)** — when a scope exceeds
+`maxRecordsPerScope` (default 1000), truncation no longer keeps only the N
+newest records; the survivors are now the top-N by a composite retention
+score so valuable old memories (important, verified, positively fed back)
+aren't silently dropped from search by newer throwaway captures:
+
+- **RETENTION_SCORING — composite retention score** (`recency × importance ×
+  feedback × citation`) in the scope-cache truncation branch; `wrong`
+  citations score -1 and are evicted first. Timestamp is the deterministic
+  tiebreak. Unconfigured stores keep the legacy recency-only behavior.
+- **`retention.scoring.*` config block** — `recencyHalfLifeHours`,
+  `importanceWeight`, `feedbackWeight`, each defaulting from `retrieval.*`
+  but able to diverge, so cache eviction can protect old memories without
+  changing live search ranking (env:
+  `OPENCODE_MEMORY_PRO_RETENTION_SCORING_*`).
+- Regression tests: unit coverage of the scoring semantics + config
+  resolution, integration coverage of truncation on a real store (mutant-
+  verified both the sort key and the config wiring).
+
+Note: with default weights (importance 0.4) the retention score closely
+tracks recency for most records — raise `retention.scoring.importanceWeight`
+to ~1.0+ to actively favor old important/verified memories in the cache.
 
 ### v1.5.4 (2026-09-07)
 

@@ -163,6 +163,11 @@
         "digest"
       ],
       "digestMaxAgeDays": 365
+    },
+    "scoring": {
+      "recencyHalfLifeHours": 72,
+      "importanceWeight": 0.4,
+      "feedbackWeight": 0.3
     }
   },
   "logging": {

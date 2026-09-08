@@ -5,6 +5,11 @@ interface ScopeCacheConfig {
     enabled: boolean;
 }
 export declare function storeFastCosine(a: number[], b: number[], normA: number, normB: number): number;
+export declare function computeRetentionScore(record: MemoryRecord, feedbackStats?: Pick<MemoryFeedbackStats, "feedbackFactor"> | undefined, weights?: {
+    recencyHalfLifeHours?: number;
+    importanceWeight?: number;
+    feedbackWeight?: number;
+}): number;
 export declare class MemoryStore {
     private readonly dbPath;
     private static readonly MIN_ROWS_FOR_INDEX;
@@ -23,6 +28,12 @@ export declare class MemoryStore {
     private retentionConfig;
     setRetentionConfig(config: {
         effectivenessEventsDays: number;
+    } | undefined): void;
+    private retentionScoringConfig;
+    setRetentionScoringConfig(config: {
+        recencyHalfLifeHours: number;
+        importanceWeight: number;
+        feedbackWeight: number;
     } | undefined): void;
     cleanupExpiredEvents(scopes?: string[], retentionDaysOverride?: number): Promise<number>;
     getEventTtlStatus(): Promise<{

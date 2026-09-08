@@ -15,6 +15,7 @@ process.env.OPENCODE_MEMORY_PRO_LOG_LEVEL = "error";
 
 const { MemoryStore, storeFastCosine } = await import("../dist/store.js");
 const { initializeStore } = await import("../dist/index.js");
+const { resolveMemoryConfig } = await import("../dist/config.js");
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -777,6 +778,149 @@ test("integration: feedback weighting applies the correct multiplier and the sta
         });
         const boostedScore2 = (await store.search(boostedParams)).find((r) => r.record.id === "mem-good").score;
         assert.ok(Math.abs(boostedScore2 / baseScore - 1.9) < 1e-6, `expected updated 1.9x factor after new feedback (cache must not serve stale stats), got base=${baseScore} boosted2=${boostedScore2} ratio=${boostedScore2 / baseScore}`);
+    }
+    finally {
+        store.close();
+    }
+});
+
+// RETENTION_SCORING (1.5.5): scope-cache truncation used to keep the N
+// NEWEST records, so an old-but-valuable memory (important, verified,
+// positively fed back) was silently dropped from search the moment enough
+// newer records landed. With retention weights configured, the survivors are
+// the top-N by a composite retention score. Mutant: reverting the truncation
+// sort to a bare timestamp sort drops rt-gold (oldest) and keeps all three
+// fresh trash records, failing the gold-present and trash-absent asserts.
+test("integration: scope cache truncation keeps high-retention records over newer ones (RETENTION_SCORING)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mem-retention-"));
+    const store = new MemoryStore(join(dir, "lancedb"), { maxRecordsPerScope: 3 });
+    store.setRetentionScoringConfig({ recencyHalfLifeHours: 72, importanceWeight: 1.5, feedbackWeight: 0.5 });
+    try {
+        await store.init(DIM);
+        const now = Date.now();
+        const old = now - 365 * 24 * 60 * 60 * 1000;
+        await store.put(makeRecord("rt-gold", "the golden rule: never delete the build cache and always pin dependencies", {
+            importance: 1,
+            citationStatus: "verified",
+            timestamp: old,
+        }));
+        await store.put(makeRecord("rt-old-trash", "old scribbles about pizza toppings and nap schedules", {
+            importance: 0,
+            timestamp: old - 1000,
+        }));
+        await store.put(makeRecord("rt-new-trash-1", "ephemeral note about what to reorder for the fridge", {
+            importance: 0.3,
+            timestamp: now - 1000,
+        }));
+        await store.put(makeRecord("rt-new-trash-2", "another ephemeral note about printer paper", {
+            importance: 0.3,
+            timestamp: now - 2000,
+        }));
+        await store.put(makeRecord("rt-new-trash-3", "yet another ephemeral note about desk snacks", {
+            importance: 0.3,
+            timestamp: now - 3000,
+        }));
+        // 2x useful+helpful -> feedbackFactor = 2 for rt-gold only.
+        for (let i = 0; i < 2; i += 1) {
+            await store.putEvent({
+                id: `rt-evt-${i}`, type: "feedback", feedbackType: "useful", scope: "global",
+                sessionID: "s", timestamp: Date.now(), memoryId: "rt-gold", helpful: true, metadataJson: "{}",
+            });
+        }
+        await store.search(searchParams("build cache pinned dependencies", deterministicEmbed("build cache pinned dependencies")));
+        const entry = store.scopeCache.get("global");
+        assert.ok(entry, "scope cache entry must exist after the search");
+        const ids = entry.records.map((r) => r.id);
+        assert.equal(ids.length, 3, `truncation must keep exactly maxRecordsPerScope records, got ${ids.join(",")}`);
+        assert.ok(ids.includes("rt-gold"), `important verified + feedback-boosted OLD memory must survive truncation, got ${ids.join(",")}`);
+        assert.ok(!ids.includes("rt-new-trash-3"), `oldest fresh-trash record must be evicted over rt-gold, got ${ids.join(",")}`);
+        assert.equal(entry.tokenized.length, 3, "tokenized must stay aligned with the truncated record set");
+        assert.equal(entry.norms.size, 3, "norms must stay aligned with the truncated record set");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// RETENTION_SCORING (1.5.5): without setRetentionScoringConfig the store must
+// keep the LEGACY recency-only truncation (bare new MemoryStore() users see
+// exactly 1.5.4 behavior). Catches a future refactor that applies retention
+// scoring on unconfigured stores.
+test("integration: scope cache truncation stays recency-only without retention config (RETENTION_SCORING fallback)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mem-retention-fallback-"));
+    const store = new MemoryStore(join(dir, "lancedb"), { maxRecordsPerScope: 3 });
+    try {
+        await store.init(DIM);
+        const now = Date.now();
+        for (let i = 1; i <= 5; i += 1) {
+            await store.put(makeRecord(`fb-${i}`, `fallback memory number ${i} about cache truncation contracts`, {
+                importance: i === 1 ? 1 : 0,
+                citationStatus: i === 1 ? "verified" : undefined,
+                timestamp: now - i * 1000,
+            }));
+        }
+        await store.search(searchParams("cache truncation contracts", deterministicEmbed("cache truncation contracts")));
+        const ids = store.scopeCache.get("global").records.map((r) => r.id);
+        assert.equal(ids.length, 3, "truncation must keep exactly maxRecordsPerScope records");
+        assert.deepEqual(ids, ["fb-1", "fb-2", "fb-3"], "without retention config, the N NEWEST records must survive (fb-1 is newest)");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// RETENTION_SCORING (1.5.5): END-TO-END through real config resolution.
+// retention.scoring.importanceWeight=1.5 diverges from retrieval.importanceWeight
+// (0.4). The store must consume the RETENTION weights for truncation (old
+// gold survives) while the live retrieval ranking weight stays untouched.
+// Mutant: wiring index.js to pass resolved.retrieval instead of
+// resolved.retention.scoring makes rt-cfg-gold (ancient, low-importance
+// weight 0.4) lose its cache slot and fails the gold-present assert.
+test("integration: config-driven divergent retention.scoring protects old memories without changing ranking (RETENTION_SCORING config)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mem-retcfg-"));
+    const cfg = resolveMemoryConfig({
+        memory: {
+            dbPath: join(dir, "lancedb"),
+            retrieval: { importanceWeight: 0.4, feedbackWeight: 0.3, recencyHalfLifeHours: 72 },
+            retention: { scoring: { importanceWeight: 1.5 } },
+        },
+    }, "/tmp");
+    assert.equal(cfg.retention.scoring.importanceWeight, 1.5, "retention scoring must diverge from retrieval");
+    assert.equal(cfg.retrieval.importanceWeight, 0.4, "retrieval ranking weight must stay at its configured value");
+    const store = new MemoryStore(cfg.dbPath, { maxRecordsPerScope: 3 });
+    store.setRetentionScoringConfig(cfg.retention.scoring);
+    try {
+        await store.init(DIM);
+        const now = Date.now();
+        const old = now - 365 * 24 * 60 * 60 * 1000;
+        await store.put(makeRecord("rt-cfg-gold", "the golden rule: never delete the build cache and always pin dependencies", {
+            importance: 1,
+            citationStatus: "verified",
+            timestamp: old,
+        }));
+        await store.put(makeRecord("rt-cfg-new-trash-1", "ephemeral note about what to reorder for the fridge", {
+            importance: 0.3,
+            timestamp: now - 1000,
+        }));
+        await store.put(makeRecord("rt-cfg-new-trash-2", "another ephemeral note about printer paper", {
+            importance: 0.3,
+            timestamp: now - 2000,
+        }));
+        await store.put(makeRecord("rt-cfg-new-trash-3", "yet another ephemeral note about desk snacks", {
+            importance: 0.3,
+            timestamp: now - 3000,
+        }));
+        for (let i = 0; i < 2; i += 1) {
+            await store.putEvent({
+                id: `rt-cfg-evt-${i}`, type: "feedback", feedbackType: "useful", scope: "global",
+                sessionID: "s", timestamp: Date.now(), memoryId: "rt-cfg-gold", helpful: true, metadataJson: "{}",
+            });
+        }
+        await store.search(searchParams("build cache pinned dependencies", deterministicEmbed("build cache pinned dependencies")));
+        const ids = store.scopeCache.get("global").records.map((r) => r.id);
+        assert.equal(ids.length, 3, "truncation must keep exactly maxRecordsPerScope records");
+        assert.ok(ids.includes("rt-cfg-gold"), `divergent retention scoring must keep the old gold memory, got ${ids.join(",")}`);
+        assert.ok(!ids.includes("rt-cfg-new-trash-3"), `oldest fresh trash must be evicted over gold, got ${ids.join(",")}`);
     }
     finally {
         store.close();

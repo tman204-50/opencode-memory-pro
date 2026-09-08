@@ -124,6 +124,11 @@ export interface MemoryRuntimeConfig {
             minImportance: number;
             protectedCategories: string[];
         };
+        scoring?: {
+            recencyHalfLifeHours: number;
+            importanceWeight: number;
+            feedbackWeight: number;
+        };
     };
     graph?: {
         enabled: boolean;

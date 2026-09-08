@@ -102,7 +102,7 @@ export function resolveMemoryConfig(config, worktree) {
         unusedDaysThreshold: Math.max(1, Math.floor(toNumber(process.env.OPENCODE_MEMORY_PRO_UNUSED_DAYS_THRESHOLD ?? raw.unusedDaysThreshold, 30))),
         minCaptureChars: Math.max(30, Math.floor(toNumber(process.env.OPENCODE_MEMORY_PRO_MIN_CAPTURE_CHARS ?? raw.minCaptureChars, 80))),
         maxEntriesPerScope: Math.max(50, Math.floor(toNumber(process.env.OPENCODE_MEMORY_PRO_MAX_ENTRIES_PER_SCOPE ?? raw.maxEntriesPerScope, 3000))),
-        retention: resolveRetentionConfig(raw, process.env),
+        retention: resolveRetentionConfig(raw, process.env, { recencyHalfLifeHours, importanceWeight, feedbackWeight }),
         logging: resolveLoggingConfig(raw, process.env),
     };
     validateEmbeddingConfig(resolvedConfig.embedding);
@@ -193,6 +193,20 @@ function resolveGraphConfig(raw, env) {
     const expansionLambda = clamp(toNumber(env.OPENCODE_MEMORY_PRO_GRAPH_EXPANSION_LAMBDA ?? graphRaw.expansionLambda, 0.3), 0, 1);
     return { enabled, dbPath, boostLambda, maxEntitiesPerMemory, maxEdgeProvenance, typedEdges, expansionEnabled, maxHops, expansionLimit, expansionLambda };
 }
+// RETENTION_SCORING (1.5.5): weights for scope-cache truncation ("which
+// records survive when a scope exceeds maxRecordsPerScope"). Defaults to the
+// resolved retrieval weights (so "what ranks well ≈ what survives"), but
+// retention.scoring.* can diverge from retrieval.* — protecting old valuable
+// memories in the cache without altering live search ranking. Env overrides
+// always win (emergency tuning before sidecar resolution).
+function resolveRetentionScoring(raw, env, retrievalWeights) {
+    const scoringRaw = (raw.retention?.scoring) ?? {};
+    return {
+        recencyHalfLifeHours: Math.max(1, toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_RECENCY_HALF_LIFE_HOURS ?? scoringRaw.recencyHalfLifeHours, retrievalWeights.recencyHalfLifeHours)),
+        importanceWeight: clamp(toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_IMPORTANCE_WEIGHT ?? scoringRaw.importanceWeight, retrievalWeights.importanceWeight), 0, 2),
+        feedbackWeight: clamp(toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_SCORING_FEEDBACK_WEIGHT ?? scoringRaw.feedbackWeight, retrievalWeights.feedbackWeight), 0, 1),
+    };
+}
 // MEMORY_RETENTION (1.0): memory-level digest-then-hide expiry, layered on top
 // of the events-table TTL. A memory is expired when it is old enough
 // (minAgeDays) AND unused for unusedDays (lastRecalled, or timestamp if never
@@ -201,7 +215,7 @@ function resolveGraphConfig(raw, env) {
 // group that earns a digest; targetChars = digest length; minImportance =
 // importance floor (protects high-value rows); protectedCategories = never
 // expired (default: digests themselves).
-function resolveRetentionConfig(raw, env) {
+function resolveRetentionConfig(raw, env, retrievalWeights) {
     const rawRetention = raw.retention ?? {};
     let eventsDays = Math.floor(toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_EVENTS_DAYS ?? rawRetention.effectivenessEventsDays, 90));
     if (eventsDays < 0) {
@@ -221,7 +235,13 @@ function resolveRetentionConfig(raw, env) {
             ? protectedRaw.filter((c) => typeof c === "string")
             : ["digest"],
     };
-    return { effectivenessEventsDays: eventsDays, memory };
+    return {
+        effectivenessEventsDays: eventsDays,
+        memory,
+        // RETENTION_SCORING (1.5.5): defaults from the resolved retrieval
+        // weights; see resolveRetentionScoring.
+        scoring: resolveRetentionScoring(raw, env, retrievalWeights),
+    };
 }
 // MEMORY_LIFECYCLE_TOOLS: defaults for the offline digest summarizer (0.9).
     // minAgeDays = how old a memory must be before it is digest-eligible;
@@ -383,6 +403,13 @@ export function mergeMemoryConfig(base, override) {
             memory: {
                 ...((base.retention ?? {}).memory ?? {}),
                 ...((override.retention ?? {}).memory ?? {}),
+            },
+            // RETENTION_SCORING (1.5.5): deep-merge retention.scoring so a
+            // sidecar fragment that only sets e.g. importanceWeight doesn't
+            // drop the other scoring keys.
+            scoring: {
+                ...((base.retention ?? {}).scoring ?? {}),
+                ...((override.retention ?? {}).scoring ?? {}),
             },
         },
         summarize: {
