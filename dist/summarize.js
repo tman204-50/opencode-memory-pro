@@ -153,6 +153,20 @@ export function extractKeySentences(text, targetChars) {
             }
         }
     }
+    // KEY_SENTENCE_FALLBACK (1.6.2): when the FIRST sentence alone exceeds
+    // targetChars the loops above can break before pushing anything —
+    // extractKeySentences returned "" and an empty summarized block was
+    // injected into the system prompt. Fall back to a truncated first
+    // sentence so the result is never empty for non-empty input.
+    if (keySentences.length === 0 && sentences.length > 0) {
+        const first = sentences[0].trim();
+        if (first.length > targetChars) {
+            keySentences.push(`${first.slice(0, Math.max(1, targetChars - 3))}...`);
+        }
+        else {
+            keySentences.push(first);
+        }
+    }
     return keySentences.join(" → ");
 }
 export function splitCodeAndText(text) {

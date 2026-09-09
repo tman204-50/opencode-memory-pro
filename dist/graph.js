@@ -294,13 +294,24 @@ export class GraphStore {
                     INSERT OR IGNORE INTO memory_entities (memory_id, entity_name) VALUES (?, ?)
                 `).run(memoryId, entity.name);
                 const bump = link.changes > 0 ? 1 : 0;
-                this.db.prepare(`
-                    INSERT INTO entities (name, type, first_seen, last_seen, mention_count)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET
-                        last_seen = excluded.last_seen,
-                        mention_count = mention_count + ?
-                `).run(entity.name, entity.type, timestamp, timestamp, bump, bump);
+                // REINDEX_ENTITY_HEAL (1.6.2): the old upsert always INSERTed
+                // the entity row with VALUES(bump) — when the link already
+                // existed (bump=0) but the entity row was missing (pre-1.4.5
+                // desync), it created a mention_count=0 ghost that GC
+                // (decrement-only) could never collect. A live link means
+                // the count is at least 1, so a missing row is healed with 1.
+                const entityRow = this.db.prepare("SELECT mention_count FROM entities WHERE name = ?").get(entity.name);
+                if (entityRow) {
+                    this.db.prepare(`
+                        UPDATE entities SET last_seen = ?, mention_count = mention_count + ? WHERE name = ?
+                    `).run(timestamp, bump, entity.name);
+                }
+                else {
+                    this.db.prepare(`
+                        INSERT INTO entities (name, type, first_seen, last_seen, mention_count)
+                        VALUES (?, ?, ?, ?, 1)
+                    `).run(entity.name, entity.type, timestamp, timestamp);
+                }
             }
             for (let i = 0; i < entities.length; i += 1) {
                 for (let j = i + 1; j < entities.length; j += 1) {
@@ -419,6 +430,12 @@ export class GraphStore {
                 this.db.prepare("UPDATE entities SET mention_count = mention_count - 1 WHERE name = ?").run(name);
                 const entity = this.db.prepare("SELECT mention_count FROM entities WHERE name = ?").get(name);
                 if (entity && entity.mention_count <= 0) {
+                    // ENTITY_GC_EDGE_CLEANUP (1.6.2): the row delete used to
+                    // leave the entity's edges behind → BFS traversed dead
+                    // entities as intermediates (stale-noise expansion). A
+                    // zero-count entity has no live memory links, so its
+                    // edges are stale; delete them with the row.
+                    this.db.prepare("DELETE FROM edges WHERE src = ? OR dst = ?").run(name, name);
                     this.db.prepare("DELETE FROM entities WHERE name = ?").run(name);
                 }
             }
@@ -678,10 +695,14 @@ export class GraphStore {
     reindexMemories(records) {
         if (!this.enabled || !records || records.length === 0)
             return;
-        const countRow = this.db.prepare("SELECT COUNT(*) AS c FROM memory_entities").get();
-        if (countRow.c > 0)
-            return;
-        log("info", `[graph] backfilling ${records.length} existing memories into entity graph`);
+        // REINDEX_BACKFILL_HEAL (1.6.2): the old `COUNT(*) > 0 → return`
+        // guard permanently blocked backfill healing — ANY memory_entities
+        // row skipped the one-time backfill forever, so a crash mid-backfill
+        // left a partial graph with no recovery path. indexMemory is
+        // idempotent since REINDEX_COUNT_IDEMPOTENT (1.4.5) (INSERT OR IGNORE
+        // link + bump-only-on-new-link), so re-running over all active
+        // memories on every init heals partial graphs safely.
+        log("info", `[graph] backfilling/re-indexing ${records.length} existing memories into entity graph`);
         for (const record of records) {
             if (!record?.id || !record?.text)
                 continue;

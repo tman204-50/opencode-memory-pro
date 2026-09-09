@@ -245,6 +245,66 @@ test("integration: memory_delete tool hard-deletes rows hidden by the status fil
     }
 });
 
+// MEMORY_STATS_EMBEDDER_GUARD (1.6.2): memory_stats used to call
+// state.embedder.dim() unguarded — when the embedder is down, dim() throws
+// after its retries and the whole diagnostic tool errored out instead of
+// reporting "embedder offline". It must degrade to a null dimension and still
+// return a full report.
+test("integration: memory_stats reports embedder offline instead of throwing (MEMORY_STATS_EMBEDDER_GUARD)", async () => {
+    const store = await newStore("mem-stats-guard-");
+    const { createMemoryTools } = await import("../dist/tools/memory.js");
+    const state = {
+        initialized: false,
+        config: {
+            provider: "test",
+            dbPath: "/tmp/test",
+            embedding: { provider: "ollama", model: "test-embed" },
+            retrieval: { mode: "hybrid", fuzzyWeight: 0.3, fuzzyThreshold: 0.5 },
+            capture: { mode: "heuristics" },
+            includeGlobalScope: true,
+        },
+        store,
+        embedder: {
+            dim: async () => { throw new Error("embedder offline"); },
+        },
+        ensureInitialized: async () => { state.initialized = true; },
+    };
+    const tools = createMemoryTools(state);
+    const context = { directory: "/tmp", sessionID: "test-session" };
+    try {
+        const result = await tools.memory_stats.execute({}, context);
+        const parsed = JSON.parse(result);
+        assert.equal(parsed.embedderOffline, true, "embedderOffline must be true when dim() throws");
+        assert.equal(parsed.incompatibleVectors, null, "incompatibleVectors must be null when the embedder is offline");
+        assert.ok(parsed.embedderHealth, "embedderHealth must still be reported");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// DELETE_FORCE_SCOPE (1.6.2): deleteByIdForce used to hard-delete by id across
+// ALL scopes, so memory_delete/memory_forget ignored their scope argument and
+// could delete a project-scoped memory from a global-scoped request. The scope
+// filter must be honored on both the exact-id fast path and the fallback scan.
+test("integration: deleteByIdForce respects the scope filter (DELETE_FORCE_SCOPE)", async () => {
+    const store = await newStore("mem-del-force-scope-");
+    try {
+        const id = "force-scope-1";
+        const projectScope = "project:local:aaaaaaaaaaaaaaaa";
+        await store.put(makeRecord(id, "a project-scoped memory that must not be deleted from global", { scope: projectScope }));
+
+        assert.equal(await store.deleteByIdForce(id, ["global"]), false, "out-of-scope force delete must return false");
+        assert.equal(await store.hasMemory(id, [projectScope]), true, "row must survive an out-of-scope force delete");
+
+        assert.equal(await store.deleteByIdForce(id, [projectScope]), true, "in-scope force delete must succeed");
+        assert.equal(await store.deleteByIdForce(id, [projectScope]), false, "row is gone after in-scope delete");
+    }
+    finally {
+        store.close();
+    }
+});
+
 test("integration: events table round-trip and TTL status", async () => {
     const store = await newStore("mem-events-");
     try {
@@ -1518,6 +1578,158 @@ test("integration: suggestRetryBudget medians parsed retryAttemptsJson, not stri
     }
 });
 
+// RETRY_TO_SUCCESS_PARSE (1.6.2): calculateRetryToSuccessRate did an
+// unguarded JSON.parse on retryAttemptsJson — one malformed row made
+// memory_kpi throw (suggestRetryBudget was hardened in RETRY_BUDGET_PARSE
+// (1.4.5); this path wasn't). Malformed rows are excluded; valid success
+// attempts still count.
+test("integration: calculateRetryToSuccessRate survives malformed retryAttemptsJson (RETRY_TO_SUCCESS_PARSE)", async () => {
+    const store = await newStore("mem-retry-success-");
+    const ep = async (id, taskId, state, retries) => {
+        await store.createTaskEpisode({
+            id,
+            sessionId: `sess-${id}`,
+            scope: "global",
+            taskId,
+            state: "running",
+            startTime: Date.now(),
+            commandsJson: "[]",
+            validationOutcomesJson: "[]",
+            successPatternsJson: "[]",
+            retryAttemptsJson: "[]",
+            recoveryStrategiesJson: "[]",
+            metadataJson: "{}",
+        });
+        await store.updateTaskState(taskId, state, "global", state === "failed" ? "resource" : null, state === "failed" ? "boom" : null);
+        if (retries !== undefined) {
+            await store.requireEpisodicTaskTable().update({
+                where: `taskId = '${taskId}' AND scope = 'global'`,
+                values: { retryAttemptsJson: retries },
+            });
+        }
+    };
+    try {
+        for (let i = 0; i < 5; i++) {
+            await ep(`f${i}`, `tf-${i}`, "failed");
+        }
+        await ep("s-malformed", "ts-malformed", "success", "{not json");
+        await ep("s-retried", "ts-retried", "success", '[{"outcome":"success","errorMessage":"boom"}]');
+        const rate = await store.calculateRetryToSuccessRate("global");
+        assert.equal(rate.status, "ok", "malformed row must not make memory_kpi throw");
+        assert.equal(rate.totalFailedTasks, 5);
+        assert.equal(rate.succeededAfterRetry, 1, "malformed row must not count; valid success attempt must");
+        assert.equal(rate.rate, 0.2);
+    }
+    finally {
+        store.close();
+    }
+});
+
+// DELETE_ORDER_FALLBACK (1.6.2): deleteByIdForce's fallback scan had no
+// ORDER BY — LanceDB can return rows in an arbitrary order when none is
+// committed, so a prefix-id match was nondeterministic (and could silently
+// miss beyond the cap). The scan is now timestamp-desc like the rest of the
+// store (SCAN_ORDER), so prefix matches resolve newest-first, deterministically.
+test("integration: deleteByIdForce prefix fallback deletes the newest matching row (DELETE_ORDER_FALLBACK)", async () => {
+    const store = await newStore("mem-orderfall-");
+    try {
+        const now = Date.now();
+        await store.put({ ...makeRecord("ord-fallback-0001", "older prefix row"), timestamp: now - 1000 });
+        await store.put({ ...makeRecord("ord-fallback-0002", "newer prefix row"), timestamp: now });
+        // 11-char prefix matching BOTH ids — the exact-id fast path misses,
+        // so this exercises the fallback scan.
+        const deleted = await store.deleteByIdForce("ord-fallback-", ["global"]);
+        assert.equal(deleted, true, "prefix fallback must find a match");
+        const remaining = await store.readByScopes(["global"]);
+        assert.equal(remaining.length, 1, "exactly one row must be deleted");
+        assert.equal(remaining[0].text, "older prefix row", "the NEWEST prefix match is deleted first");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// FEEDBACK_TTL_INVALIDATION (1.6.2): cleanupExpiredEvents deletes feedback
+// rows but never bumped feedbackVersions, so the feedback aggregate for an
+// affected scope was served STALE for up to the cache TTL (default 10 min).
+// Deleting feedback events must bump the version so the next read recomputes.
+test("integration: cleanupExpiredEvents invalidates feedback stats for scopes with deleted feedback (FEEDBACK_TTL_INVALIDATION)", async () => {
+    const store = await newStore("mem-eventttl-");
+    const feedback = (id, scope, memoryId, timestamp) => ({
+        id,
+        type: "feedback",
+        scope,
+        sessionID: "sess-ttl",
+        timestamp,
+        memoryId,
+        feedbackType: "wrong",
+        helpful: 0,
+        reason: "",
+        labelsJson: "[]",
+        metadataJson: "{}",
+    });
+    try {
+        const eventTable = store.requireEventTable();
+        const old = Date.now() - 10 * 24 * 60 * 60 * 1000; // ~10 days ago: inside the 30d aggregate window
+        const target = "global";
+
+        // Seed 5 OLD "wrong" feedback rows for memoryId m-target.
+        for (let i = 0; i < 5; i++) {
+            await store.putEvent(feedback(`old-wrong-${i}`, target, "m-target", old));
+        }
+        // Prime the cache so the aggregate is cached (shows staleness later).
+        await store.getFeedbackStatsForScope(target);
+        const cachedBefore = store.feedbackStatsCache.get(target);
+        assert.ok(cachedBefore, "feedback aggregate must be cached");
+        const cachedCount = cachedBefore.rawStats.get("m-target")?.wrong ?? 0;
+        assert.equal(cachedCount, 5, "sanity: 5 old wrong rows are in the cached aggregate");
+
+        // Clean expired events with a 2-day retention → all 5 old rows deleted.
+        const deleted = await store.cleanupExpiredEvents([target], 2);
+        assert.equal(deleted, 5, "all 5 old feedback rows must be deleted");
+
+        // The version bump invalidates the cached aggregate: the next read
+        // must RECOMPUTE (0 wrong) instead of serving the stale cached 5.
+        const recomputed = await store.getFeedbackStatsForScope(target);
+        assert.equal(recomputed.get("m-target")?.wrong ?? 0, 0, "the recomputed aggregate must no longer count deleted feedback");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// SCOPING_CACHE_LRU (1.6.2): the scoping cache evicted the OLDEST-INSERTED
+// entry, not the least-recently-USED — a long-lived server hosting many
+// project directories could evict a hot entry while keeping a cold one. It
+// now refreshes recency on every hit, so eviction drops the LRU key.
+test("scope: scoping cache evicts least-recently-used, not oldest-inserted (SCOPING_CACHE_LRU)", async () => {
+    const { setScopingConfigSource, getScopingCacheKeys } = await import("../dist/scope.js");
+    const { resolveScope } = await import("../dist/scope.js");
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    setScopingConfigSource({ memory: { scoping: "project" } });
+    try {
+        for (let i = 0; i < 20; i++) {
+            resolveScope(undefined, `/worktree-${i}`);
+        }
+        resolveScope(undefined, "/worktree-0"); // refresh recency on the OLDEST-INSERTED key
+        const before = getScopingCacheKeys();
+        assert.equal(before.length, 20);
+        assert.ok(before.includes("/worktree-0") && before.includes("/worktree-1"), "both present before eviction");
+        assert.ok(before.indexOf("/worktree-0") > before.indexOf("/worktree-1"), "touched key must be newer in LRU order");
+        resolveScope(undefined, "/worktree-21"); // 21st → evict the LRU key
+        const after = getScopingCacheKeys();
+        assert.equal(after.length, 20, "cache stays capped at 20");
+        assert.ok(!after.includes("/worktree-1"), "the least-recently-USED key must be evicted");
+        assert.ok(after.includes("/worktree-0"), "the recently-touched key must survive eviction");
+    }
+    finally {
+        setScopingConfigSource(undefined);
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    }
+});
+
 // FAST_PATH_USAGE_LOOKUP (perf review): updateMemoryUsage now finds the row
 // via the warm scope cache, then an id-bounded findRecordsByIds, and only
 // falls back to the full readByScopes scan. Behavior must be preserved across
@@ -1539,6 +1751,78 @@ test("integration: updateMemoryUsage updates rows via cache and via fallback sca
         assert.equal(row.recallCount, 2, "both updates must land (cache path + fallback scan)");
         const meta = JSON.parse(row.metadataJson);
         assert.equal((meta.recalledProjects ?? []).length, 2, "both project scopes must register");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// USAGE_CACHE_FRESHNESS (1.6.2): updateMemoryUsage's cache fast path served
+// ANY cached row regardless of age. In the cross-process case (two opencode
+// instances on the same LanceDB dir) a STALE cache entry — loaded before
+// another process bumped recallCount — was read-modify-written,
+// REGRESSING recallCount (stale+1 overwrote the higher count). Stale
+// entries must fall through to the authoritative read.
+test("integration: updateMemoryUsage ignores a stale cache row (USAGE_CACHE_FRESHNESS)", async () => {
+    const store = await newStore("mem-usagefresh-");
+    try {
+        await store.put(makeRecord("usage-new-1", "freshness memory", { recallCount: 1 }));
+        // Warm the scope cache so the fast path has an entry to (mis)trust.
+        await store.search(searchParams("freshness memory", deterministicEmbed("freshness memory")));
+        const entry = store.scopeCache.get("global");
+        assert.ok(entry, "scope cache must be warm");
+        // Simulate another process bumping recallCount behind our back.
+        await store.requireTable().update({ where: "id = 'usage-new-1'", values: { recallCount: 10 } });
+        // ...and our cache entry aging past staleAfterMs.
+        const maxAge = Number.isFinite(store.cacheConfig.staleAfterMs) ? store.cacheConfig.staleAfterMs : 0;
+        entry.loadedAt = Date.now() - maxAge - 1000;
+        await store.updateMemoryUsage("usage-new-1", "project:probe", ["global"]);
+        const row = (await store.readByScopes(["global"])).find((r) => r.id === "usage-new-1");
+        assert.equal(row.recallCount, 11, "authoritative count (10) + 1 — stale cached 1+1 must NOT overwrite");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// DIGEST_EXPIRY_SAFE_NUM (1.6.2): sweepExpiredMemories computed
+// digestMaxAgeDays with raw Number() — a malformed value ("abc") produced
+// NaN, Math.max(1, NaN)=NaN, and every age comparison against NaN was
+// false → digest expiry silently became a no-op. Malformed values fall
+// back to the 365-day default.
+test("integration: sweepExpiredMemories treats malformed digestMaxAgeDays as the default (DIGEST_EXPIRY_SAFE_NUM)", async () => {
+    const store = await newStore("mem-digestexpiry-");
+    const { sweepExpiredMemories } = await import("../dist/tools/memory.js");
+    const OLD = Date.now() - 400 * 24 * 60 * 60 * 1000;
+    const state = {
+        initialized: true,
+        defaultScope: "global",
+        config: {
+            includeGlobalScope: true,
+            retention: {
+                memory: {
+                    enabled: true,
+                    unusedDays: 60,
+                    minAgeDays: 180,
+                    minGroupSize: 2,
+                    targetChars: 500,
+                    minImportance: 0,
+                    protectedCategories: ["digest"],
+                    digestMaxAgeDays: 365,
+                },
+            },
+        },
+        store,
+        embedder: { embed: async (text) => deterministicEmbed(text) },
+        graph: { enabled: false },
+    };
+    try {
+        await store.put(makeRecord("dg-stale-1", "a long-stale digest summary", { category: "digest", timestamp: OLD }));
+        const result = await sweepExpiredMemories(state, { scope: "global", digestMaxAgeDays: "abc" });
+        assert.equal(result.digestMaxAgeDays, 365, "malformed digestMaxAgeDays must fall back to 365");
+        assert.equal(result.digestsExpired, 1, "the 400-day-old digest must expire (NaN must not no-op the sweep)");
+        const remaining = await store.readByScopes(["global"]);
+        assert.ok(!remaining.some((r) => r.id === "dg-stale-1"), "the stale digest must be deleted");
     }
     finally {
         store.close();
@@ -1640,4 +1924,121 @@ test("integration: plugin E2E scenario (subprocess)", async () => {
     assert.equal(summary.autoCaptured, true);
     assert.equal(summary.episodeSuccessful, true);
     assert.ok(summary.recentCount >= 2, `expected ≥2 memories, got ${summary.recentCount}`);
+});
+// CONSOLIDATE_WRITES_ON_ABORT (1.6.2): a consolidation run whose ANN pass
+// throws mid-run (after staging merge writes + graph notifications) used to
+// return early WITHOUT flushing/resetting the staged writes — a LATER run's
+// flush then applied them from a stale read, or they lingered forever. The
+// outer finally flushes + resets the stage on every exit path.
+test("integration: aborted consolidation flushes staged writes and resets the stage (CONSOLIDATE_WRITES_ON_ABORT)", async () => {
+    const store = await newStore("mem-consabort-");
+    try {
+        const N = 501; // >= FALLBACK_THRESHOLD so the ANN failure skips fallback
+        for (let i = 0; i < N; i += 1) {
+            await store.put(makeRecord(`ab-${i}`, `consolidation abort row ${i} with some filler text about memory`));
+        }
+        // Force the ANN pass to abort AFTER staging a write (the exact leak).
+        store.findSimilarVectorsBatch = async () => {
+            store.stageConsolidationWrite("ghost-merge", { status: "merged" });
+            throw new Error("ANN probe failure");
+        };
+        const result = await store.consolidateDuplicates("global", 0.95, 10);
+        assert.equal(result.mergedPairs, 0, "aborted run must report no merges");
+        assert.equal(store.consolidationWriteStage.size, 0,
+            "staged writes must be flushed/reset after an aborted run — no later-run stale flush");
+    }
+    finally {
+        store.close();
+    }
+});
+
+// EPISODIC_SHAPE_GUARD (1.6.2): findSimilarTasks formatting ran
+// `.slice`/`.map` on parseJsonObject results with no shape check — a row
+// with a valid-but-wrong-shape JSON blob (object instead of array) threw
+// OUTSIDE safeStoreCall and took the whole tool down.
+test("integration: similar_task_recall tolerates wrong-shape episodic JSON (EPISODIC_SHAPE_GUARD)", async () => {
+    const { createEpisodicTools } = await import("../dist/tools/episodic.js");
+    const state = {
+        initialized: true,
+        ensureInitialized: async () => {},
+        store: {
+            findSimilarTasks: async () => [{
+                taskId: "task-1",
+                state: "failed",
+                commandsJson: '{"not":"an array"}',
+                validationOutcomesJson: '{"also":"not an array"}',
+            }],
+        },
+    };
+    const tools = createEpisodicTools(state);
+    const result = await tools.similar_task_recall.execute(
+        { query: "docker", threshold: 0.5, limit: 3 },
+        { directory: "/tmp", sessionID: "sess-1" },
+    );
+    assert.equal(typeof result, "string", "tool must return a formatted string, not throw");
+    assert.ok(result.includes("Task: task-1"), "task identity preserved");
+    assert.ok(result.includes("Commands:"), "commands section rendered (empty)");
+    assert.ok(result.includes("Validations:"), "validations section rendered");
+});
+
+// DIGEST_EXPIRY_RESTORE (1.6.2): when a digest is hard-deleted after
+// digestMaxAgeDays, its digested originals used to stay status:"digested"
+// with digestedInto pointing at the deleted id — permanently hidden from
+// recall. Expiry must restore them to active.
+test("integration: digest hard-expiry restores digested originals to active (DIGEST_EXPIRY_RESTORE)", async () => {
+    const store = await newStore("mem-digestrestore-");
+    const { sweepExpiredMemories } = await import("../dist/tools/memory.js");
+    const now = Date.now();
+    const OLD = now - 400 * 24 * 60 * 60 * 1000;
+    const state = {
+        initialized: true,
+        defaultScope: "global",
+        config: {
+            includeGlobalScope: true,
+            capture: { mode: "heuristic" },
+            embedding: { model: "test-embed" },
+            retention: {
+                memory: {
+                    enabled: true,
+                    unusedDays: 60,
+                    minAgeDays: 180,
+                    minGroupSize: 2,
+                    targetChars: 500,
+                    minImportance: 0,
+                    protectedCategories: ["digest"],
+                    digestMaxAgeDays: 365,
+                },
+            },
+        },
+        store,
+        embedder: { embed: async (text) => deterministicEmbed(text) },
+        graph: { enabled: false },
+    };
+    try {
+        await store.put(makeRecord("dg-r1", "restore tutorial fact about lance vectors", { category: "tutorial", scope: "global", timestamp: OLD }));
+        await store.put(makeRecord("dg-r2", "restore tutorial fact about bm25 ranking", { category: "tutorial", scope: "global", timestamp: OLD }));
+        const first = await sweepExpiredMemories(state, { scope: "global" });
+        assert.equal(first.digestsCreated, 1, "sanity: digest created");
+        const afterFirst = await store.readByScopes(["global"]);
+        assert.ok(!afterFirst.some((r) => r.id === "dg-r1"), "originals hidden after digest");
+        // Age the digest past expiry (backdate its timestamp).
+        const digest = afterFirst.find((r) => r.category === "digest");
+        assert.ok(digest, "digest row exists");
+        await store.requireTable().update({
+            where: `id = '${digest.id}'`,
+            values: { timestamp: OLD },
+        });
+        // Second sweep: digest expires → originals restored.
+        const second = await sweepExpiredMemories(state, { scope: "global" });
+        assert.equal(second.digestsExpired, 1, "stale digest must be hard-deleted");
+        const afterSecond = await store.readByScopes(["global"]);
+        const r1 = afterSecond.find((r) => r.id === "dg-r1");
+        const r2 = afterSecond.find((r) => r.id === "dg-r2");
+        assert.ok(r1 && r2, "digested originals must be recallable again");
+        assert.ok(!(r1.metadataJson ?? "").includes("digestedInto"), "digestedInto flag must be cleared");
+        assert.ok(!(r2.metadataJson ?? "").includes("digestedInto"), "digestedInto flag must be cleared");
+    }
+    finally {
+        store.close();
+    }
 });

@@ -41,6 +41,20 @@ const ALL_CAPTURE_SIGNALS = [
     ...FACT_SIGNALS,
     ...PREF_SIGNALS,
 ];
+// SIGNAL_WORD_BOUNDARY (1.6.2): the capture gate matched signals via
+// substring includes() — "passed" matched "bypassed", "fixed" matched
+// "prefixed", "solved" matched "unsolved" → false auto-captures. The
+// sibling GLOBAL_KEYWORD_REGEXES already uses \b for the same reason (see
+// below). The gate uses a START-OF-WORD boundary only (no trailing \b):
+// capture signals are word stems ("decide" must still match "decided",
+// "fix" matches "fixed"), and embedding inside a larger word is exactly
+// what produced the false positives. CJK signals skip the boundary (CJK
+// chars are not \w in JS regex, so \b/\W-wrapped CJK would never match).
+const SIGNAL_REGEXES = ALL_CAPTURE_SIGNALS.map((signal) => {
+    const escaped = signal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const asciiWord = /^[\w\s.-]+$/.test(signal);
+    return asciiWord ? new RegExp(`(?:^|\\W)${escaped}`) : new RegExp(escaped);
+});
 // Exported so graph.js can reuse the infra lexicon for entity extraction.
 export const GLOBAL_KEYWORDS = [
     // Distributions
@@ -119,7 +133,7 @@ export function extractCaptureCandidate(text, minChars) {
         return { candidate: null, skipReason: "below-min-chars" };
     }
     const lower = normalized.toLowerCase();
-    if (!ALL_CAPTURE_SIGNALS.some((signal) => lower.includes(signal.toLowerCase()))) {
+    if (!SIGNAL_REGEXES.some((regex) => regex.test(lower))) {
         return { candidate: null, skipReason: "no-positive-signal" };
     }
     const category = classifyCategory(lower);

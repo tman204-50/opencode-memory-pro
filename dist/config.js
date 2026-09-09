@@ -26,7 +26,12 @@ export function resolveMemoryConfig(config, worktree) {
     const normalizedVectorWeight = weightSum > 0 ? vectorWeight / weightSum : 0.7;
     const normalizedBm25Weight = weightSum > 0 ? bm25Weight / weightSum : 0.3;
     const normalizedFuzzyWeight = weightSum > 0 ? fuzzyWeight / weightSum : 0;
-    const rrfK = Math.max(1, Math.floor(toNumber(process.env.OPENCODE_MEMORY_PRO_RRF_K ?? retrievalRaw.rrfK, 60)));
+    // RRF_K_CLAMP (1.6.2): rrfK had a floor but NO upper clamp — an absurdly
+    // large value (e.g. 1e9) made every RRF score collapse toward 1/(k+rank)≈0
+    // then ×(rrfK+1) → a flat 1.0 across ALL results, destroying the merge.
+    // Bound to [1, 1000] (default 60; 1000 already flattens ranking, far
+    // beyond any real intent).
+    const rrfK = Math.max(1, Math.min(1000, Math.floor(toNumber(process.env.OPENCODE_MEMORY_PRO_RRF_K ?? retrievalRaw.rrfK, 60))));
     const recencyBoost = toBoolean(process.env.OPENCODE_MEMORY_PRO_RECENCY_BOOST ?? retrievalRaw.recencyBoost, true);
     const recencyHalfLifeHours = Math.max(1, toNumber(process.env.OPENCODE_MEMORY_PRO_RECENCY_HALF_LIFE_HOURS ?? retrievalRaw.recencyHalfLifeHours, 72));
     const importanceWeight = clamp(toNumber(process.env.OPENCODE_MEMORY_PRO_IMPORTANCE_WEIGHT ?? retrievalRaw.importanceWeight, 0.4), 0, 2);
@@ -147,12 +152,15 @@ function resolveDedupConfig(raw, env) {
     const enabled = toBoolean(env.OPENCODE_MEMORY_PRO_DEDUP_ENABLED ?? dedupRaw.enabled, true);
     const writeThreshold = clamp(toNumber(env.OPENCODE_MEMORY_PRO_DEDUP_WRITE_THRESHOLD ?? dedupRaw.writeThreshold, 0.92), 0.0, 1.0);
     const consolidateThreshold = clamp(toNumber(env.OPENCODE_MEMORY_PRO_DEDUP_CONSOLIDATE_THRESHOLD ?? dedupRaw.consolidateThreshold, 0.95), 0.0, 1.0);
-    const candidateLimit = clamp(toNumber(env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT ?? dedupRaw.candidateLimit, 50), 10, 200);
-    if (candidateLimit !== toNumber(dedupRaw.candidateLimit, 50)) {
-        const original = toNumber(dedupRaw.candidateLimit, 50);
-        if (original !== 50) {
-            log("warn", `[config] dedup.candidateLimit clamped from ${original} to ${candidateLimit}`);
-        }
+    // DEDUP_CLAMP_LOG (1.6.2): the clamp warning compared candidateLimit
+    // against the RAW CONFIG value only — with an in-range ENV override set,
+    // it logged a misleading "clamped from 50 to 30" when nothing was
+    // clamped. Compare against the EFFECTIVE raw value (env wins) so the
+    // warn fires only when the actual source was out of bounds.
+    const rawCandidateLimit = toNumber(env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT ?? dedupRaw.candidateLimit, 50);
+    const candidateLimit = clamp(rawCandidateLimit, 10, 200);
+    if (candidateLimit !== rawCandidateLimit) {
+        log("warn", `[config] dedup.candidateLimit clamped from ${rawCandidateLimit} to ${candidateLimit}`);
     }
     return { enabled, writeThreshold, consolidateThreshold, candidateLimit };
 }
@@ -236,9 +244,13 @@ function resolveRetentionConfig(raw, env, retrievalWeights) {
         minGroupSize: Math.min(100, Math.max(1, Math.floor(toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_MEMORY_MIN_GROUP_SIZE ?? memoryRaw.minGroupSize, 2)))),
         targetChars: Math.min(2000, Math.max(100, Math.floor(toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_MEMORY_TARGET_CHARS ?? memoryRaw.targetChars, 500)))),
         minImportance: clamp(toNumber(env.OPENCODE_MEMORY_PRO_RETENTION_MEMORY_MIN_IMPORTANCE ?? memoryRaw.minImportance, 0.3), 0, 1),
-        protectedCategories: Array.isArray(protectedRaw) && protectedRaw.length > 0
-            ? protectedRaw.filter((c) => typeof c === "string")
-            : ["digest"],
+        // PROTECTED_CATEGORIES_EMPTY (1.6.2): an explicit [] used to fall back to
+        // the ["digest"] default, so digest protection could not be disabled.
+        // Absent → default ["digest"]; any present array (including []) is
+        // honored verbatim (string-filtered).
+        protectedCategories: protectedRaw === undefined
+            ? ["digest"]
+            : (Array.isArray(protectedRaw) ? protectedRaw.filter((c) => typeof c === "string") : ["digest"]),
     };
     return {
         effectivenessEventsDays: eventsDays,

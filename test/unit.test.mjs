@@ -5,12 +5,13 @@ import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCa
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
 import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput, setLlmRetryPolicy, resetLlmRetryPolicy, getLlmRetryPolicy } from "../dist/llm.js";
-import { summarizeContent } from "../dist/summarize.js";
+import { summarizeContent, extractKeySentences } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, runRecallPipeline, wireRetentionScoring } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, runRecallPipeline, wireRetentionScoring, handleEmbeddingConfigChange, detectValidationOutcome } from "../dist/index.js";
 import { extractCaptureCandidate } from "../dist/extract.js";
-import { buildPreferenceInjection } from "../dist/preference.js";
+import { buildPreferenceInjection, extractPreferenceSignals } from "../dist/preference.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
+import { createEmbedder, getEmbedderHealth, setEmbedderHealth, resetEmbedderHealth } from "../dist/embedder.js";
 
 process.env.OPENCODE_MEMORY_PRO_SKIP_SIDECAR = "true";
 
@@ -110,6 +111,54 @@ test("config: any non-llm capture mode value coerces to heuristics", () => {
     assert.equal(cfg.capture.mode, "heuristics");
 });
 
+// RRF_K_CLAMP (1.6.2): rrfK had a floor but no upper clamp — a huge value
+// flattened every RRF score toward a uniform 1.0, destroying the merge.
+test("config: rrfK clamps to [1,1000] (RRF_K_CLAMP)", () => {
+    assert.equal(resolveMemoryConfig({ memory: { retrieval: { rrfK: 1e9 } } }, "/tmp").retrieval.rrfK, 1000,
+        "absurdly large rrfK must clamp to 1000");
+    assert.equal(resolveMemoryConfig({ memory: { retrieval: { rrfK: 0 } } }, "/tmp").retrieval.rrfK, 1,
+        "sub-1 rrfK must clamp to 1");
+    const def = resolveMemoryConfig({}, "/tmp").retrieval.rrfK;
+    assert.equal(def, 60, "default rrfK stays 60");
+});
+
+// DEDUP_CLAMP_LOG (1.6.2): the clamp warning compared against the raw CONFIG
+// value only — an in-range ENV override logged a misleading "clamped from 50
+// to 30". The warn must fire only when the EFFECTIVE value was out of bounds.
+test("config: dedup candidateLimit clamp warn fires only on the effective out-of-bounds value (DEDUP_CLAMP_LOG)", () => {
+    const warns = [];
+    const originalWarn = console.warn;
+    console.warn = (m) => { warns.push(String(m)); };
+    const prev = process.env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT;
+    try {
+        process.env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT = "30";
+        resolveMemoryConfig({ memory: { dedup: { candidateLimit: 500 } } }, "/tmp");
+        assert.ok(!warns.some((m) => m.includes("clamped")),
+            "an in-range env override must not be reported as clamped");
+        delete process.env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT;
+        resolveMemoryConfig({ memory: { dedup: { candidateLimit: 500 } } }, "/tmp");
+        assert.ok(warns.some((m) => m.includes("clamped from 500 to 200")),
+            "an out-of-bounds config value must warn with the correct original");
+    }
+    finally {
+        console.warn = originalWarn;
+        if (prev === undefined)
+            delete process.env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT;
+        else
+            process.env.OPENCODE_MEMORY_PRO_DEDUP_CANDIDATE_LIMIT = prev;
+    }
+});
+
+// PROTECTED_CATEGORIES_EMPTY (1.6.2): an explicit [] fell back to the
+// ["digest"] default, so digest protection could not be disabled. Absent →
+// default; a present array (including []) is honored.
+test("config: explicit protectedCategories: [] disables digest protection (PROTECTED_CATEGORIES_EMPTY)", () => {
+    const none = resolveMemoryConfig({ memory: { retention: { memory: { protectedCategories: [] } } } }, "/tmp");
+    assert.deepEqual(none.retention.memory.protectedCategories, [], "explicit [] must be honored (protection off)");
+    const def = resolveMemoryConfig({}, "/tmp");
+    assert.deepEqual(def.retention.memory.protectedCategories, ["digest"], "absent must default to ['digest']");
+});
+
 test("llm: parseExtractionJSON accepts bare array, code-fenced, and wrapped forms", () => {
     const plain = parseExtractionJSON('[{"content":"A decision","type":"decision","importance":0.9},{"content":"B fact","type":"fact","importance":0.6}]');
     assert.equal(plain.length, 2);
@@ -128,6 +177,16 @@ test("llm: parseExtractionJSON accepts bare array, code-fenced, and wrapped form
     const wrappedItems = parseExtractionJSON('{"items":[{"content":"E","type":"fact","importance":1.0}]}');
     assert.equal(wrappedItems.length, 1);
     assert.equal(wrappedItems[0].importance, 1.0);
+});
+
+// EXTRACTION_EMPTY_IMPORTANCE (1.6.2): Number("")===0 and Number(null)===0 —
+// an empty-string or null importance was silently 0.0 (bottom-ranked, first
+// retention candidate) instead of the type default. Now treated as missing.
+test("llm: parseExtractionJSON treats empty/null importance as missing (EXTRACTION_EMPTY_IMPORTANCE)", () => {
+    const parsed = parseExtractionJSON('[{"content":"A","type":"fact","importance":""},{"content":"B","type":"fact","importance":null},{"content":"C","type":"decision","importance":0.4}]');
+    assert.equal(parsed[0].importance, 0.75, "empty-string importance must use the fact default");
+    assert.equal(parsed[1].importance, 0.75, "null importance must use the fact default");
+    assert.equal(parsed[2].importance, 0.4, "a real numeric importance is preserved");
 });
 
 test("llm: parseExtractionJSON rejects garbage, empty lists, and bad types", () => {
@@ -326,9 +385,14 @@ test("llm: no usage line when the response carries no token info", async () => {
 // NO_TEXT_RETRY (1.6.1): flash-tier providers under load resolve session.prompt
 // with an empty parts array — the silent-empty case must retry on the SAME
 // ephemeral session (create/delete stay 1:1), then fall back to null only after
-// the attempt budget is spent. Mutant: returning null on first empty reply
-// (prompted===1) or recreating the session per attempt (created>1) fails.
-test("llm: no-text reply retries the same ephemeral session and succeeds on a later attempt", async () => {
+// NO_TEXT_RETRY (1.6.1) + RETRY_SESSION_PER_ATTEMPT (1.6.2): the no-text
+// retry loop must retry on a FRESH session per attempt (same-session reuse
+// multiplied the transcript × attempts, blowing small context windows),
+// while thrown errors and create failures are still NOT retried. Mutants:
+// returning null on first empty reply (prompted stays 1), reverting to
+// same-session reuse (created stays 1), or retrying throws (prompted > 1)
+// each fail their tests.
+test("llm: no-text reply retries on a fresh session and succeeds on a later attempt", async () => {
     setLlmRetryPolicy({ maxAttempts: 3, initialDelayMs: 0, backoffMultiplier: 1 });
     try {
         const calls = { created: 0, prompted: 0, deleted: 0 };
@@ -336,7 +400,7 @@ test("llm: no-text reply retries the same ephemeral session and succeeds on a la
             session: {
                 create: async () => {
                     calls.created += 1;
-                    return { data: { id: "ephemeral-notext" } };
+                    return { data: { id: `ephemeral-notext-${calls.created}` } };
                 },
                 prompt: async () => {
                     calls.prompted += 1;
@@ -353,9 +417,9 @@ test("llm: no-text reply retries the same ephemeral session and succeeds on a la
         assert.equal(result.length, 1, "retried prompt must produce memories");
         assert.equal(result[0].content, "Go for services");
         assert.equal(calls.prompted, 2, "first empty reply must be retried");
-        assert.equal(calls.created, 1, "retry must reuse the same ephemeral session");
-        assert.equal(calls.deleted, 1, "ephemeral session must still be cleaned up");
-        assert.equal(isOwnSession("ephemeral-notext"), true);
+        assert.equal(calls.created, 2, "each attempt must run in a fresh session (transcript must not multiply)");
+        assert.equal(calls.deleted, 2, "every ephemeral session must still be cleaned up");
+        assert.ok(isOwnSession("ephemeral-notext-2"), "the final attempt's session is tracked as own");
     }
     finally {
         resetLlmRetryPolicy();
@@ -384,8 +448,8 @@ test("llm: no-text reply exhausts retries then falls back to null", async () => 
         const result = await requestLLMCapture(fakeClient, { provider: "openrouter", model: "z-ai/glm-5.3-flash" }, "some text", "sess-alwaysempty");
         assert.equal(result, null, "exhausted attempts must fall back to heuristics");
         assert.equal(calls.prompted, 3, "attempt budget must be fully spent before giving up");
-        assert.equal(calls.created, 1);
-        assert.equal(calls.deleted, 1);
+        assert.equal(calls.created, 3, "one fresh session per attempt, even on exhaustion");
+        assert.equal(calls.deleted, 3);
     }
     finally {
         resetLlmRetryPolicy();
@@ -457,6 +521,29 @@ test("llm: backoffMultiplier is clamped to [1,10] from env (RETRY_BACKOFF_CLAMP)
             delete process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER;
         else
             process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER = prev;
+        resetLlmRetryPolicy();
+    }
+});
+
+// SET_RETRY_POLICY_CLAMP (1.6.2): setLlmRetryPolicy used a raw
+// Object.assign, bypassing every clamp — maxAttempts: Infinity → unbounded
+// retry loop, 0 → immediate failure. The seam now applies the same bounds
+// as resetLlmRetryPolicy/env read use.
+test("llm: setLlmRetryPolicy clamps out-of-bounds patches (SET_RETRY_POLICY_CLAMP)", () => {
+    try {
+        setLlmRetryPolicy({ maxAttempts: Infinity, initialDelayMs: -50, backoffMultiplier: 100 });
+        let policy = getLlmRetryPolicy();
+        assert.ok(Number.isFinite(policy.maxAttempts) && policy.maxAttempts >= 1 && policy.maxAttempts <= 10, "Infinity maxAttempts must clamp to the [1,10] bound");
+        assert.ok(policy.initialDelayMs >= 0 && policy.initialDelayMs <= 60000, "negative initialDelayMs must clamp to 0");
+        assert.ok(policy.backoffMultiplier >= 1 && policy.backoffMultiplier <= 10, "huge multiplier must clamp to 10");
+        setLlmRetryPolicy({ maxAttempts: 0, backoffMultiplier: 0.1 });
+        policy = getLlmRetryPolicy();
+        assert.equal(policy.maxAttempts, 1, "maxAttempts 0 must clamp to 1");
+        assert.equal(policy.backoffMultiplier, 1, "sub-1 multiplier must clamp to 1");
+        setLlmRetryPolicy({ maxAttempts: "bogus" });
+        assert.equal(getLlmRetryPolicy().maxAttempts, 3, "non-numeric maxAttempts falls back to the default 3");
+    }
+    finally {
         resetLlmRetryPolicy();
     }
 });
@@ -754,6 +841,84 @@ test("graph: onMemoryMerged decrements collapsed entity counts and GCs on later 
     }
 });
 
+// REINDEX_BACKFILL_HEAL (1.6.2): reindexMemories used to return early when
+// ANY memory_entities row existed — a crash mid-backfill left a partial
+// graph with no recovery. indexMemory is idempotent (REINDEX_COUNT_IDEMPOTENT),
+// so re-running over all active memories heals partial graphs.
+test("graph: reindexMemories heals a partial graph despite existing entities (REINDEX_BACKFILL_HEAL)", async () => {
+    const store = await makeGraphStore("graph-rebackfill-");
+    try {
+        const ts = Date.now();
+        store.indexMemory("existing", "the plugin uses docker", ts);
+        // Simulate a crash mid-backfill: "postgres" memory was never indexed.
+        const missing = { id: "missed", text: "the plugin also uses postgres", timestamp: ts + 1 };
+        store.reindexMemories([missing]);
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'postgres'").get().mention_count, 1,
+            "previously-missed memory must be indexed on re-run");
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get().mention_count, 1,
+            "re-running must not inflate existing counts (idempotent)");
+        // Re-running again is still safe.
+        store.reindexMemories([missing]);
+        assert.equal(store.db.prepare("SELECT mention_count FROM entities WHERE name = 'postgres'").get().mention_count, 1);
+    }
+    finally {
+        store.db.close();
+    }
+});
+
+// ENTITY_GC_EDGE_CLEANUP (1.6.2): GC deleted the entity ROW but left its
+// edges → BFS traversed dead entities as intermediates (stale-noise
+// expansion). The provenance-based edge cleanup only removes edges tied to
+// the removed memory; a STRAY edge (desynced state, e.g. manual DB surgery
+// or a pre-1.4.5 write) survives and keeps pointing at a GC'd entity. A
+// zero-count entity's edges must go with the row.
+test("graph: entity GC removes the entity's edges with the row (ENTITY_GC_EDGE_CLEANUP)", async () => {
+    const store = await makeGraphStore("graph-edgegc-");
+    try {
+        const ts = Date.now();
+        store.indexMemory("m1", "the plugin uses docker and postgres", ts);
+        // Seed a stray edge to docker NOT tied to m1's provenance — the
+        // provenance cleanup can't see it, only the entity GC can.
+        store.upsertEdge("docker", "ghost", "co_occurs", "stray-memory", ts);
+        const strayBefore = store.db.prepare("SELECT COUNT(*) AS c FROM edges WHERE (src = 'docker' AND dst = 'ghost') OR (src = 'ghost' AND dst = 'docker')").get().c;
+        assert.equal(strayBefore, 1, "sanity: stray edge exists");
+        store.onMemoryRemoved("m1");
+        assert.equal(store.stats().entities, 0, "all entities GC'd");
+        const dockerEdges = store.db.prepare("SELECT COUNT(*) AS c FROM edges WHERE (src = 'docker' AND dst = 'ghost') OR (src = 'ghost' AND dst = 'docker')").get().c;
+        assert.equal(dockerEdges, 0, "no edge may reference a GC'd entity (BFS must never see dead intermediates)");
+    }
+    finally {
+        store.db.close();
+    }
+});
+
+// REINDEX_ENTITY_HEAL (1.6.2): when a memory_entities link exists but the
+// entities row is missing (pre-1.4.5 desync), re-index used to INSERT with
+// mention_count=0 — a ghost entity GC (decrement-only) could never collect.
+// A live link means the count is at least 1: heal with 1.
+test("graph: re-index heals a missing entity row with count 1, not 0 (REINDEX_ENTITY_HEAL)", async () => {
+    const store = await makeGraphStore("graph-entityheal-");
+    try {
+        const ts = Date.now();
+        store.indexMemory("m1", "the plugin uses docker", ts);
+        // Simulate pre-1.4.5 desync: drop the entity row, keep the link.
+        store.db.prepare("DELETE FROM entities WHERE name = 'docker'").run();
+        const mapCount = store.db.prepare("SELECT COUNT(*) AS c FROM memory_entities WHERE entity_name = 'docker'").get().c;
+        assert.equal(mapCount, 1, "desync: link still exists");
+        store.indexMemory("m1", "the plugin uses docker", ts + 1000);
+        const row = store.db.prepare("SELECT mention_count FROM entities WHERE name = 'docker'").get();
+        assert.ok(row, "entity row must be recreated on re-index");
+        assert.equal(row.mention_count, 1, "a live link means count 1 — no count-0 ghost");
+        // Removing the memory still GCs it entirely.
+        store.onMemoryRemoved("m1");
+        assert.equal(store.stats().entities, 0, "healed entity must be collectable");
+        assert.equal(store.db.prepare("SELECT COUNT(*) AS c FROM edges").get().c, 0, "edges cleaned with the row");
+    }
+    finally {
+        store.db.close();
+    }
+});
+
 // REINDEX_COUNT_IDEMPOTENT (1.4.5): re-indexing the same memory must not
 // inflate mention_count — memory_entities is INSERT OR IGNORE, so the extra
 // increment had no matching link and blocked GC after onMemoryRemoved.
@@ -787,6 +952,37 @@ test("utils: classifyFailure buckets error messages", async () => {
     assert.equal(classifyFailure("TypeError: cannot read properties of undefined"), "runtime");
     assert.equal(classifyFailure("ECONNREFUSED to 127.0.0.1:8080"), "resource");
     assert.equal(classifyFailure("some totally unique message"), "unknown");
+});
+
+// VALIDATION_ZERO_COUNT (1.6.2): parseValidationOutput chained its two
+// error-count extractors with `||`; extractCount returns 0 for a zero count,
+// and 0 is falsy, so "0 errors" WITHOUT a "Found" prefix fell through to the
+// hasError(/error|fail/i) fallback — "errors" matched → a clean type-check
+// was misclassified as FAIL. `??` preserves the parsed 0 → pass.
+test("utils: parseValidationOutput treats a clean count of 0 as pass (VALIDATION_ZERO_COUNT)", async () => {
+    const { parseValidationOutput } = await import("../dist/utils.js");
+    assert.deepEqual(parseValidationOutput("0 errors", "type-check"), { status: "pass", errorCount: 0, errorTypes: [] });
+    assert.equal(parseValidationOutput("Found 0 errors", "type-check").status, "pass");
+    assert.equal(parseValidationOutput("Found 3 errors", "type-check").status, "fail");
+    assert.equal(parseValidationOutput("error TS2322: Type 'string' is not assignable", "type-check").status, "fail");
+});
+
+// VALIDATION_OUTCOME_CASE (1.6.2): detectValidationOutcome's failure-signal
+// regex was case-sensitive — real tsc output "found 1 error" (lowercase,
+// when metadata.exit is absent) never matched, so the failure was recorded
+// as pass. /i now catches lowercase signals while the \b0 (failing|failed|
+// errors?) zero-count guard stays intact (Error\b still can't match
+// "errors" — word boundary), so clean zero-count output stays pass.
+test("capture: detectValidationOutcome catches lowercase failure signals (VALIDATION_OUTCOME_CASE)", () => {
+    const base = { metadata: {}, output: undefined };
+    const tsc = "npx tsc --noEmit";
+    const failed = detectValidationOutcome(tsc, { ...base, output: "found 1 error in src/a.ts" });
+    assert.equal(failed.status, "fail", "lowercase 'found 1 error' must be a failure");
+    assert.equal(failed.type, "type-check");
+    const clean = detectValidationOutcome(tsc, { ...base, output: "0 errors found in 12 files" });
+    assert.equal(clean.status, "pass", "zero-count output must stay a pass");
+    const exitOverride = detectValidationOutcome(tsc, { metadata: { exit: 0 }, output: "found 1 error in src/a.ts" });
+    assert.equal(exitOverride.status, "pass", "a real exit code must override the text heuristic");
 });
 // OPTIMIZE_LOCK_TOCTOU (1.3.6): the 1.3.4 lock treated an EMPTY lock file as
 // stale and deleted it, but the owner creates the file with open("wx") and
@@ -882,6 +1078,27 @@ test("scope: injected opencode config drives scoping, env still overrides (SCOPI
         else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
     }
     assert.equal(resolveScope(undefined, dir), "global", "clearing the source restores the global fallback");
+});
+
+// STABLE_HASH_NONSTRING (1.6.2): deriveProjectScope(undefined) threw in
+// project mode — stableHash(undefined) hit createHash.update(TypeError).
+// Non-string worktrees now hash the empty string instead of crashing.
+test("scope: deriveProjectScope tolerates a missing worktree in project mode (STABLE_HASH_NONSTRING)", async () => {
+    const { setScopingConfigSource, deriveProjectScope } = await import("../dist/scope.js");
+    const old = process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    try {
+        setScopingConfigSource({ memory: { scoping: "project" } });
+        const derived = deriveProjectScope(undefined);
+        assert.equal(typeof derived, "string", "deriveProjectScope(undefined) must not throw in project mode");
+        assert.ok(derived.startsWith("project:local:"), "a stable project scope is still derived");
+        assert.equal(deriveProjectScope(undefined), derived, "missing worktree hashes deterministically");
+    }
+    finally {
+        setScopingConfigSource(undefined);
+        if (old !== undefined) process.env.OPENCODE_MEMORY_PRO_SCOPING = old;
+        else delete process.env.OPENCODE_MEMORY_PRO_SCOPING;
+    }
 });
 
 test("scope: resolveScope honors explicit scopes in project mode", () => {
@@ -1022,6 +1239,8 @@ function makeFlushState({ initialized, minCaptureChars = 0 }) {
     const storedRecords = [];
     const state = {
         captureBuffer: new Map(),
+        activeEpisodes: new Map(),
+        flushInProgress: new Set(),
         defaultScope: "global",
         initialized,
         ensureInitialized: async () => { },
@@ -1120,6 +1339,46 @@ test("capture: handleSessionIdle swallows flush failure and still consolidates (
     );
 });
 
+// IDLE_SWEEP_DEDUP_DECOUPLE (1.6.2): the idle/compacted consolidate+sweep
+// pass used to be gated on dedup.enabled (handleSessionIdle wrapped it in
+// `if (state.config.dedup.enabled)`), so with dedup disabled the retention
+// sweep NEVER ran on idle/compacted — only init + session.deleted did. The
+// sweep is retention, not dedup; the deleted path runs both unconditionally.
+// Regression: dedup off must still schedule+run the retention sweep, while
+// consolidation stays off (its own dedup guard decides).
+test("capture: handleSessionIdle runs retention sweep with dedup disabled (IDLE_SWEEP_DEDUP_DECOUPLE)", async () => {
+    const { state } = makeFlushState({ initialized: true });
+    state.config.dedup.enabled = false;
+    state.consolidationInProgress = new Map();
+    state.lastConsolidateAt = new Map();
+    state.sweepInProgress = new Map();
+    state.lastSweepAt = new Map();
+    let consolidateCalls = 0;
+    state.store.consolidateDuplicates = async () => { consolidateCalls += 1; };
+    // Probe: make the sweep's first store read throw a marker — the sweep is
+    // fire-and-forget with an internal catch that logs "[retention] sweep
+    // failed: ...", which is how we observe it actually ran.
+    state.store.readByScopes = async () => { throw new Error("R10_SWEEP_PROBE"); };
+    const warnMessages = [];
+    const originalWarn = console.warn;
+    console.warn = (msg) => { warnMessages.push(String(msg)); };
+    try {
+        await assert.doesNotReject(handleSessionIdle("sess-r10", "session.idle", state, { client: offlineClient }));
+        // maybeSweepExpiredMemories is fire-and-forget; let its promise chain
+        // (readByScopes throw → catch → warn) settle before asserting.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    finally {
+        console.warn = originalWarn;
+    }
+    assert.equal(typeof state.lastSweepAt.get("global"), "number", "sweep must be scheduled even with dedup disabled");
+    assert.ok(
+        warnMessages.some((m) => m.includes("R10_SWEEP_PROBE")),
+        "the retention sweep must actually run with dedup disabled",
+    );
+    assert.equal(consolidateCalls, 0, "consolidation must stay off when dedup is disabled");
+});
+
 // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): the buffer delete used to run BEFORE
 // the awaited store writes (recordCaptureEvent → putEvent was the first). A
 // transient LanceDB failure threw out of _flushAutoCapture with the buffer
@@ -1151,6 +1410,64 @@ test("capture: store write failure retains buffered fragments for retry (CAPTURE
     await flushAutoCapture("sess-5", state, offlineClient);
     assert.ok(!state.captureBuffer.has("sess-5"), "recovered flush consumes the buffer");
     assert.equal(storedRecords.length, 1, "retained fragments must be stored on retry");
+});
+
+// FLUSH_SNAPSHOT_CONSUME (1.6.2): a fragment appended DURING the flush's
+// awaits (a text.complete landing between store writes) used to be discarded
+// by the final buffer delete — silent transcript loss. The snapshot drives
+// extraction; appended fragments survive for the next flush.
+test("capture: fragments appended during a flush survive it (FLUSH_SNAPSHOT_CONSUME)", async () => {
+    const { state, storedRecords } = makeFlushState({ initialized: true, minCaptureChars: 0 });
+    state.captureBuffer.set("sess-snap", ["decided to use sqlite for the cache"]);
+    let appended = false;
+    state.store.putEvent = async () => {
+        // Simulate a text.complete firing mid-flush: push onto the LIVE
+        // array (recordCaptureFragment pushes without reassignment).
+        if (!appended) {
+            appended = true;
+            state.captureBuffer.get("sess-snap").push("decided to use redis afterwards");
+        }
+    };
+    await flushAutoCapture("sess-snap", state, offlineClient);
+    assert.equal(storedRecords.length, 1, "only the snapshot fragment is stored");
+    assert.equal(storedRecords[0].text, "decided to use sqlite for the cache");
+    assert.deepEqual(
+        state.captureBuffer.get("sess-snap"),
+        ["decided to use redis afterwards"],
+        "the appended fragment must remain in the buffer for the next flush",
+    );
+});
+
+// FLUSH_IN_PROGRESS_GUARD (1.6.2): concurrent session.idle + session.deleted
+// flushes for one session used to BOTH read the same fragments and store
+// them twice (duplicate captures). The per-session guard coalesces them.
+test("capture: concurrent flushes for one session coalesce (FLUSH_IN_PROGRESS_GUARD)", async () => {
+    const { state, storedRecords } = makeFlushState({ initialized: true, minCaptureChars: 0 });
+    state.captureBuffer.set("sess-race", ["decided to use sqlite for the cache"]);
+    await Promise.all([
+        flushAutoCapture("sess-race", state, offlineClient),
+        flushAutoCapture("sess-race", state, offlineClient),
+    ]);
+    assert.equal(storedRecords.length, 1, "only one flush consumes the fragments");
+    assert.ok(!state.captureBuffer.has("sess-race"), "buffer consumed exactly once");
+});
+
+// ACTIVE_EPISODES_CAP (1.6.2): activeEpisodes grew unbounded (siblings are
+// capped: captureBuffer 200, sessionErrors 500). A lost session.deleted
+// event or a failing updateTaskState (retained for retry by design) leaked
+// entries for the process lifetime. FIFO-capped at 500.
+test("lifecycle: activeEpisodes is FIFO-capped (ACTIVE_EPISODES_CAP)", async () => {
+    const { state } = makeFlushState({ initialized: true });
+    let created = 0;
+    state.store.createTaskEpisode = async () => { created += 1; };
+    const input = { worktree: "/tmp", client: offlineClient };
+    for (let i = 0; i < 501; i++) {
+        await handleSessionStart(`sess-cap-${i}`, state, input);
+    }
+    assert.equal(created, 501, "every episode is still created");
+    assert.equal(state.activeEpisodes.size, 500, "map must be capped at 500");
+    assert.ok(!state.activeEpisodes.has("sess-cap-0"), "oldest entry must be evicted");
+    assert.ok(state.activeEpisodes.has("sess-cap-500"), "newest entry retained");
 });
 
 // SESSION_LIFECYCLE_GUARD (1.4.6): handleSessionStart/End perform real store
@@ -1232,6 +1549,26 @@ test("preference: buildPreferenceInjection budget mode consumes tokenBudget and 
     const fallback = buildPreferenceInjection(prefs, { mode: "budget", maxMemories: 10 });
     const fallbackItems = fallback.split("\n").length - 1;
     assert.equal(fallbackItems, 3, "missing tokenBudget falls back to 500 (all items fit)");
+});
+
+// PREFERENCE_VERB_LOOKAHEAD (1.6.2): "I prefer to use docker" fires
+// preference pattern 4, whose optional "(?:to |)" consumed "to " and then
+// captured the NEXT word — the verb "use" became a junk preference key
+// ("to" itself on backtrack), injected into every recall turn's preference
+// block. The negative lookahead now skips generic verbs; the intended
+// object is still captured by the sibling patterns.
+test("preference: 'prefer to use X' captures X, not the verb (PREFERENCE_VERB_LOOKAHEAD)", () => {
+    const mem = { text: "I prefer to use docker for local development", timestamp: Date.now(), id: "m1" };
+    const signals = extractPreferenceSignals(mem);
+    const keys = signals.map((s) => s.key);
+    assert.ok(!keys.includes("use"), `junk key 'use' must not be produced (got ${keys.join(",")})`);
+    assert.ok(!keys.includes("to"), `junk key 'to' must not be produced (got ${keys.join(",")})`);
+    assert.ok(keys.includes("docker"), "the real preference object must still be captured");
+    const direct = extractPreferenceSignals({ text: "I prefer docker over podman", timestamp: Date.now(), id: "m2" });
+    assert.ok(direct.some((s) => s.key === "docker"), "direct 'prefer docker' still captures the object");
+    const avoid = extractPreferenceSignals({ text: "I prefer to avoid docker", timestamp: Date.now(), id: "m3" });
+    assert.ok(!avoid.some((s) => s.key === "avoid"), "'avoid' is a verb, not a preference");
+    assert.ok(avoid.some((s) => s.key === "docker"), "'avoid docker' still captures docker");
 });
 
 // OWN_SESSIONS_CAP (1.4.6): OWN_SESSION_IDS grew unbounded — one entry per
@@ -1337,11 +1674,94 @@ test("init: initializeStore skips repair when dimensions match (EMBEDDING_CONFIG
     assert.deepEqual(state.store.initCalls, [16], "single init, no rebuild");
 });
 
+// CONFIG_CHANGE_INIT_RESET (1.6.2): a config re-resolution that swaps the
+// embedder while an init is in flight must clear initPromise, otherwise the
+// next ensureInitialized returns the OLD in-flight promise (built against the
+// OLD embedder) and the new dimension is never probed.
+test("config: handleEmbeddingConfigChange clears initPromise on embedding change (CONFIG_CHANGE_INIT_RESET)", () => {
+    const state = {
+        config: { embedding: { provider: "ollama", model: "old-model" } },
+        embedder: { model: "old-model" },
+        initialized: true,
+        initPromise: Promise.resolve(),
+    };
+    const nextConfig = { embedding: { provider: "ollama", model: "new-model" } };
+    handleEmbeddingConfigChange(state, nextConfig);
+    assert.equal(state.initPromise, null, "in-flight initPromise must be cleared so the next init re-probes the new dimension");
+    assert.equal(state.initialized, false, "embedding change must clear initialized");
+    assert.equal(state.embedder.model, "new-model", "embedder must be swapped to the new model");
+});
+
+test("config: handleEmbeddingConfigChange leaves initPromise intact when embedding unchanged", () => {
+    const inFlight = Promise.resolve();
+    const state = {
+        config: { embedding: { provider: "ollama", model: "same-model" } },
+        embedder: { model: "same-model" },
+        initialized: true,
+        initPromise: inFlight,
+    };
+    const nextConfig = { embedding: { provider: "ollama", model: "same-model" } };
+    handleEmbeddingConfigChange(state, nextConfig);
+    assert.equal(state.initPromise, inFlight, "no embedding change must not clear initPromise");
+    assert.equal(state.initialized, true, "no embedding change must not clear initialized");
+});
+
 test("repair: repairEmbeddingDimension no-ops when dims already match", async () => {
     const state = makeDimensionState({ physicalDim: 16, records: [] });
     const result = await repairEmbeddingDimension(state, 16);
     assert.equal(result.mismatch, false, "matching dims must report no mismatch");
     assert.equal(state.droppedTable, undefined, "nothing dropped");
+});
+
+// EMBEDDER_HEALTH_RESET (1.6.2) + EMBEDDER_RETRY_COUNT_RESET (1.6.2): a
+// successful embed after an outage must clear the degraded state AND reset the
+// retry counter. The retry-disabled path previously returned embedder.embed()
+// directly without touching health, so a recovered embedder stayed
+// fallbackActive:true forever (memory_stats reported "bm25-only").
+function mockEmbeddingFetch() {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+        ok: true,
+        json: async () => ({ embedding: [0.1, 0.2, 0.3] }),
+    });
+    return originalFetch;
+}
+
+test("embedder: retry-disabled path clears degraded health on success (EMBEDDER_HEALTH_RESET)", async () => {
+    resetEmbedderHealth();
+    setEmbedderHealth({ status: "degraded", fallbackActive: true, retryCount: 7, lastError: "boom" });
+    const originalFetch = mockEmbeddingFetch();
+    try {
+        const embedder = createEmbedder({ provider: "ollama", model: "test", baseUrl: "http://x", retry: { enabled: false } });
+        await embedder.embed("hello");
+        const health = getEmbedderHealth();
+        assert.equal(health.fallbackActive, false, "success must clear fallbackActive");
+        assert.equal(health.status, "healthy", "success must restore healthy status");
+        assert.equal(health.retryCount, 0, "success must reset retryCount");
+        assert.equal(health.lastError, null, "success must clear lastError");
+    }
+    finally {
+        globalThis.fetch = originalFetch;
+        resetEmbedderHealth();
+    }
+});
+
+test("embedder: retryCount resets on success (EMBEDDER_RETRY_COUNT_RESET)", async () => {
+    resetEmbedderHealth();
+    setEmbedderHealth({ status: "degraded", fallbackActive: true, retryCount: 5 });
+    const originalFetch = mockEmbeddingFetch();
+    try {
+        const embedder = createEmbedder({ provider: "ollama", model: "test", baseUrl: "http://x", retry: { enabled: true, maxAttempts: 3, initialDelayMs: 1, backoffMultiplier: 1 } });
+        await embedder.embed("hello");
+        const health = getEmbedderHealth();
+        assert.equal(health.retryCount, 0, "retryCount must reset to 0 on success");
+        assert.equal(health.fallbackActive, false, "success must clear fallbackActive");
+        assert.equal(health.status, "healthy", "success must restore healthy status");
+    }
+    finally {
+        globalThis.fetch = originalFetch;
+        resetEmbedderHealth();
+    }
 });
 
 // BM25_INDEX_ALIGN (1.4.5): cached.tokenized is aligned with the UNFILTERED
@@ -1718,6 +2138,42 @@ test("extract: outcome and completion claims still trigger capture (SIGNAL_TIGHT
         const result = extractCaptureCandidate(text, 20);
         assert.ok(result.candidate, `outcome claim must capture: ${text}`);
     }
+});
+
+// SIGNAL_WORD_BOUNDARY (1.6.2): the capture gate matched signals with
+// substring includes() — "passed" matched "bypassed", "fixed" matched
+// "prefixed", "solved" matched "unsolved" → false auto-captures on
+// narration that merely contained the strings. The gate now requires word
+// boundaries, matching GLOBAL_KEYWORD_REGEXES.
+test("extract: substring signal words do not fire inside larger words (SIGNAL_WORD_BOUNDARY)", () => {
+    for (const text of [
+        "The auth check was bypassed for the integration tests.",
+        "All generated ids are prefixed with a zone tag.",
+        "The flaky suite is still unsolved after several attempts.",
+    ]) {
+        const result = extractCaptureCandidate(text, 20);
+        assert.equal(result.candidate, null, `near-miss must not capture: ${text}`);
+        assert.equal(result.skipReason, "no-positive-signal", `near-miss must hit the signal gate: ${text}`);
+    }
+    for (const text of [
+        "The bug is finally fixed.",
+        "All tests passed on the first run.",
+        "The root cause is solved.",
+    ]) {
+        const result = extractCaptureCandidate(text, 20);
+        assert.ok(result.candidate, `real signal must still capture: ${text}`);
+    }
+});
+
+// KEY_SENTENCE_FALLBACK (1.6.2): a single sentence longer than targetChars
+// with no key-pattern words made both passes break before pushing anything —
+// extractKeySentences returned "" and an empty summarized block got injected.
+test("summarize: extractKeySentences never returns empty for non-empty input (KEY_SENTENCE_FALLBACK)", () => {
+    const long = "This is one extremely long run-on sentence without any of the key signal words that the pattern list looks for anywhere inside of it";
+    const out = extractKeySentences(long, 10);
+    assert.ok(out.length > 0, "a too-long first sentence must still yield content, not ''");
+    assert.ok(out.length <= 13, "the fallback content is truncated to targetChars-ish");
+    assert.ok(out.startsWith(long.slice(0, 7)), "the fallback preserves the start of the sentence");
 });
 
 // V1_PLUGIN_EXPORT (1.5.4): opencode's plugin loader treats a module whose

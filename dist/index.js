@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.6.1";
+const PLUGIN_VERSION = "1.6.2";
 const SCHEMA_VERSION = 1;
 // CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
 // on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
@@ -24,6 +24,13 @@ const SCHEMA_VERSION = 1;
 // (same pattern as flushAutoCapture/handleSessionIdle).
 const CAPTURE_BUFFER_MAX_FRAGMENTS = 200;
 const CAPTURE_BUFFER_MAX_SESSIONS = 200;
+// ACTIVE_EPISODES_CAP (1.6.2): activeEpisodes grew unbounded while its
+// siblings are capped (captureBuffer 200, sessionErrors 500). A lost
+// session.deleted event (crash) or a failing updateTaskState (entry
+// intentionally retained for retry) leaked entries for the process
+// lifetime. FIFO-capped like sessionErrors; the evicted episode row stays
+// "running" on disk (telemetry gap, not a leak).
+const ACTIVE_EPISODES_MAX = 500;
 // V1_PLUGIN_EXPORT (1.5.4): recordCaptureFragment is NOT an `export function`.
 // Module namespace exports sort alphabetically, and opencode's legacy plugin
 // loader iterates every function export, calling each as a plugin factory with
@@ -145,7 +152,13 @@ function detectValidationOutcome(command, toolOutput) {
         status = exitCode === 0 ? "pass" : "fail";
     }
     else {
-        const failureSignal = /(^|\s)(FAIL|Failed|Error|Exception)\b/.test(output)
+        // VALIDATION_OUTCOME_CASE (1.6.2): the failure-signal regex was
+        // case-sensitive — lowercase "found 1 error" (real tsc output when
+        // metadata.exit is absent) never matched `(^|\s)Error\b`, so a the
+        // failure was recorded as pass. /i is safe: the \b0 (failing|failed|
+        // errors?) guard below stays case-insensitive, and Error\b still does
+        // not match "errors" (word boundary), so zero-count lines can't trip.
+        const failureSignal = /(^|\s)(FAIL|Failed|Error|Exception)\b/i.test(output)
             && !/\b0 (failing|failed|errors?)\b/i.test(output);
         status = failureSignal ? "fail" : "pass";
     }
@@ -168,10 +181,7 @@ const plugin = async (input) => {
             // silently ignored memory.scoping from opencode.json.
             setScopingConfigSource(config);
             const nextConfig = resolveMemoryConfig(config, input.worktree);
-            if (hasEmbeddingConfigChanged(state.config.embedding, nextConfig.embedding)) {
-                state.embedder = createEmbedder(nextConfig.embedding);
-                state.initialized = false;
-            }
+            handleEmbeddingConfigChange(state, nextConfig);
             state.config = nextConfig;
             configureLogger(nextConfig.logging ?? {});
             // Startup banner logs after the config hook has armed the file
@@ -451,6 +461,9 @@ async function createRuntimeState(input) {
         startupLogged: false,
         captureBuffer: new Map(),
         activeEpisodes: new Map(),
+        // FLUSH_IN_PROGRESS_GUARD (1.6.2): per-session in-flight guard for
+        // capture flushes (see _flushAutoCapture).
+        flushInProgress: new Set(),
         sessionErrors: new Map(),
         lastRecall: null,
         // PER_SCOPE_COOLDOWN (1.4.0): cooldowns are per-scope (Map keyed by scope)
@@ -844,8 +857,54 @@ async function flushAutoCapture(sessionID, state, client) {
         stop({ fragmentCount });
     }
 }
+// FLUSH_IN_PROGRESS_GUARD (1.6.2): a concurrent session.idle + session.deleted
+// flush for the SAME session used to both read the same fragments and store
+// them twice (duplicate captures; also raced the first flush's deletes). A
+// per-session in-flight guard lets only ONE flush consume a snapshot; the
+// other no-ops. Fragments appended after the snapshot stay in the buffer.
 async function _flushAutoCapture(sessionID, state, client) {
-    const fragments = state.captureBuffer.get(sessionID) ?? [];
+    if (state.flushInProgress?.has(sessionID)) {
+        return;
+    }
+    state.flushInProgress?.add(sessionID);
+    try {
+        await _flushAutoCaptureGuarded(sessionID, state, client);
+    }
+    finally {
+        state.flushInProgress?.delete(sessionID);
+    }
+}
+// FLUSH_SNAPSHOT_CONSUME (1.6.2): take a SNAPSHOT (copy) of the buffered
+// fragments. recordCaptureFragment pushes onto the LIVE array (and can
+// reassign it at the 200-fragment cap), so a fragment appended during the
+// flush's awaits used to land in the array that the final delete() discarded
+// → silent transcript loss, exactly in the path hardened for retention. The
+// snapshot drives extraction; consumeBufferedFragments keeps anything
+// appended after it for the next flush.
+// FLUSH_SNAPSHOT_CONSUME (1.6.2): remove exactly the snapshot's fragments
+// from the live buffer, keeping anything appended during the flush.
+// Reference-identity: if recordCaptureFragment REASSIGNED the entry at the
+// fragment cap mid-flush (list.slice(-200)), the live array is no longer
+// the snapshot — all surviving content is post-snapshot, so keep it for the
+// next flush rather than dropping it.
+function consumeBufferedFragments(state, sessionID, snapshot, snapshotCount) {
+    const live = state.captureBuffer.get(sessionID);
+    if (live === undefined)
+        return;
+    if (live === snapshot) {
+        // snapshotCount is FROZEN at capture time (snapshot.length grows as
+        // the live array is appended to — same reference).
+        if (live.length > snapshotCount) {
+            state.captureBuffer.set(sessionID, live.slice(snapshotCount));
+        }
+        else {
+            state.captureBuffer.delete(sessionID);
+        }
+    }
+}
+async function _flushAutoCaptureGuarded(sessionID, state, client) {
+    const liveSnapshot = state.captureBuffer.get(sessionID) ?? [];
+    const fragments = liveSnapshot.slice();
     if (fragments.length === 0) {
         await recordCaptureEvent(state, {
             sessionID,
@@ -930,7 +989,7 @@ async function _flushAutoCapture(sessionID, state, client) {
             }
             // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): all store writes above
             // succeeded — safe to drop the buffered fragments.
-            state.captureBuffer.delete(sessionID);
+            consumeBufferedFragments(state, sessionID, liveSnapshot, fragments.length);
             return;
         }
         await recordCaptureEvent(state, {
@@ -948,7 +1007,7 @@ async function _flushAutoCapture(sessionID, state, client) {
         if (candidates !== null) {
             // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): LLM returned a real empty
             // verdict — the transcript was considered and rejected; drop it.
-            state.captureBuffer.delete(sessionID);
+            consumeBufferedFragments(state, sessionID, liveSnapshot, fragments.length);
             return;
         }
     }
@@ -963,7 +1022,7 @@ async function _flushAutoCapture(sessionID, state, client) {
         });
         // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): considered + skipped — the
         // transcript was processed; drop it.
-        state.captureBuffer.delete(sessionID);
+        consumeBufferedFragments(state, sessionID, liveSnapshot, fragments.length);
         return;
     }
     const stored = await storeCapturedMemory(state, {
@@ -984,7 +1043,7 @@ async function _flushAutoCapture(sessionID, state, client) {
         });
         // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): considered + skipped — the
         // transcript was processed; drop it.
-        state.captureBuffer.delete(sessionID);
+        consumeBufferedFragments(state, sessionID, liveSnapshot, fragments.length);
         return;
     }
     await recordCaptureEvent(state, {
@@ -998,7 +1057,7 @@ async function _flushAutoCapture(sessionID, state, client) {
     // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): all store writes above succeeded —
     // only now is it safe to drop the buffered fragments. A throw anywhere
     // above leaves them in place for the next flush to retry.
-    state.captureBuffer.delete(sessionID);
+    consumeBufferedFragments(state, sessionID, liveSnapshot, fragments.length);
 }
 // SESSION_IDLE_FLUSH_GUARD (1.4.5): session.idle/session.compacted handling,
 // extracted from the event hook so the flush-failure path is unit-testable.
@@ -1014,16 +1073,20 @@ async function handleSessionIdle(sessionID, eventType, state, input) {
     catch (error) {
         log("warn", `failed to flush capture on session idle: ${toErrorMessage(error)}`);
     }
-    if (state.config.dedup.enabled) {
-        // Use the session's actual directory (not the static plugin-init
-        // worktree) since a single opencode server process can host
-        // sessions across multiple project directories.
-        const activeScope = await resolveSessionScope(sessionID, input.client, state.defaultScope);
-        // idle = throttled background pass (cooldown-gated);
-        // compacted = explicit compaction, consolidate right away.
-        maybeConsolidateDuplicates(state, activeScope, eventType === "session.compacted");
-        maybeSweepExpiredMemories(state, activeScope, eventType === "session.compacted");
-    }
+    // IDLE_SWEEP_DEDUP_DECOUPLE (1.6.2): the consolidate/sweep pass used to be
+    // gated on dedup.enabled, so with dedup off the retention sweep NEVER ran
+    // on idle/compacted (only init + session.deleted) — wrong coupling, the
+    // deleted path (:266-267) already runs both unconditionally. Consolidation
+    // self-guards on dedup.enabled (maybeConsolidateDuplicates), and the sweep
+    // is retention, not dedup.
+    // Use the session's actual directory (not the static plugin-init
+    // worktree) since a single opencode server process can host
+    // sessions across multiple project directories.
+    const activeScope = await resolveSessionScope(sessionID, input.client, state.defaultScope);
+    // idle = throttled background pass (cooldown-gated);
+    // compacted = explicit compaction, consolidate right away.
+    maybeConsolidateDuplicates(state, activeScope, eventType === "session.compacted");
+    maybeSweepExpiredMemories(state, activeScope, eventType === "session.compacted");
 }
 /**
  * Shared capture-store path (used by both heuristics and LLM modes): embed,
@@ -1237,6 +1300,17 @@ async function handleSessionStart(sessionID, state, input) {
         };
         await state.store.createTaskEpisode(episode);
         state.activeEpisodes.set(sessionID, { taskId, scope: activeScope });
+        // ACTIVE_EPISODES_CAP (1.6.2): bound growth when session.deleted
+        // never fires (crash) or updateTaskState keeps failing (entry
+        // retained for retry by design). FIFO-evict the oldest, mirroring
+        // sessionErrors; the episode row stays "running" on disk.
+        if (state.activeEpisodes.size > ACTIVE_EPISODES_MAX) {
+            const oldestKey = state.activeEpisodes.keys().next().value;
+            if (oldestKey !== undefined) {
+                state.activeEpisodes.delete(oldestKey);
+                log("warn", `activeEpisodes cap reached (${ACTIVE_EPISODES_MAX}); evicted oldest session ${oldestKey}`);
+            }
+        }
     }
     catch (error) {
         log("warn", `failed to record session start for ${sessionID}: ${toErrorMessage(error)}`);
@@ -1319,6 +1393,22 @@ function hasEmbeddingConfigChanged(current, next) {
         || (current.apiKey ?? "") !== (next.apiKey ?? "")
         || (current.timeoutMs ?? 0) !== (next.timeoutMs ?? 0));
 }
+// CONFIG_CHANGE_INIT_RESET (1.6.2): when the embedding config changes, the
+// config hook swaps the embedder and clears `initialized` so the next
+// ensureInitialized re-probes the new dimension. But it did NOT clear
+// `initPromise` — if an init was already in flight (deferred init racing a
+// config re-resolution), ensureInitialized returned the OLD in-flight promise
+// (built against the OLD embedder), so the new embedder's dimension was never
+// probed and the store kept the old fixed-width vector column (silent
+// corruption window). Clearing initPromise here forces the next
+// ensureInitialized to start a fresh init against the new embedder.
+function handleEmbeddingConfigChange(state, nextConfig) {
+    if (hasEmbeddingConfigChanged(state.config.embedding, nextConfig.embedding)) {
+        state.embedder = createEmbedder(nextConfig.embedding);
+        state.initialized = false;
+        state.initPromise = null;
+    }
+}
 // V1_PLUGIN_EXPORT (1.5.4): the default export is a V1 plugin object, not the
 // legacy factory function. opencode's loader detects V1 plugins via
 // readV1Plugin (default export is an object with `id` + `server`) and then
@@ -1333,4 +1423,4 @@ export default {
 // Named exports for regression tests only — opencode plugin loading consumes
 // the default export and ignores these (kept below `export default` so the
 // legacy loader fallback would still reach the server factory first).
-export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline, wireRetentionScoring, wireStoreCacheCap };
+export { recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, runRecallPipeline, wireRetentionScoring, wireStoreCacheCap, handleEmbeddingConfigChange, detectValidationOutcome };

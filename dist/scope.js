@@ -69,15 +69,30 @@ export function setScopingConfigSource(config) {
 const SCOPING_CACHE_TTL_MS = Number.isFinite(Number(process.env.OPENCODE_MEMORY_PRO_SCOPING_CACHE_TTL_MS))
     ? Math.max(0, Number(process.env.OPENCODE_MEMORY_PRO_SCOPING_CACHE_TTL_MS))
     : 5000;
+// SCOPING_CACHE_LRU (1.6.2): the cache evicted the OLDEST-INSERTED entry
+// (Map insertion order), not the least-recently-USED — a long-lived server
+// hosting many project directories could evict a hot entry while keeping a
+// cold stale one. get() now refreshes recency before every read (delete →
+// set), so eviction drops the least-recently-USED key. Also: a TTL of 0
+// (OPENCODE_MEMORY_PRO_SCOPING_CACHE_TTL_MS=0) silently DISABLED the cache
+// (every entry expired instantly, `now < expiresAt` always false); 0 now
+// means "never expire" so the cache stays usable.
 const SCOPING_CACHE_MAX_ENTRIES = 20;
 const scopingCache = new Map();
 function resolveScoping(worktree) {
     const key = worktree ?? "";
     const envScoping = process.env.OPENCODE_MEMORY_PRO_SCOPING;
     const now = Date.now();
-    const cached = scopingCache.get(key);
-    if (cached && cached.envScoping === envScoping && now < cached.expiresAt) {
-        return cached.value;
+    const rawCached = scopingCache.get(key);
+    if (rawCached && rawCached.envScoping === envScoping) {
+        const expired = SCOPING_CACHE_TTL_MS > 0 && now >= rawCached.expiresAt;
+        if (!expired) {
+            // Refresh recency, then normalize: good; the clone below keeps
+            // insertion order = LRU order.
+            scopingCache.delete(key);
+            scopingCache.set(key, { value: rawCached.value, envScoping, expiresAt: rawCached.expiresAt });
+            return rawCached.value;
+        }
     }
     let value;
     try {
@@ -86,10 +101,16 @@ function resolveScoping(worktree) {
     catch {
         value = "global";
     }
+    scopingCache.delete(key);
     scopingCache.set(key, { value, envScoping, expiresAt: now + SCOPING_CACHE_TTL_MS });
     if (scopingCache.size > SCOPING_CACHE_MAX_ENTRIES) {
-        const oldestKey = scopingCache.keys().next().value;
-        scopingCache.delete(oldestKey);
+        const leastRecent = scopingCache.keys().next().value;
+        scopingCache.delete(leastRecent);
     }
     return value;
+}
+// SCOPING_CACHE_LRU (1.6.2): test-only seam — expose the cache's current
+// keys IN INSERTION (LRU) ORDER so the eviction policy is observable.
+export function getScopingCacheKeys() {
+    return Array.from(scopingCache.keys());
 }

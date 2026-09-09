@@ -1,7 +1,21 @@
 const PREFERENCE_PATTERNS = [
-    { regex: /I prefer (?:using |)([\w#.+-]+)/i, category: "tool", source: "explicit" },
+    // PREFERENCE_VERB_LOOKAHEAD (1.6.2): "I prefer to use docker" used to
+    // capture the verb — "to" here (optional "(?:using )?" skipped, next word
+    // grabbed), and "use" in the sibling "prefer(red) (?:to )?" pattern below.
+    // Junk keys ("to"/"use"/"avoid") were injected into the preference block
+    // on every recall turn. The negative lookahead skips generic verbs; the
+    // real object is still captured by the other patterns ("use docker" →
+    // "use X" pattern, "avoid docker" → "avoid" pattern).
+    { regex: /I prefer (?:using )?(?!using\b|use\b|to\b|avoid\b)([\w#.+-]+)/i, category: "tool", source: "explicit" },
     { regex: /I (?:always |)(?:use |use |using )([\w#.+-]+)/i, category: "tool", source: "explicit" },
-    { regex: /(?:prefer|preferred) (?:to |)([\w#.+-]+)/i, category: "tool", source: "explicit" },
+    // PREFERENCE_VERB_LOOKAHEAD (1.6.2): "I prefer to use docker" used to
+    // capture the verb ("use" — via the optional "(?:to )?" consuming "to "
+    // then grabbing the next word; backtracking could even capture "to"
+    // itself). Junk keys ("use"/"to"/"avoid") were injected into the
+    // preference block on every recall turn. The negative lookahead skips
+    // generic verbs; the real object is still captured by the other patterns
+    // ("use docker" → line 5, "avoid docker" → line 11).
+    { regex: /(?:prefer|preferred) (?:to )?(?!using\b|use\b|to\b|avoid\b)([\w#.+-]+)/i, category: "tool", source: "explicit" },
     { regex: /use ([\w#.+-]+) (?:for |)/i, category: "tool", source: "explicit" },
     { regex: /I like (?:using |)([\w#.+-]+)/i, category: "tool", source: "explicit" },
     { regex: /(typescript|javascript|python|rust|go|java)/i, category: "language", source: "explicit" },

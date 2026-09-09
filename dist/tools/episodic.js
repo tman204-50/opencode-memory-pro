@@ -103,11 +103,17 @@ export function createEpisodicTools(state) {
                 }
                 const limited = similar.slice(0, args.limit);
                 return limited.map((ep) => {
-                    const commands = parseJsonObject(ep.commandsJson, []);
-                    const outcomes = parseJsonObject(ep.validationOutcomesJson, []);
+                    // EPISODIC_SHAPE_GUARD (1.6.2): parseJsonObject accepts any
+                    // valid JSON — a row with a valid-but-wrong-shape blob
+                    // (object instead of array) made `.slice`/`.map` throw
+                    // OUTSIDE safeStoreCall, taking the whole tool down.
+                    const commandsRaw = parseJsonObject(ep.commandsJson, []);
+                    const outcomesRaw = parseJsonObject(ep.validationOutcomesJson, []);
+                    const commands = Array.isArray(commandsRaw) ? commandsRaw : [];
+                    const outcomes = Array.isArray(outcomesRaw) ? outcomesRaw : [];
                     return `Task: ${ep.taskId} (${ep.state})
-  Commands: ${commands.slice(0, 3).join(" → ")}
-  Validations: ${outcomes.map((o) => `${o.type}:${o.status}`).join(", ") || "none"}
+  Commands: ${commands.slice(0, 3).map((c) => (typeof c === "string" ? c : String(c))).join(" → ")}
+  Validations: ${outcomes.map((o) => `${o?.type ?? "?"}:${o?.status ?? "?"}`).join(", ") || "none"}
 `;
                 }).join("\n");
             },

@@ -66,7 +66,7 @@ export declare class MemoryStore {
     private _search;
     deleteById(id: string, scopes: string[]): Promise<boolean>;
     deleteByIdRaw(id: string): Promise<boolean>;
-    deleteByIdForce(id: string): Promise<boolean>;
+    deleteByIdForce(id: string, scopes?: string[]): Promise<boolean>;
     softDeleteMemory(id: string, scopes: string[]): Promise<boolean>;
     updateMemoryScope(id: string, newScope: string, scopes: string[]): Promise<boolean>;
     readGlobalMemories(limit?: number): Promise<MemoryRecord[]>;

@@ -33,8 +33,23 @@ let llmRetryPolicy = {
     initialDelayMs: envIntClamped("OPENCODE_MEMORY_PRO_LLM_RETRY_INITIAL_DELAY_MS", 250, 0, 60000),
     backoffMultiplier: clampBackoffMultiplier(process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER),
 };
+// SET_RETRY_POLICY_CLAMP (1.6.2): setLlmRetryPolicy used a raw
+// Object.assign, bypassing every clamp — maxAttempts: Infinity → unbounded
+// retry loop; 0 → immediate failure. Clamp each field with the same bounds
+// resetLlmRetryPolicy/env read use, so the test seam can't exceed them.
+// Non-numeric/Infinity values fall back via toNumber like the env path.
+function clampRetryPatch(patch = {}) {
+    const out = {};
+    if (patch.maxAttempts !== undefined)
+        out.maxAttempts = Math.max(1, Math.min(10, Math.floor(toNumber(patch.maxAttempts, 3))));
+    if (patch.initialDelayMs !== undefined)
+        out.initialDelayMs = Math.max(0, Math.min(60000, Math.floor(toNumber(patch.initialDelayMs, 250))));
+    if (patch.backoffMultiplier !== undefined)
+        out.backoffMultiplier = clampBackoffMultiplier(patch.backoffMultiplier);
+    return out;
+}
 export function setLlmRetryPolicy(patch) {
-    Object.assign(llmRetryPolicy, patch);
+    Object.assign(llmRetryPolicy, clampRetryPatch(patch));
 }
 export function resetLlmRetryPolicy() {
     llmRetryPolicy = {
@@ -176,7 +191,12 @@ export function parseExtractionJSON(raw) {
         if (!content)
             continue;
         const type = VALID_CAPTURE_TYPES.includes(item?.type) ? item.type : "other";
-        let importance = Number(item?.importance);
+        // EXTRACTION_EMPTY_IMPORTANCE (1.6.2): Number("")===0 and Number(null)===0 —
+        // an empty-string or null importance was silently treated as 0.0
+        // (bottom-ranked, first retention candidate) instead of the type
+        // default. Treat "" and null like missing (undefined path already
+        // yields NaN → default).
+        let importance = (item?.importance === "" || item?.importance == null) ? NaN : Number(item?.importance);
         if (!Number.isFinite(importance)) {
             importance = type === "decision" ? 0.9 : type === "fact" ? 0.75 : 0.65;
         }
@@ -301,9 +321,42 @@ async function runEphemeralPrompt(client, llmConfig, system, userText, title) {
     }
 }
 async function _runEphemeralPrompt(client, llmConfig, system, userText, title) {
+    globalLlmHealth.lastConfig = { provider: llmConfig?.provider ?? null, model: llmConfig?.model ?? null };
+    // RETRY_SESSION_PER_ATTEMPT (1.6.2): NO_TEXT_RETRY (1.6.1) reused the
+    // SAME ephemeral session across retries, so each retry appended the full
+    // transcript again — effective context multiplied by attempts (3× 60k
+    // chars can exceed the context window, exactly the overloaded-
+    // flash-model workload retries exist for). Each attempt now runs in a
+    // FRESH session (create/delete stay 1:1 per attempt). Thrown errors and
+    // session.create failures are still NOT retried — they return null
+    // immediately, preserving the NO_TEXT_RETRY scope guard.
+    const policy = llmRetryPolicy;
+    for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+        const outcome = await runEphemeralAttempt(client, llmConfig, system, userText, title);
+        if (outcome.fatal)
+            return null; // thrown error or create failure — not retried
+        if (outcome.text)
+            return outcome.text;
+        // outcome.empty → silent-empty success: retry with backoff.
+        if (attempt < policy.maxAttempts) {
+            const delay = Math.floor(policy.initialDelayMs * Math.pow(policy.backoffMultiplier, attempt - 1));
+            log("warn", `[llm] ${title}: session.prompt returned no text parts (attempt ${attempt}/${policy.maxAttempts}); retrying in ${delay}ms (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+    }
+    log("warn", `[llm] ${title}: session.prompt succeeded but returned no text parts after ${policy.maxAttempts} attempts (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+    setLlmHealth({ status: "error", lastError: "session.prompt returned no text parts", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
+    return null;
+}
+/**
+ * One ephemeral round trip: create → prompt (tools disabled) → delete (in
+ * finally). Returns { fatal: true } for thrown errors / create failures
+ * (never retried), { text } on a successful text reply, { empty: true } on a
+ * successful prompt with no text parts (the only retryable outcome).
+ */
+async function runEphemeralAttempt(client, llmConfig, system, userText, title) {
     let sessionId = null;
     try {
-        globalLlmHealth.lastConfig = { provider: llmConfig?.provider ?? null, model: llmConfig?.model ?? null };
         const created = await client.session.create({
             body: { title: `opencode-memory-pro ${title}` },
         });
@@ -312,50 +365,32 @@ async function _runEphemeralPrompt(client, llmConfig, system, userText, title) {
         if (!sessionId) {
             log("warn", `[llm] ${title}: session.create did not return an id (got ${JSON.stringify(createdPayload)?.slice(0, 200)})`);
             setLlmHealth({ status: "error", lastError: "session.create returned no id", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
-            return null;
+            return { fatal: true };
         }
         trackOwnSession(sessionId);
-        // NO_TEXT_RETRY (1.6.1): the observed failure mode is a SUCCESSFUL
-        // prompt with zero text parts (flash-tier providers under load).
-        // Retry only that case, on the same session, with backoff; each
-        // attempt logs its own usage so empty replies stay attributable.
-        // Any thrown error still skips retries and falls through to null.
-        const policy = llmRetryPolicy;
-        let text = "";
-        for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
-            const response = await client.session.prompt({
-                path: { id: sessionId },
-                body: {
-                    system,
-                    parts: [{ type: "text", text: userText }],
-                    model: { providerID: llmConfig.provider, modelID: llmConfig.model },
-                    tools: {},
-                },
-            });
-            // PROMPT_USAGE_LOG (1.4.8) — see logPromptUsage: every attempt
-            // logs its own token usage line so empty replies stay attributable.
-            logPromptUsage(response, llmConfig, title);
-            text = extractAssistantText(response);
-            if (text)
-                break;
-            if (attempt < policy.maxAttempts) {
-                const delay = Math.floor(policy.initialDelayMs * Math.pow(policy.backoffMultiplier, attempt - 1));
-                log("warn", `[llm] ${title}: session.prompt returned no text parts (attempt ${attempt}/${policy.maxAttempts}); retrying in ${delay}ms (provider=${llmConfig.provider}, model=${llmConfig.model})`);
-                await new Promise((resolve) => setTimeout(resolve, delay));
-            }
+        const response = await client.session.prompt({
+            path: { id: sessionId },
+            body: {
+                system,
+                parts: [{ type: "text", text: userText }],
+                model: { providerID: llmConfig.provider, modelID: llmConfig.model },
+                tools: {},
+            },
+        });
+        // PROMPT_USAGE_LOG (1.4.8) — see logPromptUsage: every attempt
+        // logs its own token usage line so empty replies stay attributable.
+        logPromptUsage(response, llmConfig, title);
+        const text = extractAssistantText(response);
+        if (text) {
+            setLlmHealth({ status: "healthy", lastError: null, lastSuccess: Date.now(), errorCount: 0 });
+            return { text };
         }
-        if (!text) {
-            log("warn", `[llm] ${title}: session.prompt succeeded but returned no text parts after ${policy.maxAttempts} attempts (provider=${llmConfig.provider}, model=${llmConfig.model})`);
-            setLlmHealth({ status: "error", lastError: "session.prompt returned no text parts", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
-            return null;
-        }
-        setLlmHealth({ status: "healthy", lastError: null, lastSuccess: Date.now(), errorCount: 0 });
-        return text;
+        return { empty: true };
     }
     catch (error) {
         log("warn", `[llm] ${title}: ${error instanceof Error ? error.message : String(error)} (provider=${llmConfig.provider}, model=${llmConfig.model})`);
         setLlmHealth({ status: "error", lastError: error instanceof Error ? error.message : String(error), lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
-        return null;
+        return { fatal: true };
     }
     finally {
         if (sessionId) {

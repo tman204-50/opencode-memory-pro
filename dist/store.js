@@ -610,6 +610,13 @@ export class MemoryStore {
         // also deleted every other project's expired events. Now exact-match
         // `scope IN (...)` for the given scopes (undefined = all scopes).
         let deletedCount = 0;
+        // FEEDBACK_TTL_INVALIDATION (1.6.2): deleting feedback rows changes
+        // the feedback aggregate for their scopes, but cleanupExpiredEvents
+        // never bumped feedbackVersions → stale aggregates were served for up
+        // to the cache TTL (default 10 min; dormant at default event TTL 90d
+        // > 30d feedback window, live with effectivenessEventsDays < 30).
+        // Track which scopes actually had rows deleted and invalidate them.
+        const scopesWithDeletedEvents = new Set();
         const ttlBatchSize = 1000;
         for (;;) {
             let filter = `timestamp < ${cutoffTimestamp}`;
@@ -621,6 +628,14 @@ export class MemoryStore {
             if (toDelete.length === 0)
                 break;
             const idsToDelete = toDelete.map((row) => row.id);
+            // FEEDBACK_TTL_INVALIDATION: only invalidate scopes whose deleted
+            // events were actual feedback (non-feedback events don't feed the
+            // aggregate).
+            for (const row of toDelete) {
+                if (row.type === "feedback") {
+                    scopesWithDeletedEvents.add(row.scope);
+                }
+            }
             try {
                 const idIn = idsToDelete.map((id) => `'${escapeSql(id)}'`).join(", ");
                 await table.delete(`id IN (${idIn})`);
@@ -632,6 +647,12 @@ export class MemoryStore {
             }
             if (idsToDelete.length < ttlBatchSize)
                 break;
+        }
+        if (scopesWithDeletedEvents.size > 0) {
+            for (const scope of scopesWithDeletedEvents) {
+                this.invalidateFeedbackStats(scope);
+            }
+            log("info", `[store] Event TTL cleanup invalidated feedback stats for ${scopesWithDeletedEvents.size} scope(s)`);
         }
         if (deletedCount > 0) {
             log("info", `[store] Event TTL cleanup completed, deleted=${deletedCount}, retentionDays=${retentionDays}`);
@@ -891,18 +912,38 @@ export class MemoryStore {
     // failed and left the hidden row on disk forever. Tries the exact-id raw
     // delete first (fast path), then falls back to an unfiltered scan so
     // prefix ids and hidden rows both work.
-    async deleteByIdForce(id) {
-        if (await this.deleteByIdRaw(id)) {
+    async deleteByIdForce(id, scopes) {
+        const table = this.requireTable();
+        // Fast path: exact-id raw delete (sees hidden rows). When a scope
+        // filter is provided, only delete if the row lives in one of those
+        // scopes (DELETE_FORCE_SCOPE (1.6.2): memory_delete/memory_forget
+        // previously hard-deleted across ALL scopes while claiming
+        // current-scope-only).
+        const exact = await table.query().where(`id = '${escapeSql(id)}'`).limit(1).toArray();
+        if (exact.length > 0) {
+            if (scopes && !scopes.includes(exact[0].scope)) {
+                return false;
+            }
+            await table.delete(`id = '${escapeSql(id)}'`);
+            this.invalidateScope(exact[0].scope);
+            this.notifyGraphRemoved(id);
             return true;
         }
-        const table = this.requireTable();
-        const rows = await table.query().limit(SCAN_LIMIT).toArray();
+        // DELETE_ORDER_FALLBACK (1.6.2): the fallback scan had no ORDER BY —
+        // with no committed order LanceDB's rows come back in an unstable
+        // order, so a prefix-id match was nondeterministic and could silently
+        // miss (or hit a different row than a prior call) beyond the cap.
+        // Timestamp-desc matches the standard store ordering (SCAN_ORDER).
+        const rows = await table.query().orderBy(SCAN_ORDER).limit(SCAN_LIMIT).toArray();
         if (MAX_SCAN_ROWS !== 0 && rows.length >= SCAN_LIMIT) {
             log("warn", `[store] deleteByIdForce fallback scan hit the ${MAX_SCAN_ROWS}-row cap; the target may not be found if it lives beyond the cap`);
         }
         const match = rows.find((row) => this.matchesId(row.id, id));
         if (!match)
             return false;
+        if (scopes && !scopes.includes(match.scope)) {
+            return false;
+        }
         await table.delete(`id = '${escapeSql(match.id)}'`);
         this.invalidateScope(match.scope);
         this.notifyGraphRemoved(match.id);
@@ -1287,58 +1328,87 @@ export class MemoryStore {
             }
             return { merged: localMerged, updated: localUpdated, skipped: localSkipped };
         };
+        // CONSOLIDATE_WRITES_ON_ABORT (1.6.2): staging + graph notification
+        // happen WHILE a pass runs, but flushing happened only after both
+        // passes completed. If the ANN pass threw mid-run and the fallback
+        // was skipped (large scope) the method returned early with writes
+        // still staged — a LATER run's flush then applied those stale
+        // read values (the graph had already been notified at stage time),
+        // or they lingered forever. The outer finally flushes whatever
+        // remains staged and resets the stage on EVERY exit path; the
+        // successful path's flush already cleared the stage, so the
+        // defensive flush is a no-op there.
         try {
-            const annResult = await processWithANN();
-            mergedPairs = annResult.merged;
-            updatedRecords = annResult.updated;
-            skippedRecords = annResult.skipped;
-        }
-        catch (error) {
-            log("error", `[consolidate] ANN-based consolidation failed:`, error);
-            if (rows.length < FALLBACK_THRESHOLD) {
-                log("warn", `[consolidate] Falling back to O(N²) for small scope (${rows.length} memories)`);
-                const fbResult = await processWithFallback();
-                mergedPairs = fbResult.merged;
-                updatedRecords = fbResult.updated;
-                skippedRecords = fbResult.skipped;
+            try {
+                const annResult = await processWithANN();
+                mergedPairs = annResult.merged;
+                updatedRecords = annResult.updated;
+                skippedRecords = annResult.skipped;
             }
-            else {
-                log("warn", `[consolidate] Skipping fallback for large scope (${rows.length} >= ${FALLBACK_THRESHOLD})`);
-                return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0, clearedFlags: 0 };
+            catch (error) {
+                log("error", `[consolidate] ANN-based consolidation failed:`, error);
+                if (rows.length < FALLBACK_THRESHOLD) {
+                    log("warn", `[consolidate] Falling back to O(N²) for small scope (${rows.length} memories)`);
+                    const fbResult = await processWithFallback();
+                    mergedPairs = fbResult.merged;
+                    updatedRecords = fbResult.updated;
+                    skippedRecords = fbResult.skipped;
+                }
+                else {
+                    log("warn", `[consolidate] Skipping fallback for large scope (${rows.length} >= ${FALLBACK_THRESHOLD})`);
+                    // CONSOLIDATE_WRITES_ON_ABORT (1.6.2): the early return
+                    // still passes THROUGH the finally below, which flushes
+                    // and resets the aborted pass's staged writes.
+                    return { mergedPairs: 0, updatedRecords: 0, skippedRecords: 0, clearedFlags: 0 };
+                }
             }
+            // DEDUP_FLAG_REVALIDATION (1.4.0): clear false duplicate flags. Rows
+            // whose best found neighbor never reached the merge threshold were
+            // flagged by the pre-1.4.0 RRF write-check (or carry a flag made stale
+            // by later edits); unsetting isPotentialDuplicate lets flaggedCount
+            // self-correct instead of ratcheting up forever.
+            for (const [id, bestSim] of bestSimByFlagged) {
+                if (mergedIds.has(id) || bestSim >= threshold)
+                    continue;
+                const meta = metaById.get(id);
+                if (!meta || meta.isPotentialDuplicate !== true)
+                    continue;
+                delete meta.isPotentialDuplicate;
+                delete meta.duplicateOf;
+                // CONSOLIDATE_WRITE_BATCHING (1.5.8): staged with merge writes.
+                this.stageConsolidationWrite(id, { metadataJson: JSON.stringify(meta) });
+                clearedFlags += 1;
+            }
+            // CONSOLIDATE_WRITE_BATCHING (1.5.8): flush all staged row updates
+            // (merge losers, merge survivors, cleared duplicate flags) in batched
+            // `id IN (...)` commits — one commit per ~100 rows instead of one per
+            // row. Idempotent by construction: batches are disjoint, and the
+            // stage is reset on entry, so a partially-processed scope re-runs
+            // cleanly.
+            const stagedUpdates = await this.flushConsolidationWrites();
+            if (stagedUpdates > 0) {
+                log("info", `[consolidate] flushed ${stagedUpdates} row updates in batched commits`);
+            }
+            this.resetConsolidationWriteStage();
+            if (mergedPairs > 0 || clearedFlags > 0) {
+                this.invalidateScope(scope);
+            }
+            await this.maybeOptimizeAll(false);
+            return { mergedPairs, updatedRecords, skippedRecords, clearedFlags };
         }
-        // DEDUP_FLAG_REVALIDATION (1.4.0): clear false duplicate flags. Rows
-        // whose best found neighbor never reached the merge threshold were
-        // flagged by the pre-1.4.0 RRF write-check (or carry a flag made stale
-        // by later edits); unsetting isPotentialDuplicate lets flaggedCount
-        // self-correct instead of ratcheting up forever.
-        for (const [id, bestSim] of bestSimByFlagged) {
-            if (mergedIds.has(id) || bestSim >= threshold)
-                continue;
-            const meta = metaById.get(id);
-            if (!meta || meta.isPotentialDuplicate !== true)
-                continue;
-            delete meta.isPotentialDuplicate;
-            delete meta.duplicateOf;
-            // CONSOLIDATE_WRITE_BATCHING (1.5.8): staged with merge writes.
-            this.stageConsolidationWrite(id, { metadataJson: JSON.stringify(meta) });
-            clearedFlags += 1;
+        finally {
+            // CONSOLIDATE_WRITES_ON_ABORT (1.6.2): see comment above the try.
+            if (this.consolidationWriteStage && this.consolidationWriteStage.size > 0) {
+                try {
+                    await this.flushConsolidationWrites();
+                    log("warn", `[consolidate] flushed staged writes after aborted pass`);
+                }
+                catch (flushError) {
+                    log("warn", `[consolidate] failed to flush staged writes after abort: ${flushError instanceof Error ? flushError.message : String(flushError)}`);
+                }
+            }
+            this.resetConsolidationWriteStage();
         }
-        // CONSOLIDATE_WRITE_BATCHING (1.5.8): flush all staged row updates
-        // (merge losers, merge survivors, cleared duplicate flags) in batched
-        // `id IN (...)` commits — one commit per ~100 rows instead of one per
-        // row. Idempotent by construction: batches are disjoint, and the stage
-        // is reset on entry, so a partially-processed scope re-runs cleanly.
-        const stagedUpdates = await this.flushConsolidationWrites();
-        if (stagedUpdates > 0) {
-            log("info", `[consolidate] flushed ${stagedUpdates} row updates in batched commits`);
-        }
-        this.resetConsolidationWriteStage();
-        if (mergedPairs > 0 || clearedFlags > 0) {
-            this.invalidateScope(scope);
-        }
-        await this.maybeOptimizeAll(false);
-        return { mergedPairs, updatedRecords, skippedRecords, clearedFlags };
     }
     // CONSOLIDATE_WRITE_BATCHING (1.5.8): consolidation staged row updates.
     // @internal — used by _consolidateDuplicates, reset per run.
@@ -1542,6 +1612,17 @@ export class MemoryStore {
         for (const scope of scopes) {
             const entry = this.scopeCache.get(scope);
             if (!entry)
+                continue;
+            // USAGE_CACHE_FRESHNESS (1.6.2): the fast path served any cached
+            // row regardless of age — in the cross-process case (two opencode
+            // instances on the same LanceDB dir) a STALE cache entry from
+            // before another process's recallCount bump was read-modify-
+            // written, REGRESSING recallCount (stale+1 overwrote the higher
+            // count). Only trust cache entries fresh within staleAfterMs;
+            // older ones fall through to the authoritative read.
+            const maxAgeMs = Number.isFinite(this.cacheConfig.staleAfterMs) ? this.cacheConfig.staleAfterMs : 0;
+            const staleByAge = maxAgeMs > 0 && Date.now() - (entry.loadedAt ?? entry.lastAccessTimestamp) > maxAgeMs;
+            if (staleByAge)
                 continue;
             const record = entry.records.find((row) => this.matchesId(row.id, id));
             if (record)
@@ -2752,7 +2833,18 @@ export class MemoryStore {
         }
         const totalFailed = failedTasks.length;
         const succeededAfterRetry = successTasks.filter((t) => {
-            const retries = JSON.parse(t.retryAttemptsJson || "[]");
+            // RETRY_TO_SUCCESS_PARSE (1.6.2): unguarded JSON.parse — one
+            // malformed retryAttemptsJson row made memory_kpi throw
+            // (suggestRetryBudget got the same guard in RETRY_BUDGET_PARSE
+            // (1.4.5); this path didn't). Malformed or non-array rows are
+            // treated as no attempts.
+            let retries = [];
+            try {
+                const parsed = JSON.parse(t.retryAttemptsJson || "[]");
+                if (Array.isArray(parsed))
+                    retries = parsed;
+            }
+            catch { /* malformed row: no attempts */ }
             return retries.some((r) => r.outcome === "success");
         }).length;
         const sampleCount = totalFailed + succeededAfterRetry;
@@ -3183,6 +3275,50 @@ export class MemoryStore {
             this.notifyGraphRemoved(record.id);
         }
         return updated;
+    }
+    // DIGEST_EXPIRY_RESTORE (1.6.2): when a digest is HARD-deleted after
+    // digestMaxAgeDays (sweepExpiredMemories), its digested originals used to
+    // stay status:"digested" with digestedInto pointing at the deleted id —
+    // permanently hidden from recall with no restore path. Restore them
+    // (status active + metadata flags cleared + graph links re-indexed) so
+    // the originals become recallable again; a later sweep may re-digest
+    // them if they still qualify. Returns the number of restored memories.
+    async unDigestOriginals(digestId, scopes) {
+        if (!digestId)
+            return 0;
+        const table = this.requireTable();
+        const filter = `metadataJson LIKE '%"digestedInto":"${escapeSql(digestId)}"%'`;
+        const fullFilter = Array.isArray(scopes) && scopes.length > 0
+            ? `(${filter}) AND (${scopes.map((scope) => `scope = '${escapeSql(scope)}'`).join(" OR ")})`
+            : filter;
+        const rows = await table.query().where(fullFilter).limit(SCAN_LIMIT).toArray();
+        let restored = 0;
+        for (const record of rows) {
+            let metadata = {};
+            try {
+                metadata = JSON.parse(record.metadataJson || "{}");
+            }
+            catch {
+                metadata = {};
+            }
+            delete metadata.digestedInto;
+            delete metadata.digestedAt;
+            await table.update({
+                where: `id = '${escapeSql(record.id)}'`,
+                values: { status: "active", metadataJson: JSON.stringify(metadata) },
+            });
+            this.invalidateScope(record.scope);
+            // Restore graph links (notifyGraphRemoved stripped them at
+            // digest time) so recall boost/expand see the originals again.
+            try {
+                this.graph?.indexMemory(record.id, record.text, record.timestamp ?? Date.now());
+            }
+            catch (error) {
+                log("warn", `[store] graph indexMemory during un-digest failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            restored += 1;
+        }
+        return restored;
     }
     async readByScopes(scopes) {
         const table = this.requireTable();

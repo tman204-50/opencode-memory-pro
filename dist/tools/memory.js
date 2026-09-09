@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import { deriveProjectScope, buildScopeFilter, resolveScope } from "../scope.js";
-import { generateId } from "../utils.js";
+import { generateId, toNumber } from "../utils.js";
 import { getEmbedderHealth } from "../embedder.js";
 import { extractiveDigest, retentionCandidates, expiredDigestCandidates } from "../store.js";
 import { requestLLMDigest } from "../llm.js";
@@ -358,11 +358,14 @@ export function createMemoryTools(state) {
                     return "Rejected: memory_delete requires confirm=true.";
                 }
                 const activeScope = resolveScope(args.scope, context.directory || context.worktree);
+                const scopes = buildScopeFilter(activeScope, state.config.includeGlobalScope);
                 // FORCE_DELETE_HIDDEN (1.3.8): was deleteById, whose readByScopes
                 // filter excludes disabled/merged rows — so memory_delete could
                 // never permanently delete a memory that was soft-deleted first.
                 // deleteByIdForce sees those hidden rows (see memory_forget).
-                const deleted = await state.store.deleteByIdForce(args.id);
+                // DELETE_FORCE_SCOPE (1.6.2): pass the scope filter so the hard
+                // delete is scoped to the current scope instead of all scopes.
+                const deleted = await state.store.deleteByIdForce(args.id, scopes);
                 return deleted ? `Deleted memory ${args.id}.` : `Memory ${args.id} not found in current scope.`;
             },
         }),
@@ -395,7 +398,25 @@ export function createMemoryTools(state) {
                     return unavailableMessage(state.config.embedding.provider);
                 const scope = resolveScope(args.scope, context.directory || context.worktree);
                 const entries = await state.store.list(scope, 20);
-                const incompatibleVectors = await state.store.countIncompatibleVectors(buildScopeFilter(scope, state.config.includeGlobalScope), await state.embedder.dim());
+                // MEMORY_STATS_EMBEDDER_GUARD (1.6.2): state.embedder.dim()
+                // throws after its retries when the embedder is down, which used
+                // to make memory_stats — the one diagnostic tool that should
+                // report "embedder offline" — error out instead. Degrade to a
+                // null dimension (and null incompatible-vector count) so the
+                // tool still returns a full report with embedderHealth showing
+                // the outage.
+                let embedderDim = null;
+                let embedderOffline = false;
+                try {
+                    embedderDim = await state.embedder.dim();
+                }
+                catch (error) {
+                    embedderOffline = true;
+                    log("warn", `embedder unavailable during memory_stats: ${error?.message ?? String(error)}`);
+                }
+                const incompatibleVectors = embedderOffline
+                    ? null
+                    : await state.store.countIncompatibleVectors(buildScopeFilter(scope, state.config.includeGlobalScope), embedderDim);
                 const health = state.store.getIndexHealth();
                 const embedderHealth = getEmbedderHealth();
                 const llmHealth = getLlmHealth();
@@ -434,6 +455,7 @@ export function createMemoryTools(state) {
                         threshold: state.config.retrieval.fuzzyThreshold ?? 0.5,
                     },
                     embeddingModel: state.config.embedding.model,
+                    embedderOffline,
                     searchMode,
                     embedderHealth,
                     capture: {
@@ -626,7 +648,7 @@ export function createMemoryTools(state) {
                     // readByScopes filter excludes disabled/merged rows — so
                     // force=true could never permanently delete a memory that
                     // was soft-deleted first.
-                    const deleted = await state.store.deleteByIdForce(args.id);
+                    const deleted = await state.store.deleteByIdForce(args.id, scopes);
                     if (!deleted) {
                         return `Memory ${args.id} not found in current scope.`;
                     }
@@ -1647,7 +1669,12 @@ export async function sweepExpiredMemories(state, opts = {}) {
     const targetChars = opts.targetChars ?? retCfg.targetChars;
     const minImportance = opts.minImportance ?? retCfg.minImportance;
     const protectedCategories = opts.protectedCategories ?? retCfg.protectedCategories;
-    const digestMaxAgeDays = Math.max(1, Number(opts.digestMaxAgeDays ?? retCfg.digestMaxAgeDays ?? 365));
+    // DIGEST_EXPIRY_SAFE_NUM (1.6.2): raw Number() on a malformed
+    // digestMaxAgeDays (e.g. "abc") produced NaN; Math.max(1, NaN) = NaN,
+    // and `days > NaN` is always false → digest expiry silently became a
+    // no-op. toNumber falls back to 365; Math.max guards negatives.
+    const digestMaxAgeDaysConfig = toNumber(opts.digestMaxAgeDays ?? retCfg.digestMaxAgeDays ?? 365, 365);
+    const digestMaxAgeDays = Math.max(1, Number.isFinite(digestMaxAgeDaysConfig) ? digestMaxAgeDaysConfig : 365);
     const records = await state.store.readByScopes(scopes);
     const candidates = retentionCandidates(records, { unusedDays, minAgeDays, minImportance, protectedCategories });
     // DIGEST_EXPIRY (1.4.3): digests themselves used to live forever as active
@@ -1668,6 +1695,13 @@ export async function sweepExpiredMemories(state, opts = {}) {
                 if (await state.store.deleteByIdForce(r.id)) {
                     digestsExpired += 1;
                     expiredDigests.push({ id: r.id, category: r.category, digestChars: r.text?.length ?? 0 });
+                    // DIGEST_EXPIRY_RESTORE (1.6.2): the digest is gone, so
+                    // its digested originals must not stay hidden behind a
+                    // deleted id — restore them to active recall.
+                    const restored = await state.store.unDigestOriginals(r.id, scopes);
+                    if (restored > 0) {
+                        log("info", `[retention] digest ${r.id} expired; restored ${restored} original(s) to active`);
+                    }
                 }
             }
             catch (error) {

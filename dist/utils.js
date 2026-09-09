@@ -33,8 +33,11 @@ export function toBoolean(value, fallback) {
 export function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
+// STABLE_HASH_NONSTRING (1.6.2): update(undefined) throws a TypeError —
+        // deriveProjectScope(undefined) crashed in project mode (odd
+        // hosts/tests only). Hash the empty string instead of throwing.
 export function stableHash(input) {
-    return createHash("sha256").update(input, "utf8").digest("hex");
+    return createHash("sha256").update(typeof input === "string" ? input : "", "utf8").digest("hex");
 }
 export function tokenize(text) {
     return text
@@ -176,7 +179,11 @@ export function parseValidationOutput(output, type) {
     };
     switch (type) {
         case "type-check": {
-            const errorCount = extractCount(/(\d+)\s+error/i) || extractCount(/Found (\d+) error/i);
+            // VALIDATION_ZERO_COUNT (1.6.2): `||` collapsed a legitimate 0
+            // (extractCount returns 0 = falsy) into the hasError fallback, so
+            // "0 errors" (no "Found" prefix) hit /error|fail/i → false fail.
+            // `??` preserves a parsed count of 0 → status pass.
+            const errorCount = extractCount(/(\d+)\s+error/i) ?? extractCount(/Found (\d+) error/i);
             if (errorCount !== undefined) {
                 return {
                     status: errorCount > 0 ? "fail" : "pass",

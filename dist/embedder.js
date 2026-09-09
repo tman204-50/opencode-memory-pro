@@ -25,6 +25,20 @@ export function resetEmbedderHealth() {
 async function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
+// EMBEDDER_HEALTH_RESET (1.3.5) + EMBEDDER_RETRY_COUNT_RESET (1.6.2): a
+// successful embed/dim after an outage must clear the degraded state AND reset
+// the retry counter, or memory_stats reports "bm25-only" / a stale retryCount
+// forever after the provider recovers.
+function recordEmbedderSuccess() {
+    globalEmbedderHealth.lastSuccess = Date.now();
+    globalEmbedderHealth.lastError = null;
+    globalEmbedderHealth.retryCount = 0;
+    globalEmbedderHealth.fallbackActive = false;
+    if (globalEmbedderHealth.status === "degraded") {
+        globalEmbedderHealth.status = "healthy";
+        log("info", "Embedder recovered, resuming normal mode");
+    }
+}
 async function embedWithRetry(embedder, config, text) {
     // TIMING_SPANS (1.4.7): the embedding call is the dominant network cost on
     // both recall and capture; attempts exposes retry amplification.
@@ -45,7 +59,22 @@ async function _embedWithRetry(embedder, config, text, spanExtra = {}) {
         backoffMultiplier: 2,
     };
     if (!retry.enabled) {
-        return embedder.embed(text);
+        // EMBEDDER_HEALTH_RESET (1.6.2): the retry-disabled path previously
+        // returned embedder.embed(text) directly, never touching health — so a
+        // previously-degraded embedder stayed fallbackActive:true forever even
+        // after embeds succeeded.
+        try {
+            const result = await embedder.embed(text);
+            recordEmbedderSuccess();
+            return result;
+        }
+        catch (error) {
+            const err = error instanceof Error ? error : new Error(String(error));
+            globalEmbedderHealth.lastError = err.message;
+            globalEmbedderHealth.status = "degraded";
+            globalEmbedderHealth.fallbackActive = true;
+            throw err;
+        }
     }
     let lastError = null;
     let attempt = 0;
@@ -54,16 +83,7 @@ async function _embedWithRetry(embedder, config, text, spanExtra = {}) {
         spanExtra.attempts = attempt;
         try {
             const result = await embedder.embed(text);
-            globalEmbedderHealth.lastSuccess = Date.now();
-            globalEmbedderHealth.lastError = null;
-            // EMBEDDER_HEALTH_RESET (1.3.5): fallbackActive used to stay true
-            // forever after one outage, so memory_stats reported "bm25-only"
-            // even after the provider recovered. Reset it on any success.
-            globalEmbedderHealth.fallbackActive = false;
-            if (globalEmbedderHealth.status === "degraded") {
-                globalEmbedderHealth.status = "healthy";
-                log("info", "Embedder recovered, resuming normal mode");
-            }
+            recordEmbedderSuccess();
             return result;
         }
         catch (error) {
@@ -92,7 +112,20 @@ async function dimWithRetry(embedder, config) {
         backoffMultiplier: 2,
     };
     if (!retry.enabled) {
-        return embedder.dim();
+        // EMBEDDER_HEALTH_RESET (1.6.2): retry-disabled path must still update
+        // health, or a previously-degraded embedder stays fallbackActive:true.
+        try {
+            const result = await embedder.dim();
+            recordEmbedderSuccess();
+            return result;
+        }
+        catch (error) {
+            const err = error instanceof Error ? error : new Error(String(error));
+            globalEmbedderHealth.lastError = err.message;
+            globalEmbedderHealth.status = "degraded";
+            globalEmbedderHealth.fallbackActive = true;
+            throw err;
+        }
     }
     let lastError = null;
     let attempt = 0;
@@ -100,16 +133,7 @@ async function dimWithRetry(embedder, config) {
         attempt++;
         try {
             const result = await embedder.dim();
-            globalEmbedderHealth.lastSuccess = Date.now();
-            globalEmbedderHealth.lastError = null;
-            // EMBEDDER_HEALTH_RESET (mirrors embedWithRetry): a dim() success
-            // after an outage must clear the degraded state too, or
-            // memory_stats reports "degraded" until the next embed() call.
-            globalEmbedderHealth.fallbackActive = false;
-            if (globalEmbedderHealth.status === "degraded") {
-                globalEmbedderHealth.status = "healthy";
-                log("info", "Embedder recovered, resuming normal mode");
-            }
+            recordEmbedderSuccess();
             return result;
         }
         catch (error) {

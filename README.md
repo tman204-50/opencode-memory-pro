@@ -512,7 +512,56 @@ CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
 
-### v1.6.1 (unreleased)
+### v1.6.2 (2026-09-09)
+
+**Minor-queue completion** — all 29 MINOR findings from the Sep 8 code review
+(r1–r29) are fixed. Highlights, grouped:
+
+- **Capture pipeline hardening** — `FLUSH_SNAPSHOT_CONSUME` (fragments
+  appended during a flush survive it — the read-then-delete was losing them),
+  `FLUSH_IN_PROGRESS_GUARD` (concurrent session.idle + session.deleted
+  flushes coalesce, no duplicate captures), `ACTIVE_EPISODES_CAP` (episode
+  map FIFO-capped at 500, mirroring sessionErrors),
+  `CONFIG_CHANGE_INIT_RESET` (an embedding-config change while init is in
+  flight now resets the in-flight promise so the new dimension is probed).
+- **LLM retry + extraction** — `RETRY_SESSION_PER_ATTEMPT` (each no-text
+  retry now runs in a FRESH ephemeral session — same-session reuse multiplied
+  the transcript × attempts and could blow small context windows),
+  `SET_RETRY_POLICY_CLAMP` (setLlmRetryPolicy clamps maxAttempts/
+  initialDelayMs/backoffMultiplier like the env path), `EXTRACTION_EMPTY_IMPORTANCE`
+  (empty-string/null importance no longer silently ranks 0.0).
+- **Store consistency** — `CONSOLIDATE_WRITES_ON_ABORT` (aborted
+  consolidation flushes + resets its staged writes), `FEEDBACK_TTL_INVALIDATION`
+  (deleted feedback rows invalidate the affected scope's aggregate),
+  `USAGE_CACHE_FRESHNESS` (updateMemoryUsage's cache fast path ignores stale
+  entries — fixes the cross-process recallCount regression),
+  `DELETE_ORDER_FALLBACK` (force-delete prefix fallback is deterministic,
+  newest-first), `RETRY_TO_SUCCESS_PARSE` (malformed retryAttemptsJson no
+  longer crashes memory_kpi).
+- **Retention / digests** — `IDLE_SWEEP_DEDUP_DECOUPLE` (retention sweep now
+  runs on idle/compacted even with dedup disabled), `DIGEST_EXPIRY_RESTORE`
+  (hard-expired digests restore their originals to active instead of
+  orphaning them), `DIGEST_SCOPE_FOLLOWS_MEMBERS`, `DIGEST_EXPIRY_SAFE_NUM`
+  (malformed digestMaxAgeDays falls back to 365), `PROTECTED_CATEGORIES_EMPTY`
+  (explicit `protectedCategories: []` now disables digest protection).
+- **Entity graph** — `REINDEX_BACKFILL_HEAL` (backfill re-runs idempotently,
+  healing partial graphs), `ENTITY_GC_EDGE_CLEANUP` (GC deletes a dead
+  entity's edges), `REINDEX_ENTITY_HEAL` (missing entity row healed with
+  count 1, not a count-0 ghost).
+- **Parsing / validation / preference / config** — `VALIDATION_ZERO_COUNT`
+  + `VALIDATION_OUTCOME_CASE` (clean "0 errors" and lowercase "found 1
+  error" classified correctly), `SIGNAL_WORD_BOUNDARY` (capture gate no
+  longer fires "passed" inside "bypassed"), `PREFERENCE_VERB_LOOKAHEAD`
+  ("prefer to use docker" no longer captures junk "use"/"to" keys),
+  `KEY_SENTENCE_FALLBACK` (summaries never return an empty string),
+  `EPISODIC_SHAPE_GUARD` (wrong-shape episodic JSON degrades, not throws),
+  `STABLE_HASH_NONSTRING`, `RRF_K_CLAMP` ([1,1000]), `DEDUP_CLAMP_LOG`,
+  `SCOPING_CACHE_LRU`, `EMBEDDER_HEALTH_RESET` + `EMBEDDER_RETRY_COUNT_RESET`,
+  `MEMORY_STATS_EMBEDDER_GUARD`, `DELETE_FORCE_SCOPE`.
+
+Every fix is mutant-verified with a regression test; suite **166/166 + e2e**.
+
+### v1.6.1 (2026-09-09)
 
 **Code-review hardening bundle** — the 1.6.0 source-verified review pass
 (7 MAJOR findings) is fully fixed:
