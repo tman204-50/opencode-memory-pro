@@ -12,7 +12,7 @@ import { createMemoryTools, createFeedbackTools, createEpisodicTools } from "./t
 import { sweepExpiredMemories, repairEmbeddingDimension } from "./tools/memory.js";
 import { createGraphStore } from "./graph.js";
 import { startSpan } from "./timing.js";
-const PLUGIN_VERSION = "1.6.0";
+const PLUGIN_VERSION = "1.6.1";
 const SCHEMA_VERSION = 1;
 // CAPTURE_BUFFER_BOUNDS (1.5.3): the text.complete fragment buffer is bounded
 // on both axes. Per-session fragments keep only the last MAX_FRAGMENTS (a
@@ -291,8 +291,6 @@ const plugin = async (input) => {
             }
         },
         "experimental.text.complete": async (eventInput, eventOutput) => {
-            if (isOwnSession(eventInput.sessionID))
-                return;
             recordCaptureFragment(state, eventInput.sessionID, eventOutput.text);
         },
         // Wires the episodic learning store (addCommandToEpisode/
@@ -347,6 +345,14 @@ const plugin = async (input) => {
         },
         "experimental.chat.system.transform": async (eventInput, eventOutput) => {
             if (!eventInput.sessionID)
+                return;
+            // OWN_SESSION_RECALL_GUARD (1.6.1): every other hook filters the
+            // plugin's own ephemeral LLM sessions (capture/digest); this hook
+            // didn't, so recall ran with the extraction transcript as the query
+            // and injected a [Memory Recall] block into the extraction prompt —
+            // self-amplification (recalled memories echoed back as new captures)
+            // plus a wasted embed+search+graph pass on every capture flush.
+            if (isOwnSession(eventInput.sessionID))
                 return;
             await state.ensureInitialized();
             if (!state.initialized)
@@ -572,23 +578,37 @@ async function runRecallPipeline(eventInput, eventOutput, state, input, query, p
                 if (isFallback) {
                     log("info", "Using BM25-only search (embedder unavailable)");
                 }
-                const results = await state.store.search({
-                    query,
-                    queryVector,
-                    scopes,
-                    limit: profile.maxMemories * 2,
-                    vectorWeight: effectiveVectorWeight,
-                    bm25Weight: effectiveBm25Weight,
-                    fuzzyWeight: effectiveFuzzyWeight,
-                    fuzzyThreshold: state.config.retrieval.fuzzyThreshold,
-                    minScore: Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor),
-                    rrfK: state.config.retrieval.rrfK,
-                    recencyBoost: state.config.retrieval.recencyBoost,
-                    recencyHalfLifeHours: state.config.retrieval.recencyHalfLifeHours,
-                    importanceWeight: state.config.retrieval.importanceWeight,
-                    feedbackWeight: state.config.retrieval.feedbackWeight,
-                    globalDiscountFactor: state.config.globalDiscountFactor,
-                });
+                // RECALL_SEARCH_GUARD (1.6.1): every other store call in this
+                // hook is guarded (embedder, graph boost/expansion,
+                // findSimilarTasks, resolveSessionScope) — store.search was the
+                // one unguarded LanceDB read. A transient failure propagated out
+                // of the system.transform hook (which has no try/catch) and
+                // failed the user's chat turn. Recall is an enhancement: degrade
+                // to empty results (flows through to the no-injection early
+                // return) instead of breaking the request.
+                let results = [];
+                try {
+                    results = await state.store.search({
+                        query,
+                        queryVector,
+                        scopes,
+                        limit: profile.maxMemories * 2,
+                        vectorWeight: effectiveVectorWeight,
+                        bm25Weight: effectiveBm25Weight,
+                        fuzzyWeight: effectiveFuzzyWeight,
+                        fuzzyThreshold: state.config.retrieval.fuzzyThreshold,
+                        minScore: Math.max(state.config.retrieval.minScore, state.config.injection.injectionFloor),
+                        rrfK: state.config.retrieval.rrfK,
+                        recencyBoost: state.config.retrieval.recencyBoost,
+                        recencyHalfLifeHours: state.config.retrieval.recencyHalfLifeHours,
+                        importanceWeight: state.config.retrieval.importanceWeight,
+                        feedbackWeight: state.config.retrieval.feedbackWeight,
+                        globalDiscountFactor: state.config.globalDiscountFactor,
+                    });
+                }
+                catch (error) {
+                    log("warn", `recall search failed: ${toErrorMessage(error)}`);
+                }
                 // GRAPH_STORE_PHASE1: entity-co-occurrence boost on top of the
                 // hybrid score. Multiplicative, conservative (1 + lambda*strength),
                 // and a no-op when the graph is disabled or the query has no
@@ -851,7 +871,15 @@ async function _flushAutoCapture(sessionID, state, client) {
     // flush provably proceeds past init. Edge: a session.deleted flush while
     // init is still deferred retains the entry (bounded string-array leak)
     // rather than dropping the data.
-    state.captureBuffer.delete(sessionID);
+    //
+    // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): the delete used to run HERE, before
+    // any of the awaited store writes below (recordCaptureEvent → putEvent,
+    // storeCapturedMemory → put, pruneScope). A transient LanceDB failure
+    // threw out of _flushAutoCapture with the buffer entry ALREADY deleted —
+    // the transcript was gone and the retry-on-next-flush mechanism found an
+    // empty buffer. The delete now runs only after every store write succeeds
+    // (all return paths reach the delete at the bottom); a throw leaves the
+    // fragments in place for the next flush to retry.
     await recordCaptureEvent(state, {
         sessionID,
         scope: activeScope,
@@ -900,6 +928,9 @@ async function _flushAutoCapture(sessionID, state, client) {
             if (storedCount > 0) {
                 await state.store.pruneScope(activeScope, state.config.maxEntriesPerScope);
             }
+            // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): all store writes above
+            // succeeded — safe to drop the buffered fragments.
+            state.captureBuffer.delete(sessionID);
             return;
         }
         await recordCaptureEvent(state, {
@@ -915,6 +946,9 @@ async function _flushAutoCapture(sessionID, state, client) {
         // stored transcript content the LLM explicitly rejected. Only fall
         // back when extraction FAILED (candidates === null).
         if (candidates !== null) {
+            // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): LLM returned a real empty
+            // verdict — the transcript was considered and rejected; drop it.
+            state.captureBuffer.delete(sessionID);
             return;
         }
     }
@@ -927,6 +961,9 @@ async function _flushAutoCapture(sessionID, state, client) {
             skipReason: result.skipReason,
             text: combined,
         });
+        // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): considered + skipped — the
+        // transcript was processed; drop it.
+        state.captureBuffer.delete(sessionID);
         return;
     }
     const stored = await storeCapturedMemory(state, {
@@ -945,6 +982,9 @@ async function _flushAutoCapture(sessionID, state, client) {
             skipReason: stored.skipReason,
             text: combined,
         });
+        // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): considered + skipped — the
+        // transcript was processed; drop it.
+        state.captureBuffer.delete(sessionID);
         return;
     }
     await recordCaptureEvent(state, {
@@ -955,6 +995,10 @@ async function _flushAutoCapture(sessionID, state, client) {
         text: result.candidate.text,
     });
     await state.store.pruneScope(activeScope, state.config.maxEntriesPerScope);
+    // CAPTURE_BUFFER_AFTER_WRITES (1.6.1): all store writes above succeeded —
+    // only now is it safe to drop the buffered fragments. A throw anywhere
+    // above leaves them in place for the next flush to retry.
+    state.captureBuffer.delete(sessionID);
 }
 // SESSION_IDLE_FLUSH_GUARD (1.4.5): session.idle/session.compacted handling,
 // extracted from the event hook so the flush-failure path is unit-testable.

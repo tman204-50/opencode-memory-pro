@@ -4,10 +4,10 @@ import assert from "node:assert/strict";
 import { extractiveDigest, retentionCandidates, storeFastCosine, expiredDigestCandidates, computeRetentionScore } from "../dist/store.js";
 import { extractEntities, extractTypedRelations } from "../dist/graph.js";
 import { resolveMemoryConfig, mergeMemoryConfig } from "../dist/config.js";
-import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput } from "../dist/llm.js";
+import { parseExtractionJSON, extractAssistantText, requestLLMCapture, requestLLMDigest, isOwnSession, trackOwnSession, truncateCaptureInput, setLlmRetryPolicy, resetLlmRetryPolicy, getLlmRetryPolicy } from "../dist/llm.js";
 import { summarizeContent } from "../dist/summarize.js";
 import { resolveScope } from "../dist/scope.js";
-import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, wireRetentionScoring } from "../dist/index.js";
+import { flushAutoCapture, handleSessionIdle, handleSessionStart, handleSessionEnd, preferenceInjectionConfig, initializeStore, recordCaptureFragment, fetchSessionMessages, lastUserTextFromMessages, runRecallPipeline, wireRetentionScoring } from "../dist/index.js";
 import { extractCaptureCandidate } from "../dist/extract.js";
 import { buildPreferenceInjection } from "../dist/preference.js";
 import { repairEmbeddingDimension } from "../dist/tools/memory.js";
@@ -321,6 +321,144 @@ test("llm: no usage line when the response carries no token info", async () => {
         console.info = originalInfo;
     }
     assert.equal(captured.find((line) => line.includes("usage")), undefined, "missing token info must not fabricate a usage line");
+});
+
+// NO_TEXT_RETRY (1.6.1): flash-tier providers under load resolve session.prompt
+// with an empty parts array — the silent-empty case must retry on the SAME
+// ephemeral session (create/delete stay 1:1), then fall back to null only after
+// the attempt budget is spent. Mutant: returning null on first empty reply
+// (prompted===1) or recreating the session per attempt (created>1) fails.
+test("llm: no-text reply retries the same ephemeral session and succeeds on a later attempt", async () => {
+    setLlmRetryPolicy({ maxAttempts: 3, initialDelayMs: 0, backoffMultiplier: 1 });
+    try {
+        const calls = { created: 0, prompted: 0, deleted: 0 };
+        const fakeClient = {
+            session: {
+                create: async () => {
+                    calls.created += 1;
+                    return { data: { id: "ephemeral-notext" } };
+                },
+                prompt: async () => {
+                    calls.prompted += 1;
+                    if (calls.prompted === 1)
+                        return { data: { info: {}, parts: [] } };
+                    return { data: { info: {}, parts: [{ type: "text", text: '[{"content":"Go for services","type":"decision","importance":0.9}]' }] } };
+                },
+                delete: async () => {
+                    calls.deleted += 1;
+                },
+            },
+        };
+        const result = await requestLLMCapture(fakeClient, { provider: "openrouter", model: "z-ai/glm-5.3-flash" }, "User decided.", "sess-notext");
+        assert.equal(result.length, 1, "retried prompt must produce memories");
+        assert.equal(result[0].content, "Go for services");
+        assert.equal(calls.prompted, 2, "first empty reply must be retried");
+        assert.equal(calls.created, 1, "retry must reuse the same ephemeral session");
+        assert.equal(calls.deleted, 1, "ephemeral session must still be cleaned up");
+        assert.equal(isOwnSession("ephemeral-notext"), true);
+    }
+    finally {
+        resetLlmRetryPolicy();
+    }
+});
+
+test("llm: no-text reply exhausts retries then falls back to null", async () => {
+    setLlmRetryPolicy({ maxAttempts: 3, initialDelayMs: 0, backoffMultiplier: 1 });
+    try {
+        const calls = { created: 0, prompted: 0, deleted: 0 };
+        const fakeClient = {
+            session: {
+                create: async () => {
+                    calls.created += 1;
+                    return { data: { id: "ephemeral-alwaysempty" } };
+                },
+                prompt: async () => {
+                    calls.prompted += 1;
+                    return { data: { info: {}, parts: [] } };
+                },
+                delete: async () => {
+                    calls.deleted += 1;
+                },
+            },
+        };
+        const result = await requestLLMCapture(fakeClient, { provider: "openrouter", model: "z-ai/glm-5.3-flash" }, "some text", "sess-alwaysempty");
+        assert.equal(result, null, "exhausted attempts must fall back to heuristics");
+        assert.equal(calls.prompted, 3, "attempt budget must be fully spent before giving up");
+        assert.equal(calls.created, 1);
+        assert.equal(calls.deleted, 1);
+    }
+    finally {
+        resetLlmRetryPolicy();
+    }
+});
+
+// NO_TEXT_RETRY (1.6.1) scope guard: thrown errors (provider offline, timeout)
+// must NOT be retried — only the silent-empty success case is. Mutant: moving
+// the retry loop to wrap the whole prompt (throw path) makes prompted > 1.
+test("llm: thrown prompt errors skip retries and still clean up", async () => {
+    setLlmRetryPolicy({ maxAttempts: 3, initialDelayMs: 0, backoffMultiplier: 1 });
+    try {
+        const calls = { created: 0, prompted: 0, deleted: 0 };
+        const fakeClient = {
+            session: {
+                create: async () => {
+                    calls.created += 1;
+                    return { data: { id: "ephemeral-throw" } };
+                },
+                prompt: async () => {
+                    calls.prompted += 1;
+                    throw new Error("provider offline");
+                },
+                delete: async () => {
+                    calls.deleted += 1;
+                },
+            },
+        };
+        const result = await requestLLMCapture(fakeClient, { provider: "openrouter", model: "z-ai/glm-5.3-flash" }, "some text", "sess-throw");
+        assert.equal(result, null);
+        assert.equal(calls.prompted, 1, "thrown errors must not be retried");
+        assert.equal(calls.deleted, 1, "cleanup must still run");
+    }
+    finally {
+        resetLlmRetryPolicy();
+    }
+});
+
+test("llm: retry policy defaults are bounded and env-overridable", () => {
+    const policy = getLlmRetryPolicy();
+    assert.ok(policy.maxAttempts >= 1 && policy.maxAttempts <= 10, "maxAttempts must be clamped");
+    assert.ok(policy.initialDelayMs >= 0 && policy.initialDelayMs <= 60000, "initialDelayMs must be clamped");
+    assert.ok(policy.backoffMultiplier >= 1, "backoff must be non-decreasing");
+});
+
+// RETRY_BACKOFF_CLAMP (1.6.1): backoffMultiplier was read with plain toNumber
+// (no clamp) while its siblings were clamped — a large multiplier with
+// maxAttempts=10 overflows setTimeout's 2^31-1ms clamp (~24.8 days/attempt),
+// hanging the capture flush. resetLlmRetryPolicy re-reads env at call time,
+// so the clamp is testable through the seam.
+test("llm: backoffMultiplier is clamped to [1,10] from env (RETRY_BACKOFF_CLAMP)", () => {
+    const prev = process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER;
+    try {
+        process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER = "100";
+        resetLlmRetryPolicy();
+        assert.equal(getLlmRetryPolicy().backoffMultiplier, 10, "huge multiplier must clamp to 10");
+        process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER = "0.5";
+        resetLlmRetryPolicy();
+        assert.equal(getLlmRetryPolicy().backoffMultiplier, 1, "sub-1 multiplier must clamp to 1");
+        process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER = "bogus";
+        resetLlmRetryPolicy();
+        assert.equal(getLlmRetryPolicy().backoffMultiplier, 2, "non-numeric multiplier falls back to default 2");
+        process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER = "3.5";
+        resetLlmRetryPolicy();
+        assert.equal(getLlmRetryPolicy().backoffMultiplier, 3.5, "in-range fractional multiplier is preserved");
+    }
+    finally {
+        if (prev === undefined)
+            delete process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER;
+        else
+            process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER = prev;
+        resetLlmRetryPolicy();
+    }
 });
 
 test("extractiveDigest: builds header, picks high-scoring sentences, respects budget", () => {
@@ -982,6 +1120,39 @@ test("capture: handleSessionIdle swallows flush failure and still consolidates (
     );
 });
 
+// CAPTURE_BUFFER_AFTER_WRITES (1.6.1): the buffer delete used to run BEFORE
+// the awaited store writes (recordCaptureEvent → putEvent was the first). A
+// transient LanceDB failure threw out of _flushAutoCapture with the buffer
+// entry ALREADY deleted — the transcript was gone and the retry-on-next-flush
+// mechanism found an empty buffer. The delete now runs only after every store
+// write succeeds, so a thrown write leaves the fragments in place to retry.
+test("capture: store write failure retains buffered fragments for retry (CAPTURE_BUFFER_AFTER_WRITES)", async () => {
+    const { state, events, storedRecords } = makeFlushState({ initialized: true, minCaptureChars: 0 });
+    const fragments = ["decided to use SQLite for the cache"];
+    state.captureBuffer.set("sess-5", [...fragments]);
+    // The "considered" recordCaptureEvent is the first store call in flush —
+    // make it reject exactly like a transient LanceDB write failure.
+    state.store.putEvent = async () => { throw new Error("lancedb transient failure"); };
+    // flushAutoCapture propagates the failure (handleSessionIdle/session.deleted
+    // catch it) — the contract is that the buffer retains the fragments.
+    await assert.rejects(flushAutoCapture("sess-5", state, offlineClient), /lancedb transient failure/);
+    assert.ok(
+        state.captureBuffer.has("sess-5"),
+        "fragments must survive a failed store write so the next flush can retry",
+    );
+    assert.deepEqual(
+        state.captureBuffer.get("sess-5"),
+        fragments,
+        "the buffered fragments must be unchanged after the failed flush",
+    );
+    // Recover the store and flush again — the retained fragments must now be
+    // consumed exactly once.
+    state.store.putEvent = async (event) => { events.push(event); };
+    await flushAutoCapture("sess-5", state, offlineClient);
+    assert.ok(!state.captureBuffer.has("sess-5"), "recovered flush consumes the buffer");
+    assert.equal(storedRecords.length, 1, "retained fragments must be stored on retry");
+});
+
 // SESSION_LIFECYCLE_GUARD (1.4.6): handleSessionStart/End perform real store
 // I/O (createTaskEpisode / updateTaskState) with no try/catch — a transient
 // LanceDB failure propagated out of the event hook, and on session.deleted it
@@ -1481,6 +1652,41 @@ test("recall: lastUserTextFromMessages returns the last non-empty user text (MES
     assert.equal(lastUserTextFromMessages(messages), "second query");
     assert.equal(lastUserTextFromMessages([]), "");
     assert.equal(lastUserTextFromMessages([{ info: { role: "user" }, parts: [] }]), "");
+});
+
+// RECALL_SEARCH_GUARD (1.6.1): state.store.search was the one unguarded
+// LanceDB read in runRecallPipeline — every other store call in the hook
+// (embedder, graph boost/expansion, findSimilarTasks, resolveSessionScope) is
+// wrapped. A transient store failure propagated out of the system.transform
+// hook (no try/catch) and failed the user's chat turn. It now degrades to
+// empty results → no injection, and lastRecall is still recorded.
+test("recall: store.search failure degrades to no-injection (RECALL_SEARCH_GUARD)", async () => {
+    const config = resolveMemoryConfig({}, "/tmp");
+    config.graph.enabled = false;
+    const state = {
+        config,
+        initialized: true,
+        embedder: { embed: async () => [0.1, 0.2, 0.3] },
+        store: {
+            search: async () => { throw new Error("lancedb transient failure"); },
+            putEvent: async () => { },
+            updateMemoryUsage: async () => { },
+            findSimilarTasks: async () => [],
+        },
+        lastRecall: null,
+        activeEpisodes: new Map(),
+    };
+    const eventOutput = { system: [] };
+    const input = {
+        client: { session: { get: async () => { throw new Error("offline"); } } },
+        worktree: "/tmp",
+    };
+    // Must NOT reject — the chat turn survives a storage hiccup.
+    await assert.doesNotReject(
+        runRecallPipeline({ sessionID: "sess-r3" }, eventOutput, state, input, "some query", []),
+    );
+    assert.equal(eventOutput.system.length, 0, "failed search must not inject anything");
+    assert.ok(state.lastRecall, "lastRecall must still be recorded for observability");
 });
 
 // SIGNAL_TIGHTEN (1.5.3): the expanded POSITIVE_SIGNALS list leaned on generic

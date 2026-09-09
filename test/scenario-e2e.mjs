@@ -10,6 +10,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { trackOwnSession } from "../dist/llm.js";
 
 const DIM = 64;
 
@@ -134,6 +135,20 @@ summary.autoRecallBlocks = systemOutput.system.length;
 summary.autoRecallInjected = systemOutput.system.some((block) => block.includes(memoryId));
 if (!summary.autoRecallInjected) {
     fail(`auto-recall (system.transform) did not inject the remembered memory:\n${JSON.stringify(systemOutput.system)}`);
+}
+
+// OWN_SESSION_RECALL_GUARD (1.6.1): the plugin's own ephemeral LLM sessions
+// (capture/digest) must NOT get recall injected into their system prompt —
+// this hook lacked the isOwnSession guard every other hook has, so recall ran
+// with the extraction transcript as the query (self-amplification + wasted
+// embed/search per flush). Track an own session and assert the hook no-ops.
+const ownSessionID = "e2e-own-session";
+trackOwnSession(ownSessionID);
+const ownSystemOutput = { system: [] };
+await hooks["experimental.chat.system.transform"]({ sessionID: ownSessionID }, ownSystemOutput);
+summary.ownSessionRecallBlocked = ownSystemOutput.system.length === 0;
+if (!summary.ownSessionRecallBlocked) {
+    fail(`system.transform injected recall into an own session:\n${JSON.stringify(ownSystemOutput.system)}`);
 }
 
 const captureText = "The team decided to use LanceDB for long-term memory storage because it supports vector search natively and never deletes memories.";

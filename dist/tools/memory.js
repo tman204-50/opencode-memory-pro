@@ -7,6 +7,7 @@ import { requestLLMDigest } from "../llm.js";
 import { getLlmHealth } from "../llm.js";
 import { log } from "../logger.js";
 import { getTimingStats } from "../timing.js";
+import { isTcpPortAvailable } from "../ports.js";
 function unavailableMessage(provider) {
     return `Memory store unavailable (${provider} embedding may be offline). Will retry automatically.`;
 }
@@ -62,6 +63,22 @@ export async function buildGroupDigest(state, group, targetChars, groupKey, enti
     }
     const digest = extractiveDigest(texts, targetChars, Array.from(entityNames ?? []), groupKey);
     return digest ? { ...digest, llm: false } : null;
+}
+// DIGEST_SCOPE_FOLLOWS_MEMBERS (1.6.1): with scoping="project" +
+// includeGlobalScope, a digest group can mix active-scope and global
+// records. The digest must live where EVERY member is visible: if any
+// member is not in the active scope, store the digest in "global" —
+// otherwise other projects lose those (global) memories from recall with
+// no replacement (their originals were markDigested'd while the digest sat
+// in whichever project swept first). Pure project groups keep their digest
+// in the active scope (no global pollution).
+function digestScopeForGroup(group, activeScope) {
+    for (const r of group) {
+        if (r.scope !== activeScope) {
+            return "global";
+        }
+    }
+    return activeScope;
 }
 // EMBEDDING_CONFIG_REEMBED (1.4.5): the dimension-mismatch repair core,
 // shared by the memory_reembed tool and the plugin's automatic repair path
@@ -1048,10 +1065,16 @@ ${explanations.join("\n")}`;
                 }
                 for (const service of args.services) {
                     let hostPort = service.preferredHostPort;
-                    if (!hostPort || usedPorts.has(hostPort)) {
+                    // PORT_PLAN_TCP_CHECK (1.6.1): the planner used to consult
+                    // only persisted reservations — a port bound by a LIVE
+                    // process was handed out and compose failed at up time.
+                    // isTcpPortAvailable actually binds the candidate (the
+                    // ports.js helper was dead code). usedPorts short-circuits
+                    // so already-assigned ports are never re-probed.
+                    if (!hostPort || usedPorts.has(hostPort) || !(await isTcpPortAvailable(hostPort))) {
                         hostPort = 0;
                         for (let port = args.rangeStart ?? 20000; port <= (args.rangeEnd ?? 39999); port++) {
-                            if (!usedPorts.has(port)) {
+                            if (!usedPorts.has(port) && await isTcpPortAvailable(port)) {
                                 hostPort = port;
                                 break;
                             }
@@ -1503,7 +1526,7 @@ ${explanations.join("\n")}`;
                         text: digestText,
                         vector,
                         category: "digest",
-                        scope: activeScope,
+                        scope: digestScopeForGroup(group, activeScope),
                         importance: 0.6,
                         timestamp: now,
                         lastRecalled: 0,
@@ -1708,7 +1731,7 @@ export async function sweepExpiredMemories(state, opts = {}) {
                 text: digestText,
                 vector,
                 category: "digest",
-                scope: activeScope,
+                scope: digestScopeForGroup(group, activeScope),
                 importance: 0.6,
                 timestamp: now,
                 lastRecalled: 0,

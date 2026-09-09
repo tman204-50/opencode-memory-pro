@@ -1145,6 +1145,182 @@ test("integration: concurrent store.init calls coalesce (single-flight)", async 
     }
 });
 
+test("integration: concurrent ensureEpisodicTaskTable calls coalesce (single-flight)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "episodic-race-"));
+    const store = new MemoryStore(join(dir, "lancedb"));
+    try {
+        await store.init(DIM);
+        // EPISODIC_TABLE_SINGLE_FLIGHT (1.6.1) regression: two concurrent
+        // first-touches of the episodic table. Before the guard, both failed
+        // openTable and raced createTable, so the loser threw "table already
+        // exists" and episodicTaskTable stayed null — every episodic hook
+        // (commands, retries, KPI) silently no-oped for that session.
+        // Single-flight coalesces them onto one create, so both resolve.
+        await Promise.all([
+            store.ensureEpisodicTaskTable(DIM),
+            store.ensureEpisodicTaskTable(DIM),
+        ]);
+        // Table must be fully usable after the coalesced ensure.
+        await store.createTaskEpisode({
+            id: "ep-race-1",
+            sessionId: "sess-race",
+            scope: "global",
+            taskId: "race-task",
+            state: "running",
+            startTime: Date.now(),
+            commandsJson: "[]",
+            validationOutcomesJson: "[]",
+            successPatternsJson: "[]",
+            retryAttemptsJson: "[]",
+            recoveryStrategiesJson: "[]",
+            metadataJson: "{}",
+        });
+        await store.updateTaskState("race-task", "failed", "global", "resource", "boom");
+        const episodes = await store.queryTaskEpisodes("global", "failed");
+        assert.ok(
+            episodes.some((e) => e.taskId === "race-task"),
+            "episode written after concurrent ensure must be queryable"
+        );
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: retention sweep stores mixed-scope digests where all members are visible (DIGEST_SCOPE_FOLLOWS_MEMBERS)", async () => {
+    const store = await newStore("mem-digest-scope-");
+    const { sweepExpiredMemories } = await import("../dist/tools/memory.js");
+    const now = Date.now();
+    const OLD = now - 400 * 24 * 60 * 60 * 1000;
+    const projectScope = "project:local:aaaaaaaaaaaaaaaa";
+    const state = {
+        initialized: true,
+        defaultScope: "global",
+        config: {
+            includeGlobalScope: true,
+            capture: { mode: "heuristic" },
+            embedding: { model: "test-embed" },
+            retention: {
+                memory: {
+                    enabled: true,
+                    unusedDays: 60,
+                    minAgeDays: 180,
+                    minGroupSize: 2,
+                    targetChars: 500,
+                    minImportance: 0,
+                    protectedCategories: ["digest"],
+                    digestMaxAgeDays: 365,
+                },
+            },
+        },
+        store,
+        embedder: { embed: async (text) => deterministicEmbed(text) },
+        graph: { enabled: false },
+    };
+    try {
+        // Mixed group: 2 global + 2 project records, same category.
+        await store.put(makeRecord("dg-g1", "global tutorial fact about lance vectors", { category: "tutorial", scope: "global", timestamp: OLD }));
+        await store.put(makeRecord("dg-g2", "global tutorial fact about bm25 ranking", { category: "tutorial", scope: "global", timestamp: OLD }));
+        await store.put(makeRecord("dg-p1", "project tutorial fact about scope caches", { category: "tutorial", scope: projectScope, timestamp: OLD }));
+        await store.put(makeRecord("dg-p2", "project tutorial fact about fuzzy search", { category: "tutorial", scope: projectScope, timestamp: OLD }));
+        // Pure project group: must keep its digest in the project scope.
+        await store.put(makeRecord("dg-q1", "project recipe fact about go builds", { category: "recipe", scope: projectScope, timestamp: OLD }));
+        await store.put(makeRecord("dg-q2", "project recipe fact about postgres", { category: "recipe", scope: projectScope, timestamp: OLD }));
+
+        const result = await sweepExpiredMemories(state, { scope: projectScope });
+        assert.equal(result.digestsCreated, 2, "both groups must produce a digest");
+        assert.equal(result.digested, 6, "all six originals must be digested");
+
+        // The mixed-scope digest must live in "global" (visible to EVERY
+        // project), not in the active project scope — otherwise other
+        // projects lose the digested global memories with no replacement.
+        const globalRecords = await store.readByScopes(["global"]);
+        const mixed = globalRecords.find((r) => r.category === "digest" && r.metadataJson.includes('"category":"tutorial"'));
+        assert.ok(mixed, "mixed-scope digest must be stored in the global scope");
+        // The pure-project digest must stay in the project scope (no global pollution).
+        const projectRecords = await store.readByScopes([projectScope]);
+        const pure = projectRecords.find((r) => r.category === "digest" && r.metadataJson.includes('"category":"recipe"'));
+        assert.ok(pure, "pure-project digest must stay in the active project scope");
+        assert.ok(
+            !globalRecords.some((r) => r.category === "digest" && r.metadataJson.includes('"category":"recipe"')),
+            "pure-project digest must not leak into the global scope"
+        );
+        // A DIFFERENT project's [project:Y, global] filter must still see the
+        // mixed digest (this is the exact recall view that lost it pre-fix).
+        const otherProjectView = await store.readByScopes(["project:local:bbbbbbbbbbbbbbbb", "global"]);
+        assert.ok(
+            otherProjectView.some((r) => r.id === mixed.id),
+            "another project's [project:Y, global] filter must see the mixed digest"
+        );
+    }
+    finally {
+        store.close();
+    }
+});
+
+test("integration: memory_port_plan skips host ports bound by live processes (PORT_PLAN_TCP_CHECK)", async () => {
+    const store = await newStore("mem-port-plan-");
+    const { createMemoryTools } = await import("../dist/tools/memory.js");
+    const { isTcpPortAvailable } = await import("../dist/ports.js");
+    const { createServer } = await import("node:net");
+    const state = {
+        initialized: false,
+        config: { embedding: { provider: "test" } },
+        store,
+        ensureInitialized: async () => { state.initialized = true; },
+    };
+    const tools = createMemoryTools(state);
+    const context = { directory: "/tmp", sessionID: "test-session" };
+    const rangeStart = 21000;
+    const rangeEnd = 21999;
+    // Find a genuinely free port in the test range, then bind a real server
+    // on it so it is LIVE-busy (not just reservation-busy).
+    const findFree = async (from) => {
+        for (let port = from; port <= rangeEnd; port += 1) {
+            if (await isTcpPortAvailable(port))
+                return port;
+        }
+        throw new Error("no free port in test range");
+    };
+    const busyPort = await findFree(rangeStart);
+    const busyServer = createServer();
+    busyServer.once("error", () => { });
+    await new Promise((resolve) => busyServer.listen({ host: "0.0.0.0", port: busyPort, exclusive: true }, resolve));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(await isTcpPortAvailable(busyPort), false, "test precondition: busy port must be bound");
+    try {
+        // Preferred port is LIVE-busy → the planner must skip it and pick a
+        // different free port in the range (pre-fix it handed out the busy
+        // port because only persisted reservations were consulted).
+        const result = JSON.parse(await tools.memory_port_plan.execute({
+            project: "port-test",
+            services: [{ name: "db", containerPort: 5432, preferredHostPort: busyPort }],
+            rangeStart,
+            rangeEnd,
+            persist: false,
+        }, context));
+        assert.equal(result.assignments.length, 1, "one assignment expected");
+        const assigned = result.assignments[0].hostPort;
+        assert.ok(Number.isInteger(assigned), `hostPort must be an integer, got ${assigned}`);
+        assert.ok(assigned !== busyPort, `planner must not hand out a live-bound port, got ${busyPort}`);
+        assert.ok(assigned >= rangeStart && assigned <= rangeEnd, `assigned port must be in range, got ${assigned}`);
+        // Control: a genuinely free preferred port must still be honored.
+        const freePort = await findFree(rangeStart);
+        const control = JSON.parse(await tools.memory_port_plan.execute({
+            project: "port-test",
+            services: [{ name: "web", containerPort: 8080, preferredHostPort: freePort }],
+            rangeStart,
+            rangeEnd,
+            persist: false,
+        }, context));
+        assert.equal(control.assignments[0].hostPort, freePort, "free preferred port must be used as-is");
+    }
+    finally {
+        busyServer.close();
+        store.close();
+    }
+});
+
 test("integration: initializeStore auto-repairs dimension mismatch (EMBEDDING_CONFIG_REEMBED)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "reembed-auto-"));
     const dbPath = join(dir, "lancedb");

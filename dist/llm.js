@@ -2,6 +2,50 @@
 // opencode-memory-pro.
 import { log } from "./logger.js";
 import { startSpan } from "./timing.js";
+import { toNumber } from "./utils.js";
+// NO_TEXT_RETRY (1.6.1): cheap flash-tier models (gemini-2.5-flash-lite,
+// z-ai/glm-5.3-flash) under load resolve session.prompt successfully with an
+// EMPTY parts array — extraction then silently downgrades to heuristics. The
+// DSV4 switch sidestepped it; this retries the SAME ephemeral session's prompt
+// (no session recreate — create/delete stay 1:1) on the no-text case with a
+// short backoff before giving up, so transient provider load self-heals.
+// Thrown errors are NOT retried (those already return null immediately and the
+// capture heuristics cover them); the retry targets the silent-empty success
+// only. Knobs are read at module load like the other env knobs; tests override
+// via setLlmRetryPolicy.
+const envIntClamped = (name, fallback, min, max) => {
+    if (process.env[name] !== undefined && process.env[name] !== "") {
+        const parsed = Number(process.env[name]);
+        if (Number.isFinite(parsed)) {
+            return Math.max(min, Math.min(max, Math.floor(parsed)));
+        }
+    }
+    return fallback;
+};
+// RETRY_BACKOFF_CLAMP (1.6.1): maxAttempts/initialDelayMs are clamped via
+// envIntClamped but backoffMultiplier was read with plain toNumber — with
+// maxAttempts=10 and a large multiplier the delay sequence overflows into
+// setTimeout's 2^31-1ms clamp (~24.8 days per attempt), hanging the capture
+// flush for weeks. Clamp 1–10 like its siblings.
+const clampBackoffMultiplier = (value) => Math.max(1, Math.min(10, toNumber(value, 2)));
+let llmRetryPolicy = {
+    maxAttempts: envIntClamped("OPENCODE_MEMORY_PRO_LLM_RETRY_MAX_ATTEMPTS", 3, 1, 10),
+    initialDelayMs: envIntClamped("OPENCODE_MEMORY_PRO_LLM_RETRY_INITIAL_DELAY_MS", 250, 0, 60000),
+    backoffMultiplier: clampBackoffMultiplier(process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER),
+};
+export function setLlmRetryPolicy(patch) {
+    Object.assign(llmRetryPolicy, patch);
+}
+export function resetLlmRetryPolicy() {
+    llmRetryPolicy = {
+        maxAttempts: envIntClamped("OPENCODE_MEMORY_PRO_LLM_RETRY_MAX_ATTEMPTS", 3, 1, 10),
+        initialDelayMs: envIntClamped("OPENCODE_MEMORY_PRO_LLM_RETRY_INITIAL_DELAY_MS", 250, 0, 60000),
+        backoffMultiplier: clampBackoffMultiplier(process.env.OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER),
+    };
+}
+export function getLlmRetryPolicy() {
+    return { ...llmRetryPolicy };
+}
 //
 // Transport rules (per design):
 //   - The LLM is addressed by opencode provider ID + model ID. opencode owns
@@ -160,6 +204,31 @@ function hasUsableConfig(llmConfig, client) {
     return Boolean(client?.session?.create && client?.session?.prompt && client?.session?.delete
         && llmConfig?.provider && llmConfig?.model);
 }
+// PROMPT_USAGE_LOG (1.4.8), extracted for the NO_TEXT_RETRY (1.6.1) loop so
+// every prompt attempt logs its own token usage (empty replies stay
+// attributable). Tolerant shape: info.tokens or info.usage,
+// input/output or prompt_tokens/completion_tokens. No-op when absent.
+function logPromptUsage(response, llmConfig, title) {
+    const payload = response && typeof response === "object" && "data" in response ? response.data : response;
+    const tokens = payload?.info?.tokens ?? payload?.info?.usage ?? null;
+    if (!tokens || typeof tokens !== "object")
+        return;
+    const input = tokens.input ?? tokens.prompt_tokens;
+    const output = tokens.output ?? tokens.completion_tokens;
+    const fields = [];
+    if (Number.isFinite(input))
+        fields.push(`in=${input}`);
+    if (Number.isFinite(output))
+        fields.push(`out=${output}`);
+    if (Number.isFinite(tokens.reasoning) && tokens.reasoning > 0)
+        fields.push(`reasoning=${tokens.reasoning}`);
+    const cacheRead = tokens.cache?.read;
+    if (Number.isFinite(cacheRead) && cacheRead > 0)
+        fields.push(`cacheRead=${cacheRead}`);
+    if (fields.length > 0) {
+        log("info", `[llm] ${title}: usage ${fields.join(" ")} (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+    }
+}
 /**
  * Runs one structured extraction pass over a session transcript via the
  * opencode SDK. Returns [{content,type,importance}] on success — including [] 
@@ -246,47 +315,37 @@ async function _runEphemeralPrompt(client, llmConfig, system, userText, title) {
             return null;
         }
         trackOwnSession(sessionId);
-        const response = await client.session.prompt({
-            path: { id: sessionId },
-            body: {
-                system,
-                parts: [{ type: "text", text: userText }],
-                model: { providerID: llmConfig.provider, modelID: llmConfig.model },
-                tools: {},
-            },
-        });
-        // PROMPT_USAGE_LOG (1.4.8): session.prompt blocks for the whole model
-        // round trip and llm.prompt spans (8-18s per capture.flush) could not
-        // be attributed — model swap (Phase 1) and provider swap (Phase 2) of
-        // the latency benchmark both failed to move latency, so the next
-        // discriminator is token volume: reasoning tokens burned before the
-        // JSON answer are provider-independent and would explain a slow call
-        // with a tiny visible reply. Logged at info for EVERY prompt,
-        // including prompts that fail the has-text check below, so failures
-        // are attributable too. Tolerant shape: info.tokens or info.usage,
-        // input/output or prompt_tokens/completion_tokens.
-        const payload = response && typeof response === "object" && "data" in response ? response.data : response;
-        const tokens = payload?.info?.tokens ?? payload?.info?.usage ?? null;
-        if (tokens && typeof tokens === "object") {
-            const input = tokens.input ?? tokens.prompt_tokens;
-            const output = tokens.output ?? tokens.completion_tokens;
-            const fields = [];
-            if (Number.isFinite(input))
-                fields.push(`in=${input}`);
-            if (Number.isFinite(output))
-                fields.push(`out=${output}`);
-            if (Number.isFinite(tokens.reasoning) && tokens.reasoning > 0)
-                fields.push(`reasoning=${tokens.reasoning}`);
-            const cacheRead = tokens.cache?.read;
-            if (Number.isFinite(cacheRead) && cacheRead > 0)
-                fields.push(`cacheRead=${cacheRead}`);
-            if (fields.length > 0) {
-                log("info", `[llm] ${title}: usage ${fields.join(" ")} (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+        // NO_TEXT_RETRY (1.6.1): the observed failure mode is a SUCCESSFUL
+        // prompt with zero text parts (flash-tier providers under load).
+        // Retry only that case, on the same session, with backoff; each
+        // attempt logs its own usage so empty replies stay attributable.
+        // Any thrown error still skips retries and falls through to null.
+        const policy = llmRetryPolicy;
+        let text = "";
+        for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+            const response = await client.session.prompt({
+                path: { id: sessionId },
+                body: {
+                    system,
+                    parts: [{ type: "text", text: userText }],
+                    model: { providerID: llmConfig.provider, modelID: llmConfig.model },
+                    tools: {},
+                },
+            });
+            // PROMPT_USAGE_LOG (1.4.8) — see logPromptUsage: every attempt
+            // logs its own token usage line so empty replies stay attributable.
+            logPromptUsage(response, llmConfig, title);
+            text = extractAssistantText(response);
+            if (text)
+                break;
+            if (attempt < policy.maxAttempts) {
+                const delay = Math.floor(policy.initialDelayMs * Math.pow(policy.backoffMultiplier, attempt - 1));
+                log("warn", `[llm] ${title}: session.prompt returned no text parts (attempt ${attempt}/${policy.maxAttempts}); retrying in ${delay}ms (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+                await new Promise((resolve) => setTimeout(resolve, delay));
             }
         }
-        const text = extractAssistantText(response);
         if (!text) {
-            log("warn", `[llm] ${title}: session.prompt succeeded but returned no text parts (provider=${llmConfig.provider}, model=${llmConfig.model})`);
+            log("warn", `[llm] ${title}: session.prompt succeeded but returned no text parts after ${policy.maxAttempts} attempts (provider=${llmConfig.provider}, model=${llmConfig.model})`);
             setLlmHealth({ status: "error", lastError: "session.prompt returned no text parts", lastSuccess: globalLlmHealth.lastSuccess, errorCount: globalLlmHealth.errorCount + 1 });
             return null;
         }

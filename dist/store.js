@@ -86,6 +86,13 @@ export class MemoryStore {
     table = null;
     eventTable = null;
     episodicTaskTable = null;
+    // EPISODIC_TABLE_SINGLE_FLIGHT (1.6.1): memoizes the in-flight
+    // ensureEpisodicTaskTable() promise so concurrent first-touches coalesce
+    // onto one open/create instead of the loser's createTable throwing
+    // "table already exists" and leaving episodicTaskTable null — which
+    // silently no-ops every episodic hook for that session. Cleared in
+    // finally so a failed ensure can retry on the next call.
+    episodicTaskTablePromise = null;
     // INIT_SINGLE_FLIGHT (1.4.5): memoizes the in-flight init() promise so
     // concurrent callers coalesce onto one init instead of each opening a
     // connection and racing createTable (which throws "table already exists"
@@ -550,6 +557,7 @@ export class MemoryStore {
         this.table = null;
         this.eventTable = null;
         this.episodicTaskTable = null;
+        this.episodicTaskTablePromise = null;
         this.lancedb = null;
     }
     retentionConfig;
@@ -2315,9 +2323,20 @@ export class MemoryStore {
         return this.eventTable;
     }
     async ensureEpisodicTaskTable(vectorDim) {
-        const EPISODIC_TABLE_NAME = "episodic_tasks";
         if (this.episodicTaskTable)
             return;
+        if (this.episodicTaskTablePromise)
+            return this.episodicTaskTablePromise;
+        this.episodicTaskTablePromise = this._ensureEpisodicTaskTable();
+        try {
+            return await this.episodicTaskTablePromise;
+        }
+        finally {
+            this.episodicTaskTablePromise = null;
+        }
+    }
+    async _ensureEpisodicTaskTable() {
+        const EPISODIC_TABLE_NAME = "episodic_tasks";
         try {
             this.episodicTaskTable = await this.connection.openTable(EPISODIC_TABLE_NAME);
             const schema = await this.episodicTaskTable.schema();

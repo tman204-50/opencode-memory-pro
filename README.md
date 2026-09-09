@@ -284,6 +284,11 @@ stale connections lose influence without ever being deleted.
   Extraction runs with **reasoning suppressed** (the system prompt forbids
   step-by-step thinking — 1.4.9) to keep `session.idle` latency down;
   transcripts are capped at 60k chars, keeping the **newest tail** (1.4.9).
+  A successful prompt that returns **no text parts** (flash-tier providers
+  under load) is retried on the same ephemeral session with backoff before
+  falling back (1.6.1): `OPENCODE_MEMORY_PRO_LLM_RETRY_MAX_ATTEMPTS` (default
+  3), `OPENCODE_MEMORY_PRO_LLM_RETRY_INITIAL_DELAY_MS` (default 250),
+  `OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER` (default 2).
 
 The LLM is addressed by **OpenCode provider + model IDs** — OpenCode owns
 routing, auth, and base URLs, so no API key or baseUrl lives in the plugin
@@ -506,6 +511,63 @@ npm run verify      # tests + pack dry-run
 CI runs on GitHub Actions (Node 22 + 24) on every push/PR to `main`.
 
 ## Changelog
+
+### v1.6.1 (unreleased)
+
+**Code-review hardening bundle** — the 1.6.0 source-verified review pass
+(7 MAJOR findings) is fully fixed:
+
+- **NO_TEXT_RETRY** — flash-tier providers under load
+  (gemini-2.5-flash-lite, z-ai/glm-5.3-flash) sometimes resolve
+  `session.prompt` successfully with an **empty parts array**, silently
+  downgrading capture to heuristics. The capture prompt is now retried on the
+  same ephemeral session (create/delete stay 1:1) with a short backoff before
+  giving up — only the silent-empty case retries; thrown errors still fail
+  immediately. Each attempt logs its own `usage` line so empty replies stay
+  attributable. Knobs (read at module load, like the other env knobs):
+  `OPENCODE_MEMORY_PRO_LLM_RETRY_MAX_ATTEMPTS` (default 3, 1–10),
+  `OPENCODE_MEMORY_PRO_LLM_RETRY_INITIAL_DELAY_MS` (default 250, 0–60000),
+  `OPENCODE_MEMORY_PRO_LLM_RETRY_BACKOFF_MULTIPLIER` (default 2).
+- **RETRY_BACKOFF_CLAMP** — the new `backoffMultiplier` knob is clamped to
+  [1,10] at module load and on `setLlmRetryPolicy` (it was unbounded —
+  `maxAttempts=10, multiplier=10` meant delays up to ~8.7y and a capture
+  flush hanging for weeks on the no-text path).
+- **OWN_SESSION_RECALL_GUARD** — the `experimental.chat.system.transform`
+  hook is the ONLY hook without an `isOwnSession` guard, so the plugin's own
+  ephemeral LLM sessions (capture/digest) got recall injected into their
+  extraction prompt with the transcript as the query (self-amplification +
+  an extra embed+search per flush). The guard now applies there too.
+- **RECALL_SEARCH_GUARD** — the recall pipeline's `store.search` in the
+  transform hook was the only unguarded store call: a LanceDB failure failed
+  the user's chat turn instead of degrading to no-injection. Now wrapped —
+  any failure degrades to `results = []` (no injection), `lastRecall`
+  still recorded.
+- **CAPTURE_BUFFER_AFTER_WRITES** — capture fragments were deleted from the
+  buffer BEFORE the store writes completed; a transient LanceDB failure
+  threw after the delete and the transcript was permanently lost (same class
+  as the 1.4.5 CAPTURE_RETRY_ON_DEFERRED fix, which covered init-deferral
+  only). The delete now runs on all five success exit paths, after their
+  store writes — a throw leaves fragments in place for retry.
+- **EPISODIC_TABLE_SINGLE_FLIGHT** — `ensureEpisodicTaskTable` had no
+  single-flight guard (the 1.4.5 init race at a different entry point):
+  concurrent first-touches raced `createTable`, the loser threw "table
+  already exists", and every episodic hook (commands/retries/KPI) silently
+  no-oped for that session. Memoized in-flight promise, same pattern as
+  `init()`.
+- **DIGEST_SCOPE_FOLLOWS_MEMBERS** — in `scoping:"project"` mode the
+  retention sweep / `memory_summarize` read `[project:X, global]`
+  candidates but stored the digest under the active project scope while
+  `markDigested` hid the global originals — every other project lost those
+  memories from recall with no replacement. A digest now lives in `global`
+  whenever any member is global (visible to every project); pure-project
+  groups keep their digest in the project scope.
+- **PORT_PLAN_TCP_CHECK** — `memory_port_plan` consulted only persisted
+  reservations, so a host port bound by a live process was handed out and
+  compose failed at up time. The planner now probes each candidate with a
+  real TCP bind (`isTcpPortAvailable`, previously dead code in ports.js)
+  before assigning.
+
+All fixes are mutant-verified with regression tests; suite 133/133 + e2e.
 
 ### v1.6.0 (2026-09-08)
 
