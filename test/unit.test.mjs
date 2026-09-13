@@ -2288,11 +2288,21 @@ test("store: computeRetentionScore applies feedback factor only when weighted", 
     const without = computeRetentionScore(record, undefined, retentionWeights);
     assert.ok(withFeedback > without, "positive feedback must raise the retention score");
     const zeroWeight = { ...retentionWeights, feedbackWeight: 0 };
-    assert.equal(
-        computeRetentionScore(record, boostedFeedback, zeroWeight),
-        computeRetentionScore(record, undefined, zeroWeight),
-        "feedback must be ignored when feedbackWeight is 0",
-    );
+    // Freeze time so both calls see the same recency term — otherwise a
+    // millisecond boundary between the two Date.now() calls makes the
+    // exact-equality assert flaky (float noise, e.g. 1.2 vs 1.1999999983954925).
+    const frozen = Date.now();
+    const realNow = Date.now;
+    Date.now = () => frozen;
+    try {
+        assert.equal(
+            computeRetentionScore(record, boostedFeedback, zeroWeight),
+            computeRetentionScore(record, undefined, zeroWeight),
+            "feedback must be ignored when feedbackWeight is 0",
+        );
+    } finally {
+        Date.now = realNow;
+    }
 });
 
 test("store: computeRetentionScore decays recency but keeps a soft floor", () => {
