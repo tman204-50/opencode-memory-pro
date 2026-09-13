@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="opencode-memory-pro logo" width="240">
+</p>
+
 # opencode-memory-pro
 
 [![npm version](https://img.shields.io/npm/v/opencode-memory-pro.svg)](https://www.npmjs.com/package/opencode-memory-pro)
